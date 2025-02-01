@@ -1,6 +1,6 @@
 import logging
 from quart import Blueprint, request, jsonify, current_app
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from database.db_queries import (
     get_user, add_user, add_subscription, update_subscription, add_scheduled_task
 )
@@ -9,6 +9,9 @@ from utils.db_utils import add_user_to_channel
 # إنشاء Blueprint لنقاط API الخاصة بالاشتراكات
 subscriptions_bp = Blueprint("subscriptions", __name__)
 
+# تحديد إذا كان التطبيق في وضع الاختبار
+IS_DEVELOPMENT = True  # يمكن تغيير هذا بناءً على إعدادات البيئة (مثال: os.getenv("ENVIRONMENT") == "development")
+
 
 @subscriptions_bp.route("/api/subscribe", methods=["POST"])
 async def subscribe():
@@ -16,8 +19,6 @@ async def subscribe():
     نقطة API للاشتراك أو تجديد الاشتراك.
     """
     try:
-        from datetime import datetime, timezone, timedelta
-
         data = await request.get_json()
         telegram_id = data.get("telegram_id")
         subscription_type_id = data.get("subscription_type_id")
@@ -57,7 +58,14 @@ async def subscribe():
 
             subscription_name = subscription_type["name"]
             channel_id = subscription_type["channel_id"]
-            duration_days = subscription_type.get("duration_days", 30)  # قيمة افتراضية 30 يوم
+
+            # استخدام مدة قصيرة في وضع الاختبار
+            if IS_DEVELOPMENT:
+                duration_days = 0  # 0 أيام
+                duration_minutes = 5  # 5 دقائق
+            else:
+                duration_days = subscription_type.get("duration_days", 30)  # القيمة الافتراضية 30 يومًا
+                duration_minutes = 0
 
             # البحث عن الاشتراك الحالي
             subscription = await connection.fetchrow(
@@ -68,11 +76,10 @@ async def subscribe():
 
             current_time = datetime.now(timezone.utc)  # استخدام التوقيت العالمي
 
-
             if subscription:
                 # تجديد الاشتراك مع الحفاظ على تاريخ البدء الأصلي
                 original_start_date = subscription["start_date"].astimezone(timezone.utc)
-                new_expiry = original_start_date + timedelta(days=duration_days)
+                new_expiry = original_start_date + timedelta(days=duration_days, minutes=duration_minutes)
 
                 # تحديث الاشتراك
                 success = await update_subscription(
@@ -85,8 +92,6 @@ async def subscribe():
                     True
                 )
 
-
-
                 if not success:
                     logging.error(f"❌ Failed to update subscription for {telegram_id}")
                     return jsonify({"error": "Failed to update subscription"}), 500
@@ -95,7 +100,7 @@ async def subscribe():
             else:
                 # إنشاء اشتراك جديد
                 start_date = current_time
-                new_expiry = start_date + timedelta(days=duration_days)
+                new_expiry = start_date + timedelta(days=duration_days, minutes=duration_minutes)
 
                 added = await add_subscription(
                     connection,
@@ -124,11 +129,18 @@ async def subscribe():
                 return jsonify({"error": "Failed to add user to channel"}), 500
 
             # جدولة التذكيرات
-            reminders = [
-                ("first_reminder", new_expiry - timedelta(hours=24)),
-                ("second_reminder", new_expiry - timedelta(hours=1)),
-                ("remove_user", new_expiry),
-            ]
+            if IS_DEVELOPMENT:
+                reminders = [
+                    ("first_reminder", new_expiry - timedelta(minutes=2)),  # بعد 3 دقائق من البدء
+                    ("second_reminder", new_expiry - timedelta(minutes=1)),  # بعد 4 دقائق من البدء
+                    ("remove_user", new_expiry),  # بعد 5 دقائق من البدء
+                ]
+            else:
+                reminders = [
+                    ("first_reminder", new_expiry - timedelta(hours=24)),
+                    ("second_reminder", new_expiry - timedelta(hours=1)),
+                    ("remove_user", new_expiry),
+                ]
 
             for task_type, execute_time in reminders:
                 await add_scheduled_task(
