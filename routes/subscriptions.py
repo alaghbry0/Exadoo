@@ -57,7 +57,7 @@ async def subscribe():
                 return jsonify({"error": "Invalid subscription type."}), 400
 
             subscription_name = subscription_type["name"]
-            channel_id = subscription_type["channel_id"]
+            channel_id = subscription_type["channel_id"]  # channel_id كبير (64-bit integer)
 
             # استخدام مدة قصيرة في وضع الاختبار
             if IS_DEVELOPMENT:
