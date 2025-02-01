@@ -26,7 +26,7 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
             logging.error(f"❌ نوع الاشتراك {subscription_type_id} غير موجود.")
             return False
 
-        channel_id = subscription_type['channel_id']
+        channel_id = int(subscription_type['channel_id'])  # تأكد من تحويل channel_id إلى int
         channel_name = subscription_type['name']
 
         # التحقق مما إذا كان المستخدم موجودًا بالفعل في القناة
@@ -63,7 +63,6 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
     except Exception as e:
         logging.error(f"❌ خطأ غير متوقع أثناء إضافة المستخدم {telegram_id}: {e}")
         return False
-
 
 # ----------------- 🔹 إزالة المستخدم من القناة ----------------- #
 

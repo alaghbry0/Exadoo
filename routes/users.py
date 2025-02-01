@@ -1,10 +1,11 @@
 from quart import Blueprint, request, jsonify, current_app
 import logging
 import re
+import pytz
 from aiogram import Bot
 from config import TELEGRAM_BOT_TOKEN
 from database.db_queries import get_user, add_user, get_user_subscriptions
-from datetime import datetime
+from datetime import datetime, timedelta, timezone  # <-- تأكد من وجود timezone هنا
 
 user_bp = Blueprint("users", __name__)
 
@@ -28,7 +29,7 @@ async def get_telegram_user_info(telegram_id: int):
     try:
         user = await telegram_bot.get_chat(telegram_id)
         full_name = clean_name(user.full_name) if user.full_name else "N/L"
-        username = user.username if user.username else "N/L"
+        username = f"@{user.username}" if user.username else "N/L"
         return full_name, username
     except Exception as e:
         logging.error(f"❌ خطأ أثناء جلب بيانات المستخدم {telegram_id}: {e}")
@@ -41,7 +42,7 @@ async def get_telegram_profile_photo(telegram_id: int) -> str:
         user_photos = await telegram_bot.get_user_profile_photos(user_id=telegram_id, limit=1)
         if user_photos.photos:
             file_id = user_photos.photos[0][0].file_id
-            return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
+            return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_id}"
     except Exception as e:
         logging.error(f"❌ خطأ أثناء جلب صورة المستخدم {telegram_id}: {e}")
 
@@ -55,6 +56,7 @@ async def get_user_info():
     ✅ التحقق من قاعدة البيانات
     ✅ تحديث البيانات من `Telegram API` عند كل طلب
     ✅ إرجاع البيانات المحدثة مع الاشتراكات
+    ✅ تحسين التعامل مع حالة `is_active`
     """
     telegram_id = request.args.get("telegram_id")
 
@@ -65,45 +67,63 @@ async def get_user_info():
 
     try:
         async with current_app.db_pool.acquire() as conn:
+            # 🔹 جلب بيانات المستخدم من قاعدة البيانات
             user = await get_user(conn, telegram_id)
+
+            # 🔹 جلب البيانات الحقيقية من Telegram API
             full_name, username = await get_telegram_user_info(telegram_id)
             profile_photo = await get_telegram_profile_photo(telegram_id)
-            subscriptions = await get_user_subscriptions(conn, telegram_id)
 
-            # تحديث بيانات المستخدم إذا لزم الأمر
+            # ✅ تحديث بيانات المستخدم إذا تغيرت
             if not user or (user['full_name'] != full_name) or (user['username'] != username):
                 await add_user(conn, telegram_id, username=username, full_name=full_name)
+
+            # 🔹 جلب بيانات الاشتراكات من قاعدة البيانات
+            subscriptions = await get_user_subscriptions(conn, telegram_id)
+
+            # ✅ ضبط التوقيت المحلي (UTC+3 الرياض)
+            local_tz = pytz.timezone("Asia/Riyadh")
+            now = datetime.now(timezone.utc).astimezone(local_tz)
 
             subscription_list = []
             for sub in subscriptions:
                 expiry_date = sub['expiry_date']
-                now = datetime.now()
+                start_date = sub['start_date'] if sub['start_date'] else expiry_date - timedelta(days=30)
 
-                # حساب المدة المتبقية بدقة
-                if expiry_date < now:
-                    days_left = 0
-                    status = "منتهي"
-                    progress = 0
+                # ✅ التأكد من ضبط timezone
+                if expiry_date.tzinfo is None:
+                    expiry_date = expiry_date.replace(tzinfo=timezone.utc)
+                if start_date.tzinfo is None:
+                    start_date = start_date.replace(tzinfo=timezone.utc)
+
+                expiry_date = expiry_date.astimezone(local_tz)
+                start_date = start_date.astimezone(local_tz)
+
+                # ✅ حساب مدة الاشتراك والتقدم
+                total_days = (expiry_date - start_date).days if start_date else 30
+                days_left = max((expiry_date - now).days, 0)
+                progress = min(int((days_left / total_days) * 100), 100) if total_days > 0 else 0
+
+                # ✅ التحقق من حالة `is_active` الحقيقية في قاعدة البيانات
+                is_active = sub['is_active']  # 🔹 استرجاع الحالة الفعلية من قاعدة البيانات
+                if is_active:
+                    status = "نشط"  # ✅ إذا كان `is_active = True` فهو نشط
                 else:
-                    delta = expiry_date - now
-                    days_left = delta.days + 1  # +1 لاحتساب اليوم الحالي
-                    total_days = (expiry_date - sub['start_date']).days  # نفترض وجود حقل start_date
-                    progress = min(int((days_left / total_days) * 100), 100) if total_days > 0 else 0
-                    status = "نشط" if days_left > 0 else "منتهي"
+                    status = "منتهي"  # ❌ إذا كان `is_active = False` فهو منتهي
 
-                # تحسين تنسيق الرسائل
-                expiry_msg = "انتهى الاشتراك" if days_left == 0 else f"متبقي {days_left} يوم"
+                expiry_msg = "انتهى الاشتراك" if not is_active else f"متبقي {days_left} يوم"
 
                 subscription_list.append({
                     "id": sub['subscription_type_id'],
                     "name": sub['subscription_name'],
-                    "price": f"{sub['price']:.2f} دولار/شهر",  # تنسيق السعر
+                    "price": f"{sub['price']:.2f} دولار/شهر",
                     "expiry": expiry_msg,
                     "progress": progress,
                     "status": status,
-                    "expiry_date": expiry_date.isoformat()  # إضافة تاريخ الانتهاء الدقيق
+                    "expiry_date": expiry_date.isoformat()
                 })
 
+            # ✅ إرجاع البيانات المحدثة
             return jsonify({
                 "telegram_id": telegram_id,
                 "full_name": full_name,
@@ -115,3 +135,4 @@ async def get_user_info():
     except Exception as e:
         logging.error(f"❌ خطأ أثناء جلب بيانات المستخدم {telegram_id}: {e}", exc_info=True)
         return jsonify({"error": "Internal Server Error"}), 500
+
