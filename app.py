@@ -7,6 +7,7 @@ from config import DATABASE_CONFIG
 from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
+from routes.telegram_stars import payments_bp
 from backend.telegram_bot import init_bot, start_telegram_bot
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
@@ -21,7 +22,6 @@ app = cors(app, allow_origin="*")  # تمكين CORS لجميع الطلبات
 # 🔹 إعداد تسجيل الأخطاء والمعلومات
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
 # 🔹 تحميل المفتاح الخاص من متغير البيئة
 private_key_content = os.environ.get("PRIVATE_KEY")
 if not private_key_content:
@@ -33,13 +33,13 @@ private_key = RSA.import_key(private_key_content)
 message = b"transaction data"
 hash_msg = SHA256.new(message)
 signature = pkcs1_15.new(private_key).sign(hash_msg)
-
-print("✅ Signed message:", signature.hex())
+logging.info(f"✅ Signed message: {signature.hex()}")
 
 # 🔹 تسجيل نقاط API
 app.register_blueprint(subscriptions_bp)
 app.register_blueprint(user_bp)
 app.register_blueprint(shop)
+app.register_blueprint(payments_bp)  # ✅ إضافة مدفوعات Telegram Stars
 
 # 🔹 وظيفة تشغيل الجدولة
 async def setup_scheduler():
@@ -58,7 +58,7 @@ async def create_db_connection():
         logging.info("✅ تم الاتصال بقاعدة البيانات بنجاح.")
 
         # تشغيل الجدولة مرة واحدة فقط
-        await setup_scheduler()  # ✅ هذا يكفي، لا داعي لاستدعاء start_scheduler() مرتين
+        await setup_scheduler()  # ✅ تشغيل الجدولة مرة واحدة
 
         await init_bot()  # 🔹 استدعاء بوت تيليجرام ليصبح جاهزًا
         await start_telegram_bot()  # 🔹 تشغيل بوت تيليجرام في الخلفية

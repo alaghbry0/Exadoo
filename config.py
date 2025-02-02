@@ -18,6 +18,11 @@ DATABASE_URI = f"postgresql://{DATABASE_CONFIG['user']}:{DATABASE_CONFIG['passwo
 
 # 🔹 مفتاح بوت تيليجرام
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"  # 🔹 توليد رابط API تلقائيًا
 
 # 🔹 تحميل المفتاح الخاص للتوقيع
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+
+# 🔹 متغيرات أخرى للتحكم في الإعدادات
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # مستوى السجلات
+DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"  # تمكين وضع التصحيح
