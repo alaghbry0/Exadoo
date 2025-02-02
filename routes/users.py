@@ -37,16 +37,16 @@ async def get_telegram_user_info(telegram_id: int):
 
 
 async def get_telegram_profile_photo(telegram_id: int) -> str:
-    """ 🔹 جلب صورة الملف الشخصي للمستخدم من Telegram API أو إرجاع الصورة الافتراضية """
+    """ 🔹 جلب صورة الملف الشخصي للمستخدم من Telegram API بشكل صحيح """
     try:
         user_photos = await telegram_bot.get_user_profile_photos(user_id=telegram_id, limit=1)
         if user_photos.photos:
-            file_id = user_photos.photos[0][0].file_id
-            return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_id}"
+            file = await telegram_bot.get_file(user_photos.photos[0][0].file_id)
+            return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file.file_path}"
+        return DEFAULT_PROFILE_PHOTO
     except Exception as e:
-        logging.error(f"❌ خطأ أثناء جلب صورة المستخدم {telegram_id}: {e}")
-
-    return DEFAULT_PROFILE_PHOTO
+        logging.error(f"❌ خطأ في جلب صورة المستخدم {telegram_id}: {str(e)}")
+        return DEFAULT_PROFILE_PHOTO
 
 
 @user_bp.route("/api/user", methods=["GET"])
