@@ -7,8 +7,8 @@ from config import DATABASE_CONFIG
 from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
-from routes.telegram_stars import payments_bp
-from backend.telegram_bot import init_bot, start_telegram_bot
+from backend.telegram_payments import setup_payment_handlers  # <-- استيراد معالجات الدفع الجديدة
+from backend.telegram_bot import init_bot, start_telegram_bot, setup_webhook
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
 from Crypto.Signature import pkcs1_15
@@ -39,7 +39,6 @@ logging.info(f"✅ Signed message: {signature.hex()}")
 app.register_blueprint(subscriptions_bp)
 app.register_blueprint(user_bp)
 app.register_blueprint(shop)
-app.register_blueprint(payments_bp)  # ✅ إضافة مدفوعات Telegram Stars
 
 # 🔹 وظيفة تشغيل الجدولة
 async def setup_scheduler():
@@ -57,11 +56,10 @@ async def create_db_connection():
         app.db_pool = await asyncpg.create_pool(**DATABASE_CONFIG)
         logging.info("✅ تم الاتصال بقاعدة البيانات بنجاح.")
 
-        # تشغيل الجدولة مرة واحدة فقط
-        await setup_scheduler()  # ✅ تشغيل الجدولة مرة واحدة
-
-        await init_bot()  # 🔹 استدعاء بوت تيليجرام ليصبح جاهزًا
-        await start_telegram_bot()  # 🔹 تشغيل بوت تيليجرام في الخلفية
+        await setup_scheduler()
+        await init_bot()
+        await setup_webhook()  # تمت الإضافة
+        await start_telegram_bot(setup_payment_handlers)
 
     except Exception as e:
         logging.error(f"❌ خطأ أثناء الاتصال بقاعدة البيانات: {e}")

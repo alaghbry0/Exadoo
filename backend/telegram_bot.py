@@ -2,7 +2,7 @@ import logging
 import os
 import asyncio
 from quart import Blueprint, current_app
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, types
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
@@ -77,14 +77,28 @@ async def send_message_to_user(user_id: int, message_text: str):
         await handle_errors(user_id, f"Unexpected error: {e}")
 
 
+# إعداد Webhook
+async def setup_webhook():
+    await bot.set_webhook(
+        url="https://yourdomain.com/webhook",
+        secret_token=os.getenv("WEBHOOK_SECRET")
+    )
+
+@dispatcher.message(Command("setwebhook"))
+async def cmd_setwebhook(message: types.Message):
+    await setup_webhook()
+    await message.answer("✅ Webhook configured!")
+
 # تشغيل `aiogram` داخل `Quart`
 async def init_bot():
     """ربط بوت `aiogram` مع `Quart` عند تشغيل التطبيق."""
     logging.info("✅ Telegram Bot Ready!")
 
-
 # تشغيل `aiogram` في سيرفر `Quart`
-async def start_telegram_bot():
+async def start_telegram_bot(payment_handlers=None):
     """تشغيل `aiogram` Dispatcher في الخلفية."""
+    if payment_handlers:
+        payment_handlers(dispatcher)  # إضافة معالجات الدفع إذا كانت متوفرة
+
     loop = asyncio.get_event_loop()
     loop.create_task(dispatcher.start_polling(bot))
