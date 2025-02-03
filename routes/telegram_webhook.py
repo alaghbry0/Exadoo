@@ -1,6 +1,5 @@
 import logging
 import json
-import aiohttp
 import os
 import asyncio
 import asyncpg
@@ -32,14 +31,6 @@ async def telegram_webhook():
     try:
         data = await request.get_json()
 
-        # ✅ التحقق من صحة الطلب باستخدام check_webapp_signature
-        if not check_webapp_signature(
-                current_app.config["TELEGRAM_BOT_TOKEN"],
-                request.args.get("initData", "")
-        ):
-            logging.error("❌ Webhook request غير موثوق - توقيع غير صحيح")
-            return jsonify({"error": "Unauthorized request"}), 403
-
         # ✅ التأكد من وجود بيانات الدفع
         payment = data.get("message", {}).get("successful_payment")
         if not payment:
@@ -52,10 +43,6 @@ async def telegram_webhook():
         plan_id = payload.get("planId")
         payment_id = payment.get("telegram_payment_charge_id")
         amount = payment.get("total_amount", 0) // 100  # تحويل النجوم إلى الدولار
-
-        if not telegram_id or not plan_id or not payment_id:
-            logging.error("❌ بيانات الدفع غير مكتملة!")
-            return jsonify({"error": "Invalid payment data"}), 400
 
         logging.info(f"✅ استلام دفعة جديدة من {telegram_id} للخطة {plan_id}, مبلغ: {amount}")
 
@@ -97,10 +84,12 @@ async def telegram_webhook():
 
 async def send_subscription_request(payload, headers, max_retries=3):
     """
-    🔁 دالة لإرسال طلب تجديد الاشتراك مع Retry في حالة الفشل.
+    🔁 دالة لإرسال طلب تجديد الاشتراك مع `Retry` في حالة الفشل.
     """
-    for attempt in range(1, max_retries + 1):
-        async with aiohttp.ClientSession() as session:
+    session = current_app.aiohttp_session  # ✅ استخدام الجلسة العامة
+
+    try:
+        for attempt in range(1, max_retries + 1):
             try:
                 async with session.post(SUBSCRIBE_URL, json=payload, headers=headers) as resp:
                     response_text = await resp.text()
@@ -116,6 +105,9 @@ async def send_subscription_request(payload, headers, max_retries=3):
 
             if attempt < max_retries:
                 await asyncio.sleep(2 ** attempt)  # ⏳ انتظار قبل إعادة المحاولة
+
+    except Exception as e:
+        logging.error(f"❌ خطأ عام أثناء إرسال طلب الاشتراك: {e}")
 
     logging.critical("🚨 جميع محاولات تحديث الاشتراك فشلت!")
     return False

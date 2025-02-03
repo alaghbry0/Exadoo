@@ -1,7 +1,7 @@
 import logging
 import os
 from quart import Blueprint
-from aiogram import Bot, Router, types
+from aiogram import Bot, Dispatcher, types
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
@@ -24,7 +24,7 @@ telegram_bot = Blueprint("telegram_bot", __name__)
 
 # 🔹 إعداد Aiogram 3.x
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Router()  # ✅ استخدام Router بدلاً من Dispatcher
+dp = Dispatcher()   # ✅ استخدام Router بدلاً من Dispatcher
 
 # ✅ تضمين معالجات الدفع داخل البوت
 dp.include_router(payment_router)
@@ -100,10 +100,5 @@ async def init_bot():
 
 # 🔹 تشغيل aiogram في سيرفر Quart
 async def start_telegram_bot():
-    """تشغيل Aiogram Router في الخلفية."""
-    try:
-        logging.info("🚀 بدء تشغيل بوت تيليجرام...")
-        await dp.start_polling(bot)  # ✅ استخدام start_polling
-    except Exception as e:
-        logging.critical(f"❌ فشل تشغيل بوت تيليجرام: {e}")
-
+    """بدء تشغيل Webhook فقط، بدون Polling."""
+    logging.info("🚀 Webhook يعمل فقط، لا يوجد Polling.")

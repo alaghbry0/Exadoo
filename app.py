@@ -1,6 +1,7 @@
 import asyncpg
 import logging
 import os
+import aiohttp  # ✅ استيراد aiohttp
 from quart import Quart
 from quart_cors import cors
 from config import DATABASE_CONFIG
@@ -23,6 +24,9 @@ for var in REQUIRED_ENV_VARS:
 
 # 🔹 إنشاء التطبيق
 app = Quart(__name__)
+
+# ✅ جلسة `aiohttp` عامة يمكن استخدامها في كل مكان
+app.aiohttp_session = None
 
 # 🔹 ضبط CORS للسماح بمصادر محددة فقط
 ALLOWED_ORIGINS = ["https://exadoo.onrender.com", "https://telegram.org"]
@@ -65,7 +69,8 @@ async def create_db_connection():
     try:
         logging.info("🔄 جاري الاتصال بقاعدة البيانات...")
         app.db_pool = await asyncpg.create_pool(**DATABASE_CONFIG)
-        logging.info("✅ تم الاتصال بقاعدة البيانات بنجاح.")
+        app.aiohttp_session = aiohttp.ClientSession()  # ✅ إنشاء جلسة aiohttp عند بدء التطبيق
+        logging.info("✅ تم الاتصال بقاعدة البيانات وإنشاء جلسة aiohttp بنجاح.")
 
         await setup_scheduler()
         await init_bot()
@@ -90,6 +95,11 @@ async def close_resources():
         if app.db_pool:
             await app.db_pool.close()
             logging.info("✅ تم إغلاق اتصال قاعدة البيانات بنجاح.")
+
+        # ✅ إغلاق جميع جلسات aiohttp المفتوحة
+        if app.aiohttp_session:
+            await app.aiohttp_session.close()
+            logging.info("✅ تم إغلاق جميع جلسات aiohttp بنجاح.")
 
     except Exception as e:
         logging.error(f"❌ خطأ أثناء إغلاق الموارد: {e}")
