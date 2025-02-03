@@ -272,3 +272,17 @@ async def get_user_subscriptions(connection, telegram_id: int):
     except Exception as e:
         logging.error(f"❌ خطأ أثناء جلب اشتراكات المستخدم {telegram_id}: {e}")
         return []
+
+
+async def record_payment(connection, user_id: int, payment_id: str, amount: float, plan_id: int):
+    """تسجيل تفاصيل الدفع في قاعدة البيانات."""
+    try:
+        await connection.execute("""
+            INSERT INTO payments (user_id, payment_id, amount, plan_id, payment_date)
+            VALUES ($1, $2, $3, $4, NOW())
+        """, user_id, payment_id, amount, plan_id)
+        logging.info(f"✅ تم تسجيل الدفع {payment_id} للمستخدم {user_id}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ فشل في تسجيل الدفع: {e}")
+        return False
