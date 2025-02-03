@@ -2,7 +2,7 @@ import logging
 import os
 from quart import Blueprint, request, jsonify
 from aiogram import Bot, Router, types
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, Update
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from dotenv import load_dotenv

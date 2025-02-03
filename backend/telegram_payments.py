@@ -3,6 +3,8 @@ import json
 import aiohttp
 import os
 import asyncio
+from aiogram.filter import ContentTypesFilter
+from aiogram.enums import ContentType
 from aiogram import Router, types
 from aiogram.types import Message, PreCheckoutQuery
 from aiogram.enums import ContentType
@@ -37,7 +39,7 @@ async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 
 
 # 🔹 معالجة الدفع الناجح
-@router.message(content_type=ContentType.SUCCESSFUL_PAYMENT)
+@router.message(ContentTypeFilter(content_types=[ContentType.SUCCESSFUL_PAYMENT]))
 async def handle_successful_payment(message: Message):
     if not message.successful_payment:
         return
@@ -48,7 +50,7 @@ async def handle_successful_payment(message: Message):
         telegram_id = payload["userId"]
         plan_id = payload["planId"]
         payment_id = payment.telegram_payment_charge_id
-        amount = payment.total_amount // 100  # تحويل النجوم إلى الدولار
+        amount = payment.total_amount // 100  # تحويل النجوم إلى دولار
 
         logging.info(f"✅ استلام دفعة جديدة من {telegram_id} للخطة {plan_id}, مبلغ: {amount}")
 
