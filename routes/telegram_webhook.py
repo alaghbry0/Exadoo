@@ -3,6 +3,7 @@ import json
 import aiohttp
 import os
 import asyncio
+import asyncpg
 from dotenv import load_dotenv
 from quart import Blueprint, request, jsonify, current_app
 from aiogram.utils.web_app import check_webapp_signature

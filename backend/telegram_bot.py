@@ -1,42 +1,41 @@
 import logging
 import os
-import asyncio
-from quart import Blueprint, current_app
-from aiogram import Bot, Dispatcher, types
+from quart import Blueprint
+from aiogram import Bot, Router, types
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from dotenv import load_dotenv
+from backend.telegram_payments import router as payment_router  # ✅ استيراد معالجات الدفع
 
-# تحميل متغيرات البيئة
+# 🔹 تحميل متغيرات البيئة
 load_dotenv()
 
-# إعداد تسجيل الأخطاء
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# 🔹 إعداد تسجيل الأخطاء
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# استيراد القيم من .env
+# 🔹 استيراد القيم من .env
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEB_APP_URL = os.getenv("WEB_APP_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# إنشاء Blueprint للبوت داخل Quart
+# 🔹 إنشاء Blueprint للبوت داخل Quart
 telegram_bot = Blueprint("telegram_bot", __name__)
 
-# إنشاء كائن `aiogram` Dispatcher
+# 🔹 إعداد Aiogram 3.x
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dispatcher = Dispatcher()
+dp = Router()  # ✅ استخدام Router بدلاً من Dispatcher
 
+# ✅ تضمين معالجات الدفع داخل البوت
+dp.include_router(payment_router)
 
-# دالة لمعالجة الأخطاء
+# 🔹 دالة معالجة الأخطاء
 async def handle_errors(user_id: int, error_message: str):
     """معالجة الأخطاء أثناء إرسال الرسائل إلى المستخدمين."""
     logging.error(f"❌ خطأ مع المستخدم {user_id}: {error_message}")
 
-
-# وظيفة /start
-@dispatcher.message(Command("start"))
+# 🔹 وظيفة /start
+@dp.message(Command("start"))
 async def start_command(message: Message):
     """إرسال زر فتح التطبيق المصغر عند استخدام /start."""
     user_id = message.from_user.id
@@ -56,8 +55,7 @@ async def start_command(message: Message):
         reply_markup=keyboard
     )
 
-
-# دالة إرسال رسالة إلى المستخدم عبر البوت
+# 🔹 دالة إرسال رسالة إلى المستخدم عبر البوت
 async def send_message_to_user(user_id: int, message_text: str):
     """إرسال رسالة مباشرة إلى مستخدم عبر دردشة البوت."""
     if not message_text:
@@ -76,40 +74,36 @@ async def send_message_to_user(user_id: int, message_text: str):
     except Exception as e:
         await handle_errors(user_id, f"Unexpected error: {e}")
 
-
-# إعداد Webhook
+# 🔹 إعداد Webhook
 async def setup_webhook():
-    webhook_url = "https://exadoo.onrender.com/webhook"  # ✅ إزالة الخطأ من العنوان
-    secret_token = os.getenv("WEBHOOK_SECRET")
+    webhook_url = "https://exadoo.onrender.com/webhook"
 
-    if not secret_token:
+    if not WEBHOOK_SECRET:
         logging.error("❌ WEBHOOK_SECRET غير مضبوط! الرجاء التحقق من الإعدادات.")
         return
 
     try:
-        await bot.set_webhook(
-            url=webhook_url,
-            secret_token=secret_token
-        )
+        await bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
         logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url}")
     except Exception as e:
         logging.error(f"❌ فشل تعيين Webhook: {e}")
 
-@dispatcher.message(Command("setwebhook"))
+@dp.message(Command("setwebhook"))
 async def cmd_setwebhook(message: types.Message):
     await setup_webhook()
-    await message.answer("✅ Webhook configured!")
+    await message.answer("✅ Webhook تم ضبطه بنجاح!")
 
-# تشغيل `aiogram` داخل `Quart`
+# 🔹 تشغيل `aiogram` داخل `Quart`
 async def init_bot():
     """ربط بوت `aiogram` مع `Quart` عند تشغيل التطبيق."""
     logging.info("✅ Telegram Bot Ready!")
 
-# تشغيل `aiogram` في سيرفر `Quart`
-async def start_telegram_bot(payment_handlers=None):
-    """تشغيل `aiogram` Dispatcher في الخلفية."""
-    if payment_handlers:
-        payment_handlers(dispatcher)  # إضافة معالجات الدفع إذا كانت متوفرة
+# 🔹 تشغيل `aiogram` في سيرفر `Quart`
+async def start_telegram_bot():
+    """تشغيل `aiogram` Router في الخلفية."""
+    try:
+        logging.info("🚀 بدء تشغيل بوت تيليجرام...")
+        await dp.start_polling(bot)  # ✅ استخدام start_polling بدلاً من loop.create_task()
+    except Exception as e:
+        logging.critical(f"❌ فشل تشغيل بوت تيليجرام: {e}")
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(dispatcher.start_polling(bot))
