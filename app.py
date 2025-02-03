@@ -99,7 +99,7 @@ async def close_resources():
 async def home():
     return "🚀 Exadoo API is running!"
 
-# 🔹 تشغيل التطبيق
 if __name__ == "__main__":
-    logging.info(f"🚀 تشغيل Exadoo API على المنفذ 5000...")
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", 5000))  # ✅ تحديد المنفذ تلقائيًا من متغير البيئة
+    logging.info(f"🚀 تشغيل Exadoo API على المنفذ {port}...")
+    app.run(debug=False, host="0.0.0.0", port=port)
