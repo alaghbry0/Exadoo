@@ -100,10 +100,11 @@ async def init_bot():
 
 # 🔹 تشغيل `aiogram` في سيرفر `Quart`
 async def start_telegram_bot():
-    """تشغيل `aiogram` Router في الخلفية."""
+    """تشغيل Aiogram Router في الخلفية."""
     try:
         logging.info("🚀 بدء تشغيل بوت تيليجرام...")
-        await dp.start_polling(bot)  # ✅ استخدام start_polling بدلاً من loop.create_task()
+        await dp.start_polling(bot)  # ✅ استخدام start_polling
     except Exception as e:
         logging.critical(f"❌ فشل تشغيل بوت تيليجرام: {e}")
+
 

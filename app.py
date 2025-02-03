@@ -8,7 +8,6 @@ from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
 from routes.telegram_webhook import payments_bp
-from backend.telegram_payments import setup_payment_handlers  # <-- استيراد معالجات الدفع الجديدة
 from backend.telegram_bot import init_bot, start_telegram_bot, setup_webhook
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
@@ -31,7 +30,7 @@ app = cors(app, allow_origin=ALLOWED_ORIGINS)
 
 # 🔹 إعداد تسجيل الأخطاء والمعلومات
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
@@ -43,7 +42,7 @@ private_key = RSA.import_key(private_key_content)
 message = b"transaction data"
 hash_msg = SHA256.new(message)
 signature = pkcs1_15.new(private_key).sign(hash_msg)
-logging.info(f"✅ Signed message: {signature.hex()}")
+logging.info(f"✅ تم توقيع البيانات بنجاح: {signature.hex()}")
 
 # 🔹 تسجيل نقاط API
 app.register_blueprint(subscriptions_bp)
@@ -71,7 +70,7 @@ async def create_db_connection():
         await setup_scheduler()
         await init_bot()
         await setup_webhook()
-        await start_telegram_bot(setup_payment_handlers)
+        await start_telegram_bot()
 
     except asyncpg.exceptions.PostgresError as e:
         logging.critical(f"🚨 فشل الاتصال بقاعدة البيانات: {e}")
@@ -79,6 +78,7 @@ async def create_db_connection():
 
     except Exception as e:
         logging.error(f"❌ خطأ أثناء الاتصال بقاعدة البيانات أو بدء الخدمات: {e}")
+        raise RuntimeError("❌ حدث خطأ أثناء تشغيل التطبيق.") from e
 
 # 🔹 إغلاق الموارد عند إيقاف التطبيق
 @app.after_serving
@@ -101,5 +101,5 @@ async def home():
 
 # 🔹 تشغيل التطبيق
 if __name__ == "__main__":
-    logging.info("🚀 تشغيل Exadoo API...")
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    logging.info(f"🚀 تشغيل Exadoo API على المنفذ 5000...")
+    app.run(debug=False, host="0.0.0.0", port=5000)
