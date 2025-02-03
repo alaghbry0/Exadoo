@@ -23,7 +23,7 @@ SUBSCRIBE_URL = "https://exadoo.onrender.com/api/subscribe"
 async def telegram_webhook():
     """نقطة استقبال مدفوعات تليجرام عبر Webhook"""
 
-    # ✅ التحقق من `WEBHOOK_SECRET`
+    # ✅ التحقق من WEBHOOK_SECRET
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if secret != os.getenv("WEBHOOK_SECRET"):
         logging.error("❌ Webhook request غير موثوق!")
@@ -32,7 +32,7 @@ async def telegram_webhook():
     try:
         data = await request.get_json()
 
-        # ✅ التحقق من صحة الطلب باستخدام `check_webapp_signature`
+        # ✅ التحقق من صحة الطلب باستخدام check_webapp_signature
         if not check_webapp_signature(
                 current_app.config["TELEGRAM_BOT_TOKEN"],
                 request.args.get("initData", "")
@@ -97,7 +97,7 @@ async def telegram_webhook():
 
 async def send_subscription_request(payload, headers, max_retries=3):
     """
-    🔁 دالة لإرسال طلب تجديد الاشتراك مع `Retry` في حالة الفشل.
+    🔁 دالة لإرسال طلب تجديد الاشتراك مع Retry في حالة الفشل.
     """
     for attempt in range(1, max_retries + 1):
         async with aiohttp.ClientSession() as session:

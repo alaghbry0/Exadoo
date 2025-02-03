@@ -8,7 +8,7 @@ from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
 from routes.telegram_webhook import payments_bp
-from backend.telegram_bot import telegram_bot
+from backend.telegram_bot import init_bot, start_telegram_bot, setup_webhook
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
 from Crypto.Signature import pkcs1_15
@@ -16,7 +16,7 @@ from Crypto.PublicKey import RSA
 from Crypto.Hash import SHA256
 
 # ✅ التحقق من متغيرات البيئة الأساسية قبل تشغيل التطبيق
-REQUIRED_ENV_VARS = ["PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET"]
+REQUIRED_ENV_VARS = ["PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET", "PORT"]
 for var in REQUIRED_ENV_VARS:
     if not os.environ.get(var):
         raise ValueError(f"❌ متغير البيئة {var} غير مضبوط. الرجاء التأكد من الإعدادات.")
@@ -99,6 +99,7 @@ async def close_resources():
 async def home():
     return "🚀 Exadoo API is running!"
 
+# 🔹 تشغيل التطبيق
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))  # ✅ تحديد المنفذ تلقائيًا من متغير البيئة
     logging.info(f"🚀 تشغيل Exadoo API على المنفذ {port}...")
