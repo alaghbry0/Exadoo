@@ -79,10 +79,21 @@ async def send_message_to_user(user_id: int, message_text: str):
 
 # إعداد Webhook
 async def setup_webhook():
-    await bot.set_webhook(
-        url="https://yourdomain.com/webhook",
-        secret_token=os.getenv("WEBHOOK_SECRET")
-    )
+    webhook_url = "https://exadoo.onrender.com/webhook"  # ✅ إزالة الخطأ من العنوان
+    secret_token = os.getenv("WEBHOOK_SECRET")
+
+    if not secret_token:
+        logging.error("❌ WEBHOOK_SECRET غير مضبوط! الرجاء التحقق من الإعدادات.")
+        return
+
+    try:
+        await bot.set_webhook(
+            url=webhook_url,
+            secret_token=secret_token
+        )
+        logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url}")
+    except Exception as e:
+        logging.error(f"❌ فشل تعيين Webhook: {e}")
 
 @dispatcher.message(Command("setwebhook"))
 async def cmd_setwebhook(message: types.Message):
