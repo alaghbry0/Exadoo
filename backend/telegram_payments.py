@@ -37,7 +37,7 @@ async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 
 
 # 🔹 معالجة الدفع الناجح
-@router.message(content_types=ContentType.SUCCESSFUL_PAYMENT)
+@router.message(content_type=ContentType.SUCCESSFUL_PAYMENT)
 async def handle_successful_payment(message: Message):
     if not message.successful_payment:
         return

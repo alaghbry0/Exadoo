@@ -8,7 +8,7 @@ from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
 from routes.telegram_webhook import payments_bp
-from backend.telegram_bot import init_bot, start_telegram_bot, setup_webhook
+from backend.telegram_bot import telegram_bot
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
 from Crypto.Signature import pkcs1_15
