@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 from quart import Blueprint
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
@@ -19,20 +20,26 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEB_APP_URL = os.getenv("WEB_APP_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
+# ✅ التحقق من القيم المطلوبة في البيئة
+if not TELEGRAM_BOT_TOKEN or not WEBHOOK_SECRET or not WEB_APP_URL:
+    raise ValueError("❌ خطأ: يجب ضبط TELEGRAM_BOT_TOKEN و WEBHOOK_SECRET و WEB_APP_URL في البيئة!")
+
 # 🔹 إنشاء Blueprint للبوت داخل Quart
 telegram_bot = Blueprint("telegram_bot", __name__)
 
 # 🔹 إعداد Aiogram 3.x
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()   # ✅ استخدام Router بدلاً من Dispatcher
+dp = Dispatcher()
 
 # ✅ تضمين معالجات الدفع داخل البوت
 dp.include_router(payment_router)
 
-# 🔹 دالة معالجة الأخطاء
+
+# 🔹 دالة معالجة الأخطاء أثناء إرسال الرسائل
 async def handle_errors(user_id: int, error_message: str):
     """معالجة الأخطاء أثناء إرسال الرسائل إلى المستخدمين."""
     logging.error(f"❌ خطأ مع المستخدم {user_id}: {error_message}")
+
 
 # 🔹 وظيفة /start
 @dp.message(Command("start"))
@@ -41,19 +48,20 @@ async def start_command(message: Message):
     user_id = message.from_user.id
     username = message.from_user.username or "غير معروف"
 
-    # إعداد زر التطبيق المصغر
+    # ✅ إعداد زر التطبيق المصغر
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔹 فتح التطبيق المصغر", web_app=WebAppInfo(url=WEB_APP_URL))]
     ])
 
-    # تسجيل بيانات المستخدم
+    # ✅ تسجيل بيانات المستخدم
     logging.info(f"✅ /start من المستخدم: {user_id}, Username: {username}")
 
-    # إرسال الرسالة مع الزر
+    # ✅ إرسال الرسالة مع الزر
     await message.answer(
         text="مرحبًا بك! اضغط على الزر أدناه لفتح التطبيق المصغر 👇",
         reply_markup=keyboard
     )
+
 
 # 🔹 دالة إرسال رسالة إلى المستخدم عبر البوت
 async def send_message_to_user(user_id: int, message_text: str):
@@ -74,29 +82,44 @@ async def send_message_to_user(user_id: int, message_text: str):
     except Exception as e:
         await handle_errors(user_id, f"Unexpected error: {e}")
 
-# 🔹 إعداد Webhook
-async def setup_webhook():
+
+# 🔹 إعداد Webhook مع `retry`
+async def setup_webhook(max_retries=3):
+    """إعداد Webhook مع إعادة المحاولة عند الفشل."""
     webhook_url = "https://exadoo.onrender.com/webhook"
 
     if not WEBHOOK_SECRET:
         logging.error("❌ WEBHOOK_SECRET غير مضبوط! الرجاء التحقق من الإعدادات.")
-        return
+        return False
 
-    try:
-        await bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
-        logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url}")
-    except Exception as e:
-        logging.error(f"❌ فشل تعيين Webhook: {e}")
+    for attempt in range(1, max_retries + 1):
+        try:
+            await bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
+            logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url}")
+            return True
+        except Exception as e:
+            logging.error(f"❌ فشل تعيين Webhook، المحاولة {attempt}/{max_retries}: {e}")
+
+        await asyncio.sleep(2 ** attempt)  # ⏳ انتظار قبل إعادة المحاولة
+
+    logging.critical("🚨 جميع محاولات تعيين Webhook فشلت!")
+    return False
+
 
 @dp.message(Command("setwebhook"))
 async def cmd_setwebhook(message: types.Message):
-    await setup_webhook()
-    await message.answer("✅ Webhook تم ضبطه بنجاح!")
+    success = await setup_webhook()
+    if success:
+        await message.answer("✅ Webhook تم ضبطه بنجاح!")
+    else:
+        await message.answer("❌ فشل في تعيين Webhook. يرجى التحقق من السجلات.")
+
 
 # 🔹 تشغيل aiogram داخل Quart
 async def init_bot():
     """ربط بوت aiogram مع Quart عند تشغيل التطبيق."""
     logging.info("✅ Telegram Bot Ready!")
+
 
 # ✅ إغلاق جلسة بوت تيليجرام عند إيقاف التطبيق
 async def close_bot_session():
@@ -106,8 +129,8 @@ async def close_bot_session():
     except Exception as e:
         logging.error(f"❌ خطأ أثناء إغلاق جلسة بوت تيليجرام: {e}")
 
+
 # 🔹 تشغيل aiogram في سيرفر Quart
 async def start_telegram_bot():
     """بدء تشغيل Webhook فقط، بدون Polling."""
     logging.info("🚀 Webhook يعمل فقط، لا يوجد Polling.")
-

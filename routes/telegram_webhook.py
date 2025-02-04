@@ -16,8 +16,6 @@ payments_bp = Blueprint("payments", __name__)
 # 🔹 عنوان API الخاص بتحديث الاشتراك
 SUBSCRIBE_URL = "https://exadoo.onrender.com/api/subscribe"
 
-
-# 🔹 Webhook لمعالجة المدفوعات الواردة من تليجرام
 @payments_bp.route("/webhook", methods=["POST"])
 async def telegram_webhook():
     """نقطة استقبال مدفوعات تليجرام عبر Webhook"""
@@ -25,31 +23,41 @@ async def telegram_webhook():
     # ✅ التحقق من WEBHOOK_SECRET
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if secret != os.getenv("WEBHOOK_SECRET"):
-        logging.error("❌ Webhook request غير موثوق!")
+        logging.error("❌ Webhook request غير موثوق! تم رفضه.")
         return jsonify({"error": "Unauthorized request"}), 403
 
     try:
         data = await request.get_json()
+        logging.info(f"📥 Webhook received: {json.dumps(data, indent=2)}")
 
         # ✅ التأكد من وجود بيانات الدفع
         payment = data.get("message", {}).get("successful_payment")
         if not payment:
-            logging.warning("⚠️ تم استقبال Webhook بدون بيانات دفع")
+            logging.warning("⚠️ تم استقبال Webhook بدون بيانات دفع صحيحة")
             return jsonify({"error": "No payment data"}), 400
 
-        # ✅ استخراج البيانات من الطلب
-        payload = json.loads(payment["invoice_payload"])
+        # ✅ محاولة فك تشفير `invoice_payload`
+        try:
+            payload = json.loads(payment["invoice_payload"])
+        except json.JSONDecodeError:
+            logging.error("❌ فشل في فك تشفير `invoice_payload`")
+            return jsonify({"error": "Invalid invoice payload"}), 400
+
         telegram_id = payload.get("userId")
         plan_id = payload.get("planId")
         payment_id = payment.get("telegram_payment_charge_id")
         amount = payment.get("total_amount", 0) // 100  # تحويل النجوم إلى الدولار
+
+        if not telegram_id or not plan_id or not payment_id:
+            logging.error("❌ بيانات الدفع غير مكتملة!")
+            return jsonify({"error": "Missing payment details"}), 400
 
         logging.info(f"✅ استلام دفعة جديدة من {telegram_id} للخطة {plan_id}, مبلغ: {amount}")
 
         # ✅ التحقق من توفر اتصال بقاعدة البيانات
         db_pool = getattr(current_app, "db_pool", None)
         if not db_pool:
-            logging.error("❌ قاعدة البيانات غير متاحة!")
+            logging.critical("❌ قاعدة البيانات غير متاحة!")
             return jsonify({"error": "Database unavailable"}), 500
 
         async with db_pool.acquire() as conn:
@@ -78,7 +86,7 @@ async def telegram_webhook():
             return jsonify({"error": "Subscription update failed"}), 500
 
     except Exception as e:
-        logging.error(f"❌ خطأ في Webhook الدفع: {e}")
+        logging.exception("❌ خطأ غير متوقع أثناء معالجة Webhook الدفع")
         return jsonify({"error": "Internal server error"}), 500
 
 
