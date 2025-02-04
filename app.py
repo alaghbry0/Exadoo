@@ -29,7 +29,7 @@ app = Quart(__name__)
 app.aiohttp_session = None
 
 # 🔹 ضبط CORS للسماح بمصادر محددة فقط
-ALLOWED_ORIGINS = ["https://exadoo.onrender.com", "https://telegram.org"]
+ALLOWED_ORIGINS = ["https://exadooo-git-main-mohammeds-projects-3d2877c6.vercel.app", "https://exadoo.onrender.com", "https://telegram.org"]
 app = cors(app, allow_origin=ALLOWED_ORIGINS)
 
 # 🔹 إعداد تسجيل الأخطاء والمعلومات
