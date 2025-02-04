@@ -2,15 +2,10 @@ from quart import Blueprint, request, jsonify, current_app
 import logging
 import re
 import pytz
-from aiogram import Bot
-from config import TELEGRAM_BOT_TOKEN
 from database.db_queries import get_user, add_user, get_user_subscriptions
 from datetime import datetime, timedelta, timezone  # <-- تأكد من وجود timezone هنا
 
 user_bp = Blueprint("users", __name__)
-
-# تهيئة البوت لجلب بيانات المستخدم من Telegram API
-telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # المسار الافتراضي لصورة الملف الشخصي
 DEFAULT_PROFILE_PHOTO = "/static/default_profile.png"
@@ -27,6 +22,7 @@ def clean_name(full_name: str) -> str:
 async def get_telegram_user_info(telegram_id: int):
     """ 🔹 جلب بيانات المستخدم (الاسم واسم المستخدم) من Telegram API """
     try:
+        telegram_bot = current_app.bot  # ✅ استخدام البوت الموجود في `app.py`
         user = await telegram_bot.get_chat(telegram_id)
         full_name = clean_name(user.full_name) if user.full_name else "N/L"
         username = f"@{user.username}" if user.username else "N/L"
@@ -39,10 +35,11 @@ async def get_telegram_user_info(telegram_id: int):
 async def get_telegram_profile_photo(telegram_id: int) -> str:
     """ 🔹 جلب صورة الملف الشخصي للمستخدم من Telegram API بشكل صحيح """
     try:
+        telegram_bot = current_app.bot  # ✅ استخدام البوت الموجود في `app.py`
         user_photos = await telegram_bot.get_user_profile_photos(user_id=telegram_id, limit=1)
         if user_photos.photos:
             file = await telegram_bot.get_file(user_photos.photos[0][0].file_id)
-            return f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file.file_path}"
+            return f"https://api.telegram.org/file/bot{current_app.config['TELEGRAM_BOT_TOKEN']}/{file.file_path}"
         return DEFAULT_PROFILE_PHOTO
     except Exception as e:
         logging.error(f"❌ خطأ في جلب صورة المستخدم {telegram_id}: {str(e)}")
@@ -135,4 +132,3 @@ async def get_user_info():
     except Exception as e:
         logging.error(f"❌ خطأ أثناء جلب بيانات المستخدم {telegram_id}: {e}", exc_info=True)
         return jsonify({"error": "Internal Server Error"}), 500
-

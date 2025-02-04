@@ -9,7 +9,7 @@ from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
 from routes.telegram_webhook import payments_bp
-from backend.telegram_bot import init_bot, start_telegram_bot, setup_webhook
+from backend.telegram_bot import init_bot, start_telegram_bot, setup_webhook, close_bot_session
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
 from Crypto.Signature import pkcs1_15
@@ -25,7 +25,7 @@ for var in REQUIRED_ENV_VARS:
 # 🔹 إنشاء التطبيق
 app = Quart(__name__)
 
-# ✅ جلسة `aiohttp` عامة يمكن استخدامها في كل مكان
+# ✅ جلسة aiohttp عامة يمكن استخدامها في كل مكان
 app.aiohttp_session = None
 
 # 🔹 ضبط CORS للسماح بمصادر محددة فقط
@@ -90,16 +90,18 @@ async def create_db_connection():
 async def close_resources():
     try:
         logging.info("🔄 جاري إغلاق الجلسات المفتوحة...")
+        await close_bot_session()  # ✅ إغلاق جلسة بوت تيليجرام هنا
         await close_telegram_bot_session()
 
-        if app.db_pool:
-            await app.db_pool.close()
-            logging.info("✅ تم إغلاق اتصال قاعدة البيانات بنجاح.")
-
-        # ✅ إغلاق جميع جلسات aiohttp المفتوحة
+        # ✅ إغلاق جلسة aiohttp أولاً
         if app.aiohttp_session:
             await app.aiohttp_session.close()
             logging.info("✅ تم إغلاق جميع جلسات aiohttp بنجاح.")
+
+        # 🔹 إغلاق اتصال قاعدة البيانات بعد ذلك
+        if app.db_pool:
+            await app.db_pool.close()
+            logging.info("✅ تم إغلاق اتصال قاعدة البيانات بنجاح.")
 
     except Exception as e:
         logging.error(f"❌ خطأ أثناء إغلاق الموارد: {e}")

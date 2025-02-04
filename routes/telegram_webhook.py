@@ -47,7 +47,7 @@ async def telegram_webhook():
         logging.info(f"✅ استلام دفعة جديدة من {telegram_id} للخطة {plan_id}, مبلغ: {amount}")
 
         # ✅ التحقق من توفر اتصال بقاعدة البيانات
-        db_pool = current_app.db_pool if hasattr(current_app, "db_pool") else None
+        db_pool = getattr(current_app, "db_pool", None)
         if not db_pool:
             logging.error("❌ قاعدة البيانات غير متاحة!")
             return jsonify({"error": "Database unavailable"}), 500
@@ -85,29 +85,29 @@ async def telegram_webhook():
 async def send_subscription_request(payload, headers, max_retries=3):
     """
     🔁 دالة لإرسال طلب تجديد الاشتراك مع `Retry` في حالة الفشل.
+    ✅ يتم استخدام `current_app.aiohttp_session` بدلاً من إنشاء جلسة جديدة.
     """
-    session = current_app.aiohttp_session  # ✅ استخدام الجلسة العامة
+    session = getattr(current_app, "aiohttp_session", None)
+    if not session or session.closed:
+        logging.critical("❌ جلسة aiohttp غير صالحة!")
+        return False
 
-    try:
-        for attempt in range(1, max_retries + 1):
-            try:
-                async with session.post(SUBSCRIBE_URL, json=payload, headers=headers) as resp:
-                    response_text = await resp.text()
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with session.post(SUBSCRIBE_URL, json=payload, headers=headers) as resp:
+                response_text = await resp.text()
 
-                    if resp.status == 200:
-                        logging.info("✅ تم تجديد الاشتراك بنجاح!")
-                        return True
-                    else:
-                        logging.error(f"❌ فشل تجديد الاشتراك، المحاولة {attempt}/{max_retries}: {response_text}")
+                if resp.status == 200:
+                    logging.info("✅ تم تجديد الاشتراك بنجاح!")
+                    return True
+                else:
+                    logging.error(f"❌ فشل تجديد الاشتراك، المحاولة {attempt}/{max_retries}: {response_text}")
 
-            except Exception as e:
-                logging.error(f"❌ خطأ أثناء الاتصال بـ API الاشتراك، المحاولة {attempt}/{max_retries}: {e}")
+        except Exception as e:
+            logging.error(f"❌ خطأ أثناء الاتصال بـ API الاشتراك، المحاولة {attempt}/{max_retries}: {e}")
 
-            if attempt < max_retries:
-                await asyncio.sleep(2 ** attempt)  # ⏳ انتظار قبل إعادة المحاولة
-
-    except Exception as e:
-        logging.error(f"❌ خطأ عام أثناء إرسال طلب الاشتراك: {e}")
+        if attempt < max_retries:
+            await asyncio.sleep(2 ** attempt)  # ⏳ انتظار قبل إعادة المحاولة
 
     logging.critical("🚨 جميع محاولات تحديث الاشتراك فشلت!")
     return False

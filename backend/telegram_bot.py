@@ -98,7 +98,16 @@ async def init_bot():
     """ربط بوت aiogram مع Quart عند تشغيل التطبيق."""
     logging.info("✅ Telegram Bot Ready!")
 
+# ✅ إغلاق جلسة بوت تيليجرام عند إيقاف التطبيق
+async def close_bot_session():
+    try:
+        await bot.session.close()
+        logging.info("✅ تم إغلاق جلسة بوت تيليجرام بنجاح.")
+    except Exception as e:
+        logging.error(f"❌ خطأ أثناء إغلاق جلسة بوت تيليجرام: {e}")
+
 # 🔹 تشغيل aiogram في سيرفر Quart
 async def start_telegram_bot():
     """بدء تشغيل Webhook فقط، بدون Polling."""
     logging.info("🚀 Webhook يعمل فقط، لا يوجد Polling.")
+
