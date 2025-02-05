@@ -27,6 +27,12 @@ async def telegram_webhook():
         data = await request.get_json()
         logging.info(f"📥 Webhook received: {json.dumps(data, indent=2)}")
 
+        # ✅ التأكد من أن التحديث يحتوي على "successful_payment"
+        payment = data.get("message", {}).get("successful_payment", None)
+        if not payment:
+            logging.warning("⚠️ Webhook received a non-payment update. Ignoring it.")
+            return jsonify({"message": "Ignored non-payment update"}), 200
+
         # ✅ استخراج بيانات الدفع
         payment = data.get("message", {}).get("successful_payment", {})
 
