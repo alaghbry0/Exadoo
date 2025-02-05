@@ -141,7 +141,7 @@ async def init_bot():
 async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
     """✅ التحقق من صحة الفاتورة قبل إتمام الدفع"""
     try:
-        logging.info(f"📥 استلام pre_checkout_query من {pre_checkout.from_user.id}")
+        logging.info(f"📥 استلام pre_checkout_query: {pre_checkout}")
 
         # ✅ التحقق من صحة invoice_payload
         payload = json.loads(pre_checkout.invoice_payload)
@@ -179,5 +179,8 @@ async def close_bot_session():
 async def start_bot():
     """✅ بدء تشغيل Webhook فقط إذا لم يكن مضبوطًا مسبقًا"""
     logging.info("🚀 التحقق من Webhook قبل التعيين...")
-    dp.include_router(dp)
-    await setup_webhook()  # ✅ التحقق من Webhook قبل تعيينه
+    # ✅ حذف أي Webhook قديم
+    await bot.delete_webhook()
+
+    # ✅ تعيين Webhook الجديد
+    await setup_webhook()
