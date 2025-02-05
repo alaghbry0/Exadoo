@@ -141,13 +141,16 @@ async def init_bot():
 async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
     """✅ التحقق من صحة الفاتورة قبل إتمام الدفع"""
     try:
-        # التحقق من invoice_payload (مثال)
+        logging.info(f"📥 استلام pre_checkout_query من {pre_checkout.from_user.id}")
+
+        # ✅ التحقق من صحة invoice_payload
         payload = json.loads(pre_checkout.invoice_payload)
-        if not payload.get("userId"):
+        if not payload.get("userId") or not payload.get("planId"):
+            logging.error("❌ `invoice_payload` غير صالح!")
             await bot.answer_pre_checkout_query(
                 pre_checkout.id,
                 ok=False,
-                error_message="بيانات الدفع غير صالحة"
+                error_message="بيانات الدفع غير صالحة!"
             )
             return
 
@@ -176,4 +179,5 @@ async def close_bot_session():
 async def start_bot():
     """✅ بدء تشغيل Webhook فقط إذا لم يكن مضبوطًا مسبقًا"""
     logging.info("🚀 التحقق من Webhook قبل التعيين...")
+    dp.include_router(dp)
     await setup_webhook()  # ✅ التحقق من Webhook قبل تعيينه
