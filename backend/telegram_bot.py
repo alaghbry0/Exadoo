@@ -7,7 +7,6 @@ from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, W
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from dotenv import load_dotenv
-from backend.telegram_payments import router as payment_router  # ✅ استيراد معالجات الدفع
 
 # 🔹 تحميل متغيرات البيئة
 load_dotenv()
@@ -31,8 +30,6 @@ telegram_bot = Blueprint("telegram_bot", __name__)
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
-# ✅ تضمين معالجات الدفع داخل البوت
-dp.include_router(payment_router)
 
 
 # 🔹 دالة معالجة الأخطاء أثناء إرسال الرسائل
