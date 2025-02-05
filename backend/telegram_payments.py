@@ -7,6 +7,8 @@ from aiogram.types import Message, SuccessfulPayment
 from quart import current_app
 from database.db_queries import record_payment
 
+
+
 # 🔹 إعدادات الـ Router لـ aiogram
 router = Router()
 
@@ -14,7 +16,7 @@ router = Router()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ✅ رابط Webhook لمعالجة المدفوعات
-WEBHOOK_URL = "http://127.0.0.1:5000/webhook"
+webhook_url = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # ✅ تحميل `WEBHOOK_SECRET`
 
 

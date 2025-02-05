@@ -18,7 +18,7 @@ from Crypto.PublicKey import RSA
 from Crypto.Hash import SHA256
 
 # ✅ التحقق من متغيرات البيئة الأساسية قبل تشغيل التطبيق
-REQUIRED_ENV_VARS = ["PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET", "PORT"]
+REQUIRED_ENV_VARS = ["PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET", "PORT", "WEBHOOK_URL"]
 for var in REQUIRED_ENV_VARS:
     if not os.environ.get(var):
         raise ValueError(f"❌ متغير البيئة {var} غير مضبوط. الرجاء التأكد من الإعدادات.")
@@ -75,14 +75,10 @@ async def create_db_connection():
         logging.info("✅ تم الاتصال بقاعدة البيانات وإنشاء جلسة aiohttp بنجاح.")
 
         await setup_scheduler()
-        await init_bot()
-        await setup_webhook()
-        await start_telegram_bot()
-
+        await init_bot()  # ✅ بدء تشغيل البوت هنا
     except asyncpg.exceptions.PostgresError as e:
         logging.critical(f"🚨 فشل الاتصال بقاعدة البيانات: {e}")
         raise RuntimeError("🚨 فشل بدء التطبيق بسبب مشكلة في قاعدة البيانات.") from e
-
     except Exception as e:
         logging.error(f"❌ خطأ أثناء الاتصال بقاعدة البيانات أو بدء الخدمات: {e}")
         raise RuntimeError("❌ حدث خطأ أثناء تشغيل التطبيق.") from e

@@ -5,11 +5,12 @@ import asyncio
 import asyncpg
 from quart import Blueprint, request, jsonify, current_app
 
+
 # 🔹 إنشاء Blueprint لمعاملات الدفع
 payments_bp = Blueprint("payments", __name__)
 
 # 🔹 عنوان API الخاص بتحديث الاشتراك
-SUBSCRIBE_URL = "http://127.0.0.1:5000/api/subscribe"
+webhook_url = os.getenv("SUBSCRIBE_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # ✅ تحميل `WEBHOOK_SECRET`
 
 @payments_bp.route("/webhook", methods=["POST"])

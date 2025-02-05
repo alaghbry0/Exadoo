@@ -86,7 +86,7 @@ async def send_message_to_user(user_id: int, message_text: str):
 # 🔹 إعداد Webhook مع `retry`
 async def setup_webhook(max_retries=3):
     """إعداد Webhook مع إعادة المحاولة عند الفشل."""
-    webhook_url = "https://exadoo.onrender.com/webhook"
+    webhook_url = os.getenv("WEBHOOK_URL")
 
     if not WEBHOOK_SECRET:
         logging.error("❌ WEBHOOK_SECRET غير مضبوط! الرجاء التحقق من الإعدادات.")
@@ -118,8 +118,12 @@ async def cmd_setwebhook(message: types.Message):
 # 🔹 تشغيل aiogram داخل Quart
 async def init_bot():
     """ربط بوت aiogram مع Quart عند تشغيل التطبيق."""
-    logging.info("✅ Telegram Bot Ready!")
-
+    try:
+        await setup_webhook()  # إعداد Webhook
+        await start_telegram_bot()  # بدء تشغيل البوت
+        logging.info("✅ Telegram Bot Ready!")
+    except Exception as e:
+        logging.error(f"❌ Failed to initialize Telegram Bot: {e}")
 
 # ✅ إغلاق جلسة بوت تيليجرام عند إيقاف التطبيق
 async def close_bot_session():
