@@ -59,21 +59,25 @@ async def add_subscription(
     telegram_id: int,
     channel_id: int,
     subscription_type_id: int,
-    start_date: datetime,  # <-- أضف هذا البارامتر
+    start_date: datetime,
     expiry_date: datetime,
-    is_active: bool = True
+    is_active: bool = True,
+    payment_id: str = None  # <-- إضافة payment_id كمعامل اختياري
 ):
     try:
         await connection.execute("""
             INSERT INTO subscriptions 
-            (telegram_id, channel_id, subscription_type_id, start_date, expiry_date, is_active)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """, telegram_id, channel_id, subscription_type_id, start_date, expiry_date, is_active)
-        logging.info(f"✅ Subscription added for user {telegram_id}")
+            (telegram_id, channel_id, subscription_type_id, start_date, expiry_date, is_active, payment_id, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        """, telegram_id, channel_id, subscription_type_id, start_date, expiry_date, is_active, payment_id)
+
+        logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id})")
         return True
+
     except Exception as e:
-        logging.error(f"❌ Error adding subscription: {e}")
+        logging.error(f"❌ Error adding subscription for {telegram_id}: {e}")
         return False
+
 
 # 1. تعديل دالة update_subscription (إزالة التعليقات الداخلية)
 async def update_subscription(
@@ -83,22 +87,37 @@ async def update_subscription(
     subscription_type_id: int,
     new_expiry_date: datetime,
     start_date: datetime,
-    is_active: bool = True
+    is_active: bool = True,
+    payment_id: str = None  # <-- إضافة payment_id كمعامل اختياري
 ):
     try:
-        await connection.execute("""
-            UPDATE subscriptions SET
-                subscription_type_id = $1,
-                expiry_date = $2,
-                start_date = $3,
-                is_active = $4,
-                updated_at = NOW()
-            WHERE telegram_id = $5 AND channel_id = $6
-        """, subscription_type_id, new_expiry_date, start_date, is_active, telegram_id, channel_id)
-        logging.info(f"✅ Subscription updated for {telegram_id}")
+        if payment_id:  # ✅ تحديث payment_id فقط إذا كان موجودًا
+            await connection.execute("""
+                UPDATE subscriptions SET
+                    subscription_type_id = $1,
+                    expiry_date = $2,
+                    start_date = $3,
+                    is_active = $4,
+                    payment_id = $5,
+                    updated_at = NOW()
+                WHERE telegram_id = $6 AND channel_id = $7
+            """, subscription_type_id, new_expiry_date, start_date, is_active, payment_id, telegram_id, channel_id)
+        else:  # ✅ تحديث بدون تعديل `payment_id`
+            await connection.execute("""
+                UPDATE subscriptions SET
+                    subscription_type_id = $1,
+                    expiry_date = $2,
+                    start_date = $3,
+                    is_active = $4,
+                    updated_at = NOW()
+                WHERE telegram_id = $5 AND channel_id = $6
+            """, subscription_type_id, new_expiry_date, start_date, is_active, telegram_id, channel_id)
+
+        logging.info(f"✅ Subscription updated for {telegram_id} (Channel: {channel_id})")
         return True
+
     except Exception as e:
-        logging.error(f"❌ Error updating subscription: {e}")
+        logging.error(f"❌ Error updating subscription for {telegram_id}: {e}")
         return False
 
 async def get_subscription(connection, telegram_id: int, channel_id: int):
@@ -274,15 +293,17 @@ async def get_user_subscriptions(connection, telegram_id: int):
         return []
 
 
-async def record_payment(connection, user_id: int, payment_id: str, amount: float, plan_id: int):
-    """تسجيل تفاصيل الدفع في قاعدة البيانات."""
+async def record_payment(conn, user_id, payment_id, amount, subscription_type_id):
+    """تسجيل عملية الدفع في قاعدة البيانات."""
     try:
-        await connection.execute("""
-            INSERT INTO payments (user_id, payment_id, amount, plan_id, payment_date)
+        await conn.execute(
+            """
+            INSERT INTO payments (user_id, subscription_type_id, amount, payment_id, payment_date)
             VALUES ($1, $2, $3, $4, NOW())
-        """, user_id, payment_id, amount, plan_id)
-        logging.info(f"✅ تم تسجيل الدفع {payment_id} للمستخدم {user_id}")
-        return True
+            """,
+            user_id, subscription_type_id, amount, payment_id
+        )
+        logging.info(f"✅ تم تسجيل الدفع بنجاح: {payment_id}")
     except Exception as e:
         logging.error(f"❌ فشل في تسجيل الدفع: {e}")
-        return False
+

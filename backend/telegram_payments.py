@@ -3,96 +3,75 @@ import json
 import os
 import asyncio
 from aiogram import Router, types
-from aiogram.types import Message, SuccessfulPayment, PreCheckoutQuery
+from aiogram.types import Message, SuccessfulPayment
 from quart import current_app
 from database.db_queries import record_payment
 
-# 🔹 إنشاء Router جديد لـ aiogram 3.x
+# 🔹 إعدادات الـ Router لـ aiogram
 router = Router()
 
 # 🔹 إعداد تسجيل الأخطاء
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ✅ `RETRY_LIMIT` لتحديد عدد محاولات إعادة الطلب عند فشل الاتصال
-RETRY_LIMIT = 3
+# ✅ رابط Webhook لمعالجة المدفوعات
+WEBHOOK_URL = "http://127.0.0.1:5000/webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # ✅ تحميل `WEBHOOK_SECRET`
 
 
-# 🔹 التحقق من صحة المدفوعات قبل تأكيد الدفع
-@router.pre_checkout_query()
-async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery):
-    try:
-        payload = json.loads(pre_checkout_query.invoice_payload)
-
-        if not payload.get("planId") or not payload.get("userId"):
-            logging.error(f"❌ بيانات الدفع غير صحيحة: {payload}")
-            await pre_checkout_query.answer(ok=False, error_message="Invalid payment payload")
-            return
-
-        # ✅ التحقق من أن total_amount مطابق للسعر المتوقع (لزيادة الأمان)
-        expected_price = payload.get("amount", 0)
-        if pre_checkout_query.total_amount != expected_price * 100:
-            logging.warning(f"⚠️ مبلغ غير متطابق: متوقع {expected_price}, لكن وصل {pre_checkout_query.total_amount / 100}")
-            await pre_checkout_query.answer(ok=False, error_message="Price mismatch error")
-            return
-
-        logging.info(f"✅ فاتورة جديدة لمستخدم {payload['userId']} بقيمة {pre_checkout_query.total_amount / 100}")
-        await pre_checkout_query.answer(ok=True)
-
-    except Exception as e:
-        logging.error(f"❌ خطأ أثناء التحقق من الفاتورة: {e}")
-        await pre_checkout_query.answer(ok=False, error_message="Internal error")
-
-
-# 🔹 معالجة الدفع الناجح
 @router.message()
 async def handle_successful_payment(message: Message):
-    if isinstance(message.successful_payment, SuccessfulPayment):  # ✅ التحقق من نوع الرسالة
+    """🔹 معالجة الدفع الناجح"""
+    if isinstance(message.successful_payment, SuccessfulPayment):
         try:
             payment = message.successful_payment
             payload = json.loads(payment.invoice_payload)
-            telegram_id = payload["userId"]
-            plan_id = payload["planId"]
+
+            # ✅ التحقق من البيانات المستلمة
+            telegram_id = payload.get("userId")
+            plan_id = payload.get("planId")
             payment_id = payment.telegram_payment_charge_id
             amount = payment.total_amount // 100  # تحويل النجوم إلى الدولار
 
+            if not isinstance(telegram_id, int) or not isinstance(plan_id, int) or not isinstance(payment_id, str):
+                logging.error(
+                    f"❌ بيانات الدفع غير صالحة! telegram_id={telegram_id}, plan_id={plan_id}, payment_id={payment_id}")
+                return await message.answer("⚠️ بيانات الدفع غير صحيحة، يرجى التواصل مع الدعم.")
+
             logging.info(f"✅ استلام دفعة جديدة من {telegram_id} للخطة {plan_id}, مبلغ: {amount}")
 
-            # ✅ التحقق من اتصال قاعدة البيانات
+            # ✅ تسجيل الدفع في قاعدة البيانات
             db_pool = getattr(current_app, "db_pool", None)
             if not db_pool:
                 logging.error("❌ قاعدة البيانات غير متاحة!")
                 return await message.answer("⚠️ خطأ داخلي، يرجى المحاولة لاحقًا.")
 
             async with db_pool.acquire() as conn:
-                # ✅ التحقق من أن الدفع غير مسجل مسبقًا
                 existing_payment = await conn.fetchrow("SELECT * FROM payments WHERE payment_id = $1", payment_id)
                 if existing_payment:
                     logging.warning(f"⚠️ الدفع مسجل مسبقًا: {payment_id}")
                     return await message.answer("✅ تم استلام دفعتك بالفعل!")
 
-                # ✅ تسجيل الدفع في قاعدة البيانات
-                await record_payment(conn, user_id=telegram_id, payment_id=payment_id, amount=amount, plan_id=plan_id)
+                await record_payment(conn, user_id=telegram_id, payment_id=payment_id, amount=amount,
+                                     subscription_type_id=plan_id)
 
-            # ✅ إرسال طلب إلى API Next.js لتجديد الاشتراك
-            success = await send_subscription_request(telegram_id, plan_id, payment_id)
+            # ✅ إرسال الطلب إلى `/webhook`
+            success = await send_to_webhook(telegram_id, plan_id, payment_id)
 
             if success:
-                return await message.answer("🎉 تم تفعيل اشتراكك بنجاح!")
+                return await message.answer("✅ تم استلام الدفع بنجاح! سيتم تفعيل اشتراكك قريبًا.")
             else:
-                return await message.answer("⚠️ حدث خطأ أثناء تجديد الاشتراك، يرجى التواصل مع الدعم.")
+                return await message.answer("⚠️ حدث خطأ أثناء إرسال الدفع، يرجى التواصل مع الدعم.")
 
+        except json.JSONDecodeError as e:
+            logging.error(f"❌ خطأ في تحليل بيانات الفاتورة: {e}")
+            await message.answer("⚠️ بيانات الدفع غير صالحة، يرجى التواصل مع الدعم.")
         except Exception as e:
             logging.error(f"❌ خطأ أثناء معالجة الدفع: {e}")
             await message.answer("⚠️ حدث خطأ أثناء معالجة الدفع، يرجى المحاولة لاحقًا.")
 
 
-async def send_subscription_request(telegram_id, plan_id, payment_id):
-    """
-    🔁 دالة لإرسال طلب تجديد الاشتراك مع `Retry` في حالة الفشل.
-    ✅ يتم استخدام `current_app.aiohttp_session` بدلاً من إنشاء جلسة جديدة.
-    """
-    subscribe_url = "https://exadoo.onrender.com/api/subscribe"
-    webhook_secret = os.getenv("WEBHOOK_SECRET")
+async def send_to_webhook(telegram_id, plan_id, payment_id, max_retries=3):
+    """🔁 إرسال بيانات الدفع إلى `/webhook` مع `Retry` في حالة الفشل"""
 
     session = getattr(current_app, "aiohttp_session", None)
     if not session or session.closed:
@@ -104,24 +83,29 @@ async def send_subscription_request(telegram_id, plan_id, payment_id):
         "subscription_type_id": plan_id,
         "payment_id": payment_id
     }
-    headers = {"Authorization": f"Bearer {webhook_secret}"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET  # ✅ إرسال `WEBHOOK_SECRET` لضمان أمان الطلبات
+    }
 
-    for attempt in range(1, RETRY_LIMIT + 1):
+    for attempt in range(1, max_retries + 1):
         try:
-            async with session.post(subscribe_url, json=payload, headers=headers) as resp:
+            logging.info(f"🚀 إرسال طلب الدفع إلى {WEBHOOK_URL} - المحاولة {attempt}/{max_retries}")
+            async with session.post(WEBHOOK_URL, json=payload, headers=headers) as resp:
                 response_text = await resp.text()
+                logging.info(f"🔹 استجابة Webhook: {resp.status} - {response_text}")
 
                 if resp.status == 200:
-                    logging.info(f"✅ تم تجديد الاشتراك بنجاح للمستخدم {telegram_id}")
+                    logging.info("✅ تم إرسال الدفع بنجاح!")
                     return True
                 else:
-                    logging.error(f"❌ فشل تجديد الاشتراك، المحاولة {attempt}/{RETRY_LIMIT}: {response_text}")
+                    logging.error(f"❌ فشل إرسال الدفع، المحاولة {attempt}/{max_retries}: {response_text}")
 
         except Exception as e:
-            logging.error(f"❌ خطأ أثناء الاتصال بـ API الاشتراك، المحاولة {attempt}/{RETRY_LIMIT}: {e}")
+            logging.error(f"❌ خطأ أثناء الاتصال بـ Webhook، المحاولة {attempt}/{max_retries}: {e}")
 
-        if attempt < RETRY_LIMIT:
-            await asyncio.sleep(2 ** attempt)  # ⏳ انتظار قبل إعادة المحاولة
+        if attempt < max_retries:
+            await asyncio.sleep(2 ** attempt)  # ⏳ انتظار متزايد بين المحاولات (2s, 4s, 8s)
 
-    logging.critical(f"🚨 جميع محاولات تجديد الاشتراك للمستخدم {telegram_id} فشلت!")
+    logging.critical("🚨 جميع محاولات إرسال الدفع فشلت!")
     return False

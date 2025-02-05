@@ -3,26 +3,22 @@ import json
 import os
 import asyncio
 import asyncpg
-from dotenv import load_dotenv
 from quart import Blueprint, request, jsonify, current_app
-from aiogram.utils.web_app import check_webapp_signature
-from database.db_queries import record_payment
-
-load_dotenv()
 
 # 🔹 إنشاء Blueprint لمعاملات الدفع
 payments_bp = Blueprint("payments", __name__)
 
 # 🔹 عنوان API الخاص بتحديث الاشتراك
-SUBSCRIBE_URL = "https://exadoo.onrender.com/api/subscribe"
+SUBSCRIBE_URL = "http://127.0.0.1:5000/api/subscribe"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # ✅ تحميل `WEBHOOK_SECRET`
 
 @payments_bp.route("/webhook", methods=["POST"])
 async def telegram_webhook():
-    """نقطة استقبال مدفوعات تليجرام عبر Webhook"""
+    """🔄 استلام الدفع وإرساله إلى `/api/subscribe`"""
 
-    # ✅ التحقق من WEBHOOK_SECRET
+    # ✅ التحقق من `WEBHOOK_SECRET`
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret != os.getenv("WEBHOOK_SECRET"):
+    if not secret or secret != WEBHOOK_SECRET:
         logging.error("❌ Webhook request غير موثوق! تم رفضه.")
         return jsonify({"error": "Unauthorized request"}), 403
 
@@ -30,80 +26,68 @@ async def telegram_webhook():
         data = await request.get_json()
         logging.info(f"📥 Webhook received: {json.dumps(data, indent=2)}")
 
-        # ✅ التأكد من وجود بيانات الدفع
-        payment = data.get("message", {}).get("successful_payment")
-        if not payment:
-            logging.warning("⚠️ تم استقبال Webhook بدون بيانات دفع صحيحة")
-            return jsonify({"error": "No payment data"}), 400
+        # ✅ استخراج بيانات الدفع
+        payment = data.get("message", {}).get("successful_payment", {})
 
-        # ✅ محاولة فك تشفير `invoice_payload`
         try:
-            payload = json.loads(payment["invoice_payload"])
-        except json.JSONDecodeError:
-            logging.error("❌ فشل في فك تشفير `invoice_payload`")
+            payload = json.loads(payment.get("invoice_payload", "{}"))  # ✅ تأكد من استخراج `invoice_payload` الصحيح
+        except json.JSONDecodeError as e:
+            logging.error(f"❌ فشل في فك تشفير `invoice_payload`: {e}")
             return jsonify({"error": "Invalid invoice payload"}), 400
 
         telegram_id = payload.get("userId")
-        plan_id = payload.get("planId")
+        subscription_type_id = payload.get("planId")
         payment_id = payment.get("telegram_payment_charge_id")
-        amount = payment.get("total_amount", 0) // 100  # تحويل النجوم إلى الدولار
 
-        if not telegram_id or not plan_id or not payment_id:
-            logging.error("❌ بيانات الدفع غير مكتملة!")
-            return jsonify({"error": "Missing payment details"}), 400
+        # ✅ التحقق من صحة البيانات المستلمة
+        if not isinstance(telegram_id, int) or not isinstance(subscription_type_id, int) or not isinstance(payment_id, str):
+            logging.error(
+                f"❌ Invalid data format: telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={payment_id}")
+            return jsonify({"error": "Invalid payment data format"}), 400
 
-        logging.info(f"✅ استلام دفعة جديدة من {telegram_id} للخطة {plan_id}, مبلغ: {amount}")
-
-        # ✅ التحقق من توفر اتصال بقاعدة البيانات
-        db_pool = getattr(current_app, "db_pool", None)
-        if not db_pool:
-            logging.critical("❌ قاعدة البيانات غير متاحة!")
-            return jsonify({"error": "Database unavailable"}), 500
-
-        async with db_pool.acquire() as conn:
-            # ✅ التحقق من أن الدفع غير مسجل مسبقًا
-            existing_payment = await conn.fetchrow("SELECT * FROM payments WHERE payment_id = $1", payment_id)
-            if existing_payment:
-                logging.warning(f"⚠️ الدفع مسجل مسبقًا: {payment_id}")
-                return jsonify({"message": "Payment already processed"}), 200
-
-            # ✅ تسجيل الدفع في قاعدة البيانات
-            await record_payment(conn, user_id=telegram_id, payment_id=payment_id, amount=amount, plan_id=plan_id)
-
-        # ✅ إرسال طلب إلى API Next.js لتجديد الاشتراك
-        webhook_secret = os.getenv("WEBHOOK_SECRET")
-        headers = {"Authorization": f"Bearer {webhook_secret}"}
+        # ✅ إعداد البيانات الصحيحة قبل الإرسال
         payload = {
             "telegram_id": telegram_id,
-            "subscription_type_id": plan_id,
+            "subscription_type_id": subscription_type_id,
             "payment_id": payment_id
         }
 
-        success = await send_subscription_request(payload, headers)
+        # ✅ إرسال الطلب إلى `/api/subscribe`
+        success = await send_to_subscribe_api(payload)
         if success:
             return jsonify({"message": "Subscription updated successfully"}), 200
         else:
             return jsonify({"error": "Subscription update failed"}), 500
 
+    except json.JSONDecodeError as e:
+        logging.error(f"❌ JSON Decode Error: {e}")
+        return jsonify({"error": "Invalid JSON format"}), 400
+    except asyncpg.PostgresError as e:
+        logging.error(f"❌ Database Error: {e}")
+        return jsonify({"error": "Database error"}), 500
     except Exception as e:
-        logging.exception("❌ خطأ غير متوقع أثناء معالجة Webhook الدفع")
+        logging.exception(f"❌ خطأ غير متوقع: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 
-async def send_subscription_request(payload, headers, max_retries=3):
-    """
-    🔁 دالة لإرسال طلب تجديد الاشتراك مع `Retry` في حالة الفشل.
-    ✅ يتم استخدام `current_app.aiohttp_session` بدلاً من إنشاء جلسة جديدة.
-    """
+async def send_to_subscribe_api(payload, max_retries=3):
+    """🔁 إرسال بيانات الدفع إلى `/api/subscribe` مع `Retry` في حالة الفشل"""
+
     session = getattr(current_app, "aiohttp_session", None)
     if not session or session.closed:
         logging.critical("❌ جلسة aiohttp غير صالحة!")
         return False
 
+    headers = {
+        "Authorization": f"Bearer {WEBHOOK_SECRET}"
+    }
+
     for attempt in range(1, max_retries + 1):
         try:
+            logging.info(f"🚀 إرسال طلب الاشتراك إلى {SUBSCRIBE_URL} - المحاولة {attempt}/{max_retries}")
             async with session.post(SUBSCRIBE_URL, json=payload, headers=headers) as resp:
                 response_text = await resp.text()
+                logging.info(f"🔹 استجابة API: {resp.status} - {response_text}")
 
                 if resp.status == 200:
                     logging.info("✅ تم تجديد الاشتراك بنجاح!")
@@ -115,7 +99,7 @@ async def send_subscription_request(payload, headers, max_retries=3):
             logging.error(f"❌ خطأ أثناء الاتصال بـ API الاشتراك، المحاولة {attempt}/{max_retries}: {e}")
 
         if attempt < max_retries:
-            await asyncio.sleep(2 ** attempt)  # ⏳ انتظار قبل إعادة المحاولة
+            await asyncio.sleep(2 ** attempt)  # ⏳ تأخير تصاعدي بين المحاولات
 
     logging.critical("🚨 جميع محاولات تحديث الاشتراك فشلت!")
     return False

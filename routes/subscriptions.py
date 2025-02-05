@@ -1,7 +1,9 @@
 import logging
 import pytz
+
+import os
 from quart import Blueprint, request, jsonify, current_app
-from datetime import datetime, timedelta, timezone  # <-- إضافة timezone
+from datetime import datetime, timedelta, timezone
 from database.db_queries import (
     get_user, add_user, add_subscription, update_subscription, add_scheduled_task
 )
@@ -10,11 +12,10 @@ from utils.db_utils import add_user_to_channel
 # إنشاء Blueprint لنقاط API الخاصة بالاشتراكات
 subscriptions_bp = Blueprint("subscriptions", __name__)
 
-LOCAL_TZ = pytz.timezone("Asia/Riyadh")  # يمكنك تغييره حسب منطقتك الزمنية
+LOCAL_TZ = pytz.timezone("Asia/Riyadh")  # التوقيت المحلي
+IS_DEVELOPMENT = True  # يمكن تغييره بناءً على بيئة التطبيق
 
-# تحديد إذا كان التطبيق في وضع الاختبار
-IS_DEVELOPMENT = True  # يمكن تغيير هذا بناءً على إعدادات البيئة (مثال: os.getenv("ENVIRONMENT") == "development")
-
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # تحميل مفتاح Webhook من المتغيرات البيئية
 
 @subscriptions_bp.route("/api/subscribe", methods=["POST"])
 async def subscribe():
@@ -22,25 +23,60 @@ async def subscribe():
     نقطة API للاشتراك أو تجديد الاشتراك.
     """
     try:
+        import json
+        # ✅ التحقق من `WEBHOOK_SECRET`
+        secret = request.headers.get("Authorization")
+        if not secret or secret != f"Bearer {WEBHOOK_SECRET}":
+            logging.warning("❌ Unauthorized request: Invalid or missing WEBHOOK_SECRET")
+            return jsonify({"error": "Unauthorized request"}), 403
+
+        # ✅ استقبال البيانات
         data = await request.get_json()
+        logging.info(
+            f"📥 بيانات الطلب المستلمة في /api/subscribe: {json.dumps(data, indent=2)}")  # ✅ تسجيل البيانات المستلمة
         telegram_id = data.get("telegram_id")
         subscription_type_id = data.get("subscription_type_id")
+        payment_id = data.get("payment_id")
         username = data.get("username", None)
         full_name = data.get("full_name", None)
 
-        logging.info(f"📥 Received subscription request: telegram_id={telegram_id}, subscription_type_id={subscription_type_id}")
+        logging.info(f"📥 Received subscription request: telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={payment_id}")
 
-        if not isinstance(telegram_id, int) or not isinstance(subscription_type_id, int):
-            logging.error("❌ Invalid data format: 'telegram_id' and 'subscription_type_id' must be integers.")
-            return jsonify({"error": "Invalid data format. 'telegram_id' and 'subscription_type_id' must be integers."}), 400
+        # ✅ التحقق من صحة البيانات
+        if not isinstance(telegram_id, int) or not isinstance(subscription_type_id, int) or not isinstance(payment_id,
+                                                                                                           str):
+            logging.error(
+                f"❌ Invalid data format: telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={payment_id}")
+            return jsonify({"error": "Invalid data format"}), 400
 
-        db_pool = current_app.db_pool if hasattr(current_app, "db_pool") else None
+        logging.info(
+            f"✅ استلام طلب اشتراك: telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={payment_id}")
+
+        # ✅ التأكد من اتصال قاعدة البيانات
+        db_pool = getattr(current_app, "db_pool", None)
         if not db_pool:
-            logging.error("❌ Database connection is missing!")
+            logging.critical("❌ Database connection is missing!")
             return jsonify({"error": "Internal Server Error"}), 500
 
         async with db_pool.acquire() as connection:
-            # إدارة بيانات المستخدم
+            # ✅ التحقق من `payment_id` لمنع التكرار
+            existing_payment = await connection.fetchrow("SELECT * FROM payments WHERE payment_id = $1", payment_id)
+
+            # ✅ إذا كان الدفع موجودًا، نتحقق مما إذا كان الاشتراك بحاجة إلى تحديث
+            if existing_payment:
+                logging.warning(f"⚠️ الدفع مسجل مسبقًا: {payment_id}")
+
+                # التحقق مما إذا كان الاشتراك لهذا المستخدم والخطة محدثًا أم لا
+                existing_subscription = await connection.fetchrow(
+                    "SELECT * FROM subscriptions WHERE telegram_id = $1 AND subscription_type_id = $2 AND payment_id = $3",
+                    telegram_id, subscription_type_id, payment_id
+                )
+
+                if existing_subscription:
+                    logging.info(f"✅ الاشتراك محدث بالفعل لـ {telegram_id}, لا حاجة للتحديث.")
+                    return jsonify({"message": "Subscription already updated"}), 200
+
+            # ✅ إدارة بيانات المستخدم
             user = await get_user(connection, telegram_id)
             if not user:
                 added = await add_user(connection, telegram_id, username=username, full_name=full_name)
@@ -48,7 +84,7 @@ async def subscribe():
                     logging.error(f"❌ Failed to add user {telegram_id}")
                     return jsonify({"error": "Failed to register user"}), 500
 
-            # جلب تفاصيل نوع الاشتراك مع المدة
+            # ✅ جلب تفاصيل نوع الاشتراك
             subscription_type = await connection.fetchrow(
                 "SELECT id, name, channel_id, duration_days FROM subscription_types WHERE id = $1",
                 subscription_type_id
@@ -60,18 +96,14 @@ async def subscribe():
             subscription_name = subscription_type["name"]
             channel_id = int(subscription_type["channel_id"])
 
-            # استخدام مدة قصيرة في وضع الاختبار
-            if IS_DEVELOPMENT:
-                duration_days = 0
-                duration_minutes = 5
-            else:
-                duration_days = subscription_type.get("duration_days", 30)
-                duration_minutes = 0
+            # ✅ تحديد مدة الاشتراك بناءً على البيئة (اختبارية أو فعلية)
+            duration_days = 0 if IS_DEVELOPMENT else subscription_type["duration_days"]
+            duration_minutes = 5 if IS_DEVELOPMENT else 0
 
-            # الحصول على التوقيت الحالي بالتوقيت العالمي (UTC)
+            # ✅ الحصول على الوقت الحالي UTC
             current_time = datetime.now(timezone.utc)
 
-            # البحث عن الاشتراك الحالي
+            # ✅ البحث عن اشتراك المستخدم
             subscription = await connection.fetchrow(
                 "SELECT * FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2",
                 telegram_id,
@@ -79,8 +111,8 @@ async def subscribe():
             )
 
             if subscription:
+                # ✅ تمديد الاشتراك إن كان نشطًا، وإلا إنشاء اشتراك جديد
                 is_subscription_active = subscription['is_active'] and subscription['expiry_date'] >= current_time
-
                 if is_subscription_active:
                     new_expiry = subscription['expiry_date'] + timedelta(minutes=duration_minutes, days=duration_days)
                     start_date = subscription['start_date']
@@ -95,7 +127,9 @@ async def subscribe():
                     subscription_type_id,
                     new_expiry,
                     start_date,
-                    True
+                    True,
+                    payment_id
+
                 )
                 if not success:
                     logging.error(f"❌ Failed to update subscription for {telegram_id}")
@@ -105,7 +139,7 @@ async def subscribe():
 
             else:
                 start_date = current_time
-                new_expiry = start_date + timedelta(days=duration_days, minutes=duration_minutes)
+                new_expiry = start_date + timedelta(minutes=duration_minutes, days=duration_days)
 
                 added = await add_subscription(
                     connection,
@@ -114,7 +148,8 @@ async def subscribe():
                     subscription_type_id,
                     start_date,
                     new_expiry,
-                    True
+                    True,
+                    payment_id
                 )
                 if not added:
                     logging.error(f"❌ Failed to create subscription for {telegram_id}")
@@ -122,31 +157,21 @@ async def subscribe():
 
                 logging.info(f"✅ New subscription created for {telegram_id} until {new_expiry}")
 
-            # إضافة المستخدم إلى القناة
+            # ✅ إضافة المستخدم إلى القناة
             user_added = await add_user_to_channel(telegram_id, subscription_type_id, db_pool)
             if not user_added:
                 logging.error(f"❌ Failed to add user {telegram_id} to channel {channel_id}")
-                return jsonify({"error": "Failed to add user to channel"}), 500
 
-            # جدولة التذكيرات
-            if IS_DEVELOPMENT:
-                reminders = [
-                    ("first_reminder", new_expiry - timedelta(minutes=2)),
-                    ("second_reminder", new_expiry - timedelta(minutes=1)),
-                    ("remove_user", new_expiry),
-                ]
-            else:
-                reminders = [
-                    ("first_reminder", new_expiry - timedelta(hours=24)),
-                    ("second_reminder", new_expiry - timedelta(hours=1)),
-                    ("remove_user", new_expiry),
-                ]
+            # ✅ جدولة التذكيرات
+            reminders = [
+                ("first_reminder", new_expiry - timedelta(minutes=2 if IS_DEVELOPMENT else 1440)),  # 24 ساعة
+                ("second_reminder", new_expiry - timedelta(minutes=1 if IS_DEVELOPMENT else 60)),   # 1 ساعة
+                ("remove_user", new_expiry),
+            ]
 
             for task_type, execute_time in reminders:
                 if execute_time.tzinfo is None:
                     execute_time = execute_time.replace(tzinfo=timezone.utc)
-
-                # تحويل التوقيت إلى UTC+3 قبل تخزينه أو تسجيله في السجلات
                 execute_time_local = execute_time.astimezone(LOCAL_TZ)
 
                 await add_scheduled_task(
@@ -158,7 +183,7 @@ async def subscribe():
                 )
                 logging.info(f"📅 Scheduled '{task_type}' at {execute_time_local}")
 
-            # تحويل `start_date` و `new_expiry` إلى التوقيت المحلي (UTC+3)
+            # ✅ تحويل `start_date` و `new_expiry` إلى التوقيت المحلي (UTC+3)
             start_date_local = start_date.astimezone(LOCAL_TZ)
             new_expiry_local = new_expiry.astimezone(LOCAL_TZ)
 
