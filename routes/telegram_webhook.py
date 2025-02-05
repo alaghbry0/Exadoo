@@ -21,8 +21,12 @@ async def telegram_webhook():
     """🔄 استقبال الدفع وتحديث الاشتراك"""
     try:
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        if not secret or secret != WEBHOOK_SECRET:
-            logging.error("❌ Webhook request غير موثوق! تم رفضه.")
+        if not secret:
+            logging.error("❌ Webhook request مرفوض! لم يتم إرسال Secret Token.")
+            return jsonify({"error": "Unauthorized request"}), 403
+
+        if secret != WEBHOOK_SECRET:
+            logging.error(f"❌ Webhook request غير موثوق! Token غير متطابق: {secret}")
             return jsonify({"error": "Unauthorized request"}), 403
 
         data = await request.get_json()

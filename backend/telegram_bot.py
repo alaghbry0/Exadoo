@@ -94,7 +94,7 @@ async def setup_webhook(max_retries=3):
             await bot.set_webhook(
                 url=webhook_url,
                 secret_token=WEBHOOK_SECRET,
-                allowed_updates=["message", "successful_payment"]  # ✅ إضافة `successful_payment`
+                allowed_updates=["message", "successful_payment",  "pre_checkout_query"]  # ✅ إضافة `successful_payment`
             )
             logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url} مع `successful_payment`")
             return True
@@ -140,3 +140,5 @@ async def close_bot_session():
 async def start_telegram_bot():
     """بدء تشغيل Webhook فقط، بدون Polling."""
     logging.info("🚀 Webhook يعمل فقط، لا يوجد Polling.")
+    await bot.delete_webhook()  # مسح أي Webhook قديم
+    await setup_webhook()  # تعيين Webhook الجديد

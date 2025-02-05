@@ -1,6 +1,8 @@
 import asyncpg
 import logging
 import os
+import asyncio
+
 import aiohttp  # ✅ استيراد aiohttp
 from quart import Quart
 from quart_cors import cors
@@ -74,8 +76,11 @@ async def create_db_connection():
         app.aiohttp_session = aiohttp.ClientSession()  # ✅ إنشاء جلسة aiohttp عند بدء التطبيق
         logging.info("✅ تم الاتصال بقاعدة البيانات وإنشاء جلسة aiohttp بنجاح.")
 
-        await setup_scheduler()
-        await init_bot()  # ✅ بدء تشغيل البوت هنا
+        await setup_scheduler()  # ✅ بدء تشغيل المهام المجدولة
+        await setup_webhook()  # ✅ إعداد Webhook للبوت
+
+        logging.info("✅ جميع الخدمات تم تشغيلها بنجاح.")
+
     except asyncpg.exceptions.PostgresError as e:
         logging.critical(f"🚨 فشل الاتصال بقاعدة البيانات: {e}")
         raise RuntimeError("🚨 فشل بدء التطبيق بسبب مشكلة في قاعدة البيانات.") from e
@@ -100,6 +105,8 @@ async def close_resources():
         if app.db_pool:
             await app.db_pool.close()
             logging.info("✅ تم إغلاق اتصال قاعدة البيانات بنجاح.")
+
+        await bot.session.close()  # ✅ إغلاق جلسة بوت تيليجرام
 
     except Exception as e:
         logging.error(f"❌ خطأ أثناء إغلاق الموارد: {e}")
