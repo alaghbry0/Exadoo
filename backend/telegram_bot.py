@@ -94,7 +94,7 @@ async def setup_webhook(max_retries=3):
             await bot.set_webhook(
                 url=webhook_url,
                 secret_token=WEBHOOK_SECRET,
-                allowed_updates=["message", "successful_payment",  "pre_checkout_query"]  # ✅ إضافة `successful_payment`
+                allowed_updates = ["message", "pre_checkout_query", "successful_payment"]  # ✅ إضافة `successful_payment`
             )
             logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url} مع `successful_payment`")
             return True
@@ -126,6 +126,24 @@ async def init_bot():
         logging.info("✅ Telegram Bot Ready!")
     except Exception as e:
         logging.error(f"❌ Failed to initialize Telegram Bot: {e}")
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout_query(pre_checkout: types.PreCheckoutQuery):
+    """معالجة استعلام `pre_checkout_query` قبل الدفع"""
+    try:
+        logging.info(f"📥 استلام `pre_checkout_query` من المستخدم {pre_checkout.from_user.id} - ID: {pre_checkout.id}")
+
+        # ✅ الموافقة على الطلب فورًا
+        await bot.answer_pre_checkout_query(pre_checkout.id, ok=True)
+
+        logging.info(f"✅ تمت الموافقة على `pre_checkout_query` للمستخدم {pre_checkout.from_user.id}")
+
+    except Exception as e:
+        logging.error(f"❌ خطأ أثناء معالجة `pre_checkout_query`: {e}")
+        await bot.answer_pre_checkout_query(pre_checkout.id, ok=False,
+                                            error_message="حدث خطأ أثناء معالجة الدفع. حاول مرة أخرى.")
+
 
 # ✅ إغلاق جلسة بوت تيليجرام عند إيقاف التطبيق
 async def close_bot_session():
