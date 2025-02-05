@@ -81,6 +81,7 @@ async def send_message_to_user(user_id: int, message_text: str):
 
 
 # 🔹 إعداد Webhook مع `retry`
+# 🔹 إعداد Webhook مع تجنب التكرار
 async def setup_webhook():
     """✅ ضبط Webhook فقط عند الحاجة"""
     webhook_url = os.getenv("WEBHOOK_URL")
@@ -96,6 +97,9 @@ async def setup_webhook():
             logging.info("✅ Webhook مضبوط مسبقًا، لا حاجة لتحديثه.")
             return True  # لا حاجة لإعادة التعيين
 
+        # ✅ انتظار 2-3 ثوانٍ قبل تحديث Webhook لتجنب Flood Control
+        await asyncio.sleep(2)
+
         # ✅ إذا لم يكن مضبوطًا، قم بتحديثه
         logging.info("🔄 تحديث Webhook لأن العنوان مختلف...")
         await bot.set_webhook(
@@ -109,6 +113,7 @@ async def setup_webhook():
     except Exception as e:
         logging.error(f"❌ فشل تعيين Webhook: {e}")
         return False
+
 
 @dp.message(Command("setwebhook"))
 async def cmd_setwebhook(message: types.Message):
@@ -179,8 +184,6 @@ async def close_bot_session():
 async def start_bot():
     """✅ بدء تشغيل Webhook فقط إذا لم يكن مضبوطًا مسبقًا"""
     logging.info("🚀 التحقق من Webhook قبل التعيين...")
-    # ✅ حذف أي Webhook قديم
-    await bot.delete_webhook()
 
     # ✅ تعيين Webhook الجديد
     await setup_webhook()
