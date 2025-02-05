@@ -82,25 +82,30 @@ async def send_message_to_user(user_id: int, message_text: str):
 
 # 🔹 إعداد Webhook مع `retry`
 async def setup_webhook(max_retries=3):
-    """إعداد Webhook مع إعادة المحاولة عند الفشل."""
+    """إعداد Webhook مع السماح بـ `successful_payment`."""
     webhook_url = os.getenv("WEBHOOK_URL")
 
-    if not WEBHOOK_SECRET:
-        logging.error("❌ WEBHOOK_SECRET غير مضبوط! الرجاء التحقق من الإعدادات.")
+    if not webhook_url or not WEBHOOK_SECRET:
+        logging.error("❌ `WEBHOOK_URL` أو `WEBHOOK_SECRET` غير مضبوط! تحقق من الإعدادات.")
         return False
 
     for attempt in range(1, max_retries + 1):
         try:
-            await bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
-            logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url}")
+            await bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=["message", "successful_payment"]  # ✅ إضافة `successful_payment`
+            )
+            logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url} مع `successful_payment`")
             return True
         except Exception as e:
             logging.error(f"❌ فشل تعيين Webhook، المحاولة {attempt}/{max_retries}: {e}")
 
-        await asyncio.sleep(2 ** attempt)  # ⏳ انتظار قبل إعادة المحاولة
+        await asyncio.sleep(2 ** attempt)
 
     logging.critical("🚨 جميع محاولات تعيين Webhook فشلت!")
     return False
+
 
 
 @dp.message(Command("setwebhook"))
