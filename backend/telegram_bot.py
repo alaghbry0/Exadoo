@@ -81,32 +81,34 @@ async def send_message_to_user(user_id: int, message_text: str):
 
 
 # 🔹 إعداد Webhook مع `retry`
-async def setup_webhook(max_retries=3):
-    """إعداد Webhook مع السماح بـ `successful_payment`."""
+async def setup_webhook():
+    """✅ ضبط Webhook فقط عند الحاجة"""
     webhook_url = os.getenv("WEBHOOK_URL")
 
     if not webhook_url or not WEBHOOK_SECRET:
         logging.error("❌ `WEBHOOK_URL` أو `WEBHOOK_SECRET` غير مضبوط! تحقق من الإعدادات.")
         return False
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            await bot.set_webhook(
-                url=webhook_url,
-                secret_token=WEBHOOK_SECRET,
-                allowed_updates = ["message", "pre_checkout_query", "successful_payment"]  # ✅ إضافة `successful_payment`
-            )
-            logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url} مع `successful_payment`")
-            return True
-        except Exception as e:
-            logging.error(f"❌ فشل تعيين Webhook، المحاولة {attempt}/{max_retries}: {e}")
+    try:
+        # ✅ تحقق مما إذا كان Webhook مضبوطًا بالفعل
+        webhook_info = await bot.get_webhook_info()
+        if webhook_info.url == webhook_url:
+            logging.info("✅ Webhook مضبوط مسبقًا، لا حاجة لتحديثه.")
+            return True  # لا حاجة لإعادة التعيين
 
-        await asyncio.sleep(2 ** attempt)
+        # ✅ إذا لم يكن مضبوطًا، قم بتحديثه
+        logging.info("🔄 تحديث Webhook لأن العنوان مختلف...")
+        await bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=["message", "pre_checkout_query", "successful_payment"]
+        )
+        logging.info(f"✅ تم تعيين Webhook بنجاح على {webhook_url} مع `successful_payment` و `pre_checkout_query`")
+        return True
 
-    logging.critical("🚨 جميع محاولات تعيين Webhook فشلت!")
-    return False
-
-
+    except Exception as e:
+        logging.error(f"❌ فشل تعيين Webhook: {e}")
+        return False
 
 @dp.message(Command("setwebhook"))
 async def cmd_setwebhook(message: types.Message):
@@ -119,31 +121,47 @@ async def cmd_setwebhook(message: types.Message):
 
 # 🔹 تشغيل aiogram داخل Quart
 async def init_bot():
-    """ربط بوت aiogram مع Quart عند تشغيل التطبيق."""
+    """✅ تشغيل البوت بدون إعادة ضبط Webhook إذا لم يكن ضروريًا"""
     try:
-        await setup_webhook()  # إعداد Webhook
-        await start_telegram_bot()  # بدء تشغيل البوت
+        webhook_info = await bot.get_webhook_info()
+
+        if webhook_info.url != os.getenv("WEBHOOK_URL"):  # ✅ تحديث Webhook فقط إذا لم يكن مضبوطًا
+            logging.info("🔄 تحديث Webhook لأن العنوان مختلف...")
+            await setup_webhook()
+        else:
+            logging.info("✅ Webhook مضبوط مسبقًا، لا حاجة للتحديث.")
+
         logging.info("✅ Telegram Bot Ready!")
+
     except Exception as e:
         logging.error(f"❌ Failed to initialize Telegram Bot: {e}")
 
 
 @dp.pre_checkout_query()
-async def process_pre_checkout_query(pre_checkout: types.PreCheckoutQuery):
-    """معالجة استعلام `pre_checkout_query` قبل الدفع"""
+async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
+    """✅ التحقق من صحة الفاتورة قبل إتمام الدفع"""
     try:
-        logging.info(f"📥 استلام `pre_checkout_query` من المستخدم {pre_checkout.from_user.id} - ID: {pre_checkout.id}")
+        # التحقق من invoice_payload (مثال)
+        payload = json.loads(pre_checkout.invoice_payload)
+        if not payload.get("userId"):
+            await bot.answer_pre_checkout_query(
+                pre_checkout.id,
+                ok=False,
+                error_message="بيانات الدفع غير صالحة"
+            )
+            return
 
-        # ✅ الموافقة على الطلب فورًا
+        # ✅ إذا كان كل شيء صحيح، الموافقة على الدفع
         await bot.answer_pre_checkout_query(pre_checkout.id, ok=True)
-
-        logging.info(f"✅ تمت الموافقة على `pre_checkout_query` للمستخدم {pre_checkout.from_user.id}")
+        logging.info(f"✅ تمت الموافقة على الدفع لـ {pre_checkout.from_user.id}")
 
     except Exception as e:
-        logging.error(f"❌ خطأ أثناء معالجة `pre_checkout_query`: {e}")
-        await bot.answer_pre_checkout_query(pre_checkout.id, ok=False,
-                                            error_message="حدث خطأ أثناء معالجة الدفع. حاول مرة أخرى.")
-
+        logging.error(f"❌ خطأ في pre_checkout_query: {e}")
+        await bot.answer_pre_checkout_query(
+            pre_checkout.id,
+            ok=False,
+            error_message="حدث خطأ غير متوقع"
+        )
 
 # ✅ إغلاق جلسة بوت تيليجرام عند إيقاف التطبيق
 async def close_bot_session():
@@ -155,8 +173,7 @@ async def close_bot_session():
 
 
 # 🔹 تشغيل aiogram في سيرفر Quart
-async def start_telegram_bot():
-    """بدء تشغيل Webhook فقط، بدون Polling."""
-    logging.info("🚀 Webhook يعمل فقط، لا يوجد Polling.")
-    await bot.delete_webhook()  # مسح أي Webhook قديم
-    await setup_webhook()  # تعيين Webhook الجديد
+async def start_bot():
+    """✅ بدء تشغيل Webhook فقط إذا لم يكن مضبوطًا مسبقًا"""
+    logging.info("🚀 التحقق من Webhook قبل التعيين...")
+    await setup_webhook()  # ✅ التحقق من Webhook قبل تعيينه
