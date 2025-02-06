@@ -1,6 +1,7 @@
 import logging
 import os
 import asyncio
+import sys
 import json
 import aiohttp  # ✅ استيراد `aiohttp` لإرسال الطلبات
 from aiogram import Bot, Dispatcher, types
@@ -150,17 +151,19 @@ async def handle_successful_payment(message: types.Message):
 
 
 # 🔹 تشغيل Polling بدلاً من Webhook
-is_bot_running = False  # ✅ متغير لمنع تشغيل البوت أكثر من مرة
-
+is_bot_running = False
 
 async def start_bot():
-    """✅ تشغيل Polling بدلاً من Webhook"""
     global is_bot_running
-    if is_bot_running:  # ✅ منع تشغيل البوت أكثر من مرة
+    if is_bot_running:
         logging.warning("⚠️ البوت يعمل بالفعل! تجاهل تشغيل Polling مرة أخرى.")
         return
 
     is_bot_running = True
     await remove_webhook()
     logging.info("🚀 بدء تشغيل Polling للبوت...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logging.error(f"❌ خطأ أثناء تشغيل Polling: {e}")
+        sys.exit(1)  # إغلاق التطبيق في حالة فشل التشغيل

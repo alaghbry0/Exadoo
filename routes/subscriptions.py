@@ -98,7 +98,7 @@ async def subscribe():
 
             # ✅ تحديد مدة الاشتراك بناءً على البيئة (اختبارية أو فعلية)
             duration_days = 0 if IS_DEVELOPMENT else subscription_type["duration_days"]
-            duration_minutes = 5 if IS_DEVELOPMENT else 0
+            duration_minutes = 120 if IS_DEVELOPMENT else 0
 
             # ✅ الحصول على الوقت الحالي UTC
             current_time = datetime.now(timezone.utc)
@@ -164,8 +164,8 @@ async def subscribe():
 
             # ✅ جدولة التذكيرات
             reminders = [
-                ("first_reminder", new_expiry - timedelta(minutes=2 if IS_DEVELOPMENT else 1440)),  # 24 ساعة
-                ("second_reminder", new_expiry - timedelta(minutes=1 if IS_DEVELOPMENT else 60)),   # 1 ساعة
+                ("first_reminder", new_expiry - timedelta(minutes=30 if IS_DEVELOPMENT else 1440)),  # 24 ساعة
+                ("second_reminder", new_expiry - timedelta(minutes=15 if IS_DEVELOPMENT else 60)),   # 1 ساعة
                 ("remove_user", new_expiry),
             ]
 
