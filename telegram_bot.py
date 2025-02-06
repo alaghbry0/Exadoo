@@ -18,6 +18,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # 🔹 استيراد القيم من .env
+CHANNEL_URL = os.getenv("CHANNEL_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEB_APP_URL = os.getenv("WEB_APP_URL")
 SUBSCRIBE_URL = os.getenv("SUBSCRIBE_URL")  # ✅ تحميل رابط `/api/subscribe`
@@ -43,22 +44,38 @@ async def remove_webhook():
 
 
 # 🔹 وظيفة /start
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram import Bot, Dispatcher, types
+import logging
+
+WEB_APP_URL = "https://your-web-app.com"  # ضع رابط التطبيق المصغر هنا
+CHANNEL_URL = "https://t.me/Exaado"  # رابط القناة
+
 @dp.message(Command("start"))
-async def start_command(message: Message):
+async def start_command(message: types.Message):
     """✅ إرسال زر فتح التطبيق المصغر عند استخدام /start"""
     user_id = message.from_user.id
-    username = message.from_user.username or "غير معروف"
+    full_name = message.from_user.full_name or "مستخدم عزيز"  # ✅ استخدام الاسم الكامل إن وجد
 
-    # ✅ إعداد زر التطبيق المصغر
+    # ✅ إعداد الأزرار بتنسيق جديد (زرين في نفس السطر)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔹 فتح التطبيق المصغر", web_app=WebAppInfo(url=WEB_APP_URL))]
+        [InlineKeyboardButton(text="🔹 فتح التطبيق", web_app=WebAppInfo(url=WEB_APP_URL))],
+        [InlineKeyboardButton(text="📢 فتح القناة", url=CHANNEL_URL)]
     ])
 
     # ✅ تسجيل بيانات المستخدم
-    logging.info(f"✅ /start من المستخدم: {user_id}, Username: {username}")
+    logging.info(f"✅ /start من المستخدم: {user_id}, Full Name: {full_name}")
 
-    # ✅ إرسال الرسالة مع الزر
-    await message.answer(text="مرحبًا بك! اضغط على الزر أدناه لفتح التطبيق المصغر 👇", reply_markup=keyboard)
+    # ✅ نص الترحيب المحسّن
+    welcome_text = (
+        f"👋 مرحبًا {full_name}!\n\n"
+        "مرحبًا بك في **@Exaado** \n"
+        "هنا يمكنك إدارة اشتراكاتك في قنواتنا بسهولة.\n\n"
+        "نتمنى لك تجربة رائعة! 🚀"
+    )
+
+    # ✅ إرسال الرسالة مع الأزرار
+    await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
 
 
 # 🔹 وظيفة إرسال بيانات الدفع إلى `/api/subscribe`
