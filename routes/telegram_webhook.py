@@ -36,8 +36,11 @@ def is_request_from_telegram(ip_address):
 async def telegram_webhook():
     """🔄 استقبال الدفع وتحديث الاشتراك"""
     try:
-        # ✅ الحصول على عنوان الـ IP للطلب
-        request_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+        # ✅ استخراج أول عنوان IP فقط من X-Forwarded-For
+        forwarded_ips = request.headers.get("X-Forwarded-For", "")
+        ip_list = [ip.strip() for ip in forwarded_ips.split(",") if ip.strip()]
+        request_ip = ip_list[0] if ip_list else request.remote_addr
+
         logging.info(f"📥 Webhook request received from IP: {request_ip}")
 
         # ✅ التأكد من أن الطلب قادم من خوادم تليجرام
