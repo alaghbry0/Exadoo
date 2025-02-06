@@ -11,7 +11,7 @@ from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
 from routes.telegram_webhook import payments_bp
-from telegram_bot import start_bot, telegram_bot_bp  # ✅ استخدام `telegram_bot_bp`
+from telegram_bot import start_bot, bot, telegram_bot_bp  # ✅ استخدام `telegram_bot_bp`
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
 from Crypto.Signature import pkcs1_15
@@ -49,9 +49,11 @@ async def create_db_connection():
         app.db_pool = await asyncpg.create_pool(**DATABASE_CONFIG)
         app.aiohttp_session = aiohttp.ClientSession()
         logging.info("✅ تم الاتصال بقاعدة البيانات وإنشاء جلسة aiohttp بنجاح.")
-
+        app.bot = bot
         await start_scheduler(app.db_pool)  # ✅ تشغيل الجدولة
-        asyncio.create_task(start_bot())  # ✅ تشغيل البوت عند بدء التطبيق
+        if not getattr(app, "bot_running", False):  # ✅ تأكد من أن البوت لم يتم تشغيله بالفعل
+            app.bot_running = True
+            asyncio.create_task(start_bot())  # ✅ تشغيل البوت مرة واحدة فقط
 
         logging.info("✅ جميع الخدمات تم تشغيلها بنجاح.")
 

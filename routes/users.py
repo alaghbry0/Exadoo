@@ -24,7 +24,11 @@ def clean_name(full_name: str) -> str:
 async def get_telegram_user_info(telegram_id: int):
     """ 🔹 جلب بيانات المستخدم (الاسم واسم المستخدم) من Telegram API """
     try:
-        telegram_bot = current_app.bot  # ✅ استخدام البوت الموجود في `app.py`
+        telegram_bot = getattr(current_app, "bot", None)  # ✅ استخدام `getattr` بشكل صحيح
+        if not telegram_bot:
+            logging.error("❌ فشل في جلب بيانات المستخدم: البوت غير متوفر!")
+            return "N/L", "N/L"
+
         user = await telegram_bot.get_chat(telegram_id)
         full_name = clean_name(user.full_name) if user.full_name else "N/L"
         username = f"@{user.username}" if user.username else "N/L"
@@ -35,13 +39,17 @@ async def get_telegram_user_info(telegram_id: int):
 
 
 async def get_telegram_profile_photo(telegram_id: int) -> str:
-    """ 🔹 جلب صورة الملف الشخصي للمستخدم من Telegram API بشكل صحيح """
+    """ 🔹 جلب صورة الملف الشخصي للمستخدم من Telegram API """
     try:
-        telegram_bot = current_app.bot  # ✅ استخدام البوت الموجود في `app.py`
+        telegram_bot = getattr(current_app, "bot", None)  # ✅ استخدام `getattr` بشكل صحيح
+        if not telegram_bot:
+            logging.error("❌ فشل في جلب صورة المستخدم: البوت غير متوفر!")
+            return DEFAULT_PROFILE_PHOTO
+
         user_photos = await telegram_bot.get_user_profile_photos(user_id=telegram_id, limit=1)
         if user_photos.photos:
             file = await telegram_bot.get_file(user_photos.photos[0][0].file_id)
-            return f"https://api.telegram.org/file/bot{current_app.config['TELEGRAM_BOT_TOKEN']}/{file.file_path}"
+            return f"https://api.telegram.org/file/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/{file.file_path}"
         return DEFAULT_PROFILE_PHOTO
     except Exception as e:
         logging.error(f"❌ خطأ في جلب صورة المستخدم {telegram_id}: {str(e)}")

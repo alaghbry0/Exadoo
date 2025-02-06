@@ -77,12 +77,16 @@ async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
         await bot.answer_pre_checkout_query(pre_checkout.id, ok=False, error_message="حدث خطأ غير متوقع")
 
 # 🔹 تشغيل Polling بدلاً من Webhook
+is_bot_running = False  # ✅ متغير لمنع تشغيل البوت أكثر من مرة
+
 async def start_bot():
     """✅ تشغيل Polling بدلاً من Webhook"""
+    global is_bot_running
+    if is_bot_running:  # ✅ منع تشغيل البوت أكثر من مرة
+        logging.warning("⚠️ البوت يعمل بالفعل! تجاهل تشغيل Polling مرة أخرى.")
+        return
+
+    is_bot_running = True
     await remove_webhook()
     logging.info("🚀 بدء تشغيل Polling للبوت...")
     await dp.start_polling(bot)
-
-# 🔹 تشغيل البوت فقط عند تشغيل الملف مباشرةً
-if __name__ == "__main__":
-    asyncio.run(start_bot())
