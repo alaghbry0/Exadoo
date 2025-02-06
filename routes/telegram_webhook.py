@@ -21,26 +21,25 @@ async def telegram_webhook():
     """🔄 استقبال الدفع وتحديث الاشتراك"""
     try:
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        logging.info(f"📥 Webhook Token Received: {secret}")  # ✅ طباعة التوكن المستلم
-        logging.info(f"📥 Expected Webhook Token: {WEBHOOK_SECRET}")  # ✅ طباعة التوكن المتوقع
-
-        if not secret:
-            logging.error("❌ Webhook request مرفوض! لم يتم إرسال Secret Token.")
-            return jsonify({"error": "Unauthorized request"}), 403
-
-        if secret != WEBHOOK_SECRET:
-            logging.error(f"❌ Webhook request غير موثوق! Token غير متطابق: {secret}")
-            return jsonify({"error": "Unauthorized request"}), 403
+        logging.info(f"📥 Webhook Token Received: {secret}")
+        logging.info(f"📥 Expected Webhook Token: {WEBHOOK_SECRET}")
 
         data = await request.get_json()
         logging.info(f"📥 Webhook received: {json.dumps(data, indent=2)}")
 
         # ✅ التأكد من أن التحديث يحتوي على "successful_payment"
         payment = data.get("message", {}).get("successful_payment", None)
+
+        # 🔹 إذا لم يكن الطلب يحتوي على `successful_payment`، تحقق من `secret`
         if not payment:
+            if not secret or secret != WEBHOOK_SECRET:
+                logging.error("❌ Webhook request مرفوض! لم يتم إرسال Secret Token.")
+                return jsonify({"error": "Unauthorized request"}), 403
+
             logging.warning("⚠️ Webhook لم يستلم `successful_payment`. Ignoring.")
             return jsonify({"message": "Ignored non-payment update"}), 200
 
+        # ✅ معالجة الدفع
         try:
             payload = json.loads(payment.get("invoice_payload", "{}"))
         except json.JSONDecodeError as e:
