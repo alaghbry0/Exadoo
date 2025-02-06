@@ -3,6 +3,7 @@ import json
 import os
 import asyncio
 import asyncpg
+import ipaddress
 from quart import Blueprint, request, jsonify, current_app
 from database.db_queries import record_payment
 
@@ -16,30 +17,46 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 if not SUBSCRIBE_URL:
     raise ValueError("❌ `SUBSCRIBE_URL` غير معرف! تأكد من ضبطه في المتغيرات البيئية.")
 
+# 🔹 قائمة عناوين IP الرسمية الخاصة بتليجرام (يجب تحديثها عند الحاجة)
+TELEGRAM_IP_RANGES = [
+    "149.154.160.0/20", "91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22",
+    "91.108.16.0/22", "91.108.20.0/22", "91.108.56.0/22", "149.154.164.0/22",
+    "149.154.168.0/22", "149.154.172.0/22", "91.105.192.0/23"
+]
+
+def is_request_from_telegram(ip_address):
+    """🔹 التحقق مما إذا كان الطلب قادمًا من خوادم تليجرام"""
+    try:
+        ip = ipaddress.ip_address(ip_address)
+        return any(ip in ipaddress.ip_network(cidr) for cidr in TELEGRAM_IP_RANGES)
+    except ValueError:
+        return False
+
 @payments_bp.route("/webhook", methods=["POST"])
 async def telegram_webhook():
     """🔄 استقبال الدفع وتحديث الاشتراك"""
     try:
-        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        logging.info(f"📥 Webhook Token Received: {secret}")
-        logging.info(f"📥 Expected Webhook Token: {WEBHOOK_SECRET}")
+        # ✅ الحصول على عنوان الـ IP للطلب
+        request_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+        logging.info(f"📥 Webhook request received from IP: {request_ip}")
 
+        # ✅ التأكد من أن الطلب قادم من خوادم تليجرام
+        if not request_ip or not is_request_from_telegram(request_ip):
+            logging.error(f"❌ Webhook request مرفوض! IP غير موثوق: {request_ip}")
+            return jsonify({"error": "Unauthorized request"}), 403
+
+        # ✅ الحصول على البيانات المستلمة
         data = await request.get_json()
         logging.info(f"📥 Webhook received: {json.dumps(data, indent=2)}")
 
         # ✅ التأكد من أن التحديث يحتوي على "successful_payment"
         payment = data.get("message", {}).get("successful_payment", None)
 
-        # 🔹 إذا لم يكن الطلب يحتوي على `successful_payment`، تحقق من `secret`
         if not payment:
-            if not secret or secret != WEBHOOK_SECRET:
-                logging.error("❌ Webhook request مرفوض! لم يتم إرسال Secret Token.")
-                return jsonify({"error": "Unauthorized request"}), 403
-
             logging.warning("⚠️ Webhook لم يستلم `successful_payment`. Ignoring.")
             return jsonify({"message": "Ignored non-payment update"}), 200
 
-        # ✅ معالجة الدفع
+        # ✅ معالجة بيانات الدفع
         try:
             payload = json.loads(payment.get("invoice_payload", "{}"))
         except json.JSONDecodeError as e:
