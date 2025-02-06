@@ -48,9 +48,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from aiogram import Bot, Dispatcher, types
 import logging
 
-WEB_APP_URL = "https://your-web-app.com"  # ضع رابط التطبيق المصغر هنا
-CHANNEL_URL = "https://t.me/Exaado"  # رابط القناة
-
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     """✅ إرسال زر فتح التطبيق المصغر عند استخدام /start"""
