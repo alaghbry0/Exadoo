@@ -99,6 +99,28 @@ async def send_payment_to_subscribe_api(telegram_id: int, plan_id: int, payment_
     return False
 
 
+@dp.pre_checkout_query()
+async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
+    """✅ التحقق من صحة الفاتورة قبل إتمام الدفع"""
+    try:
+        logging.info(f"📥 استلام pre_checkout_query من {pre_checkout.from_user.id}: {pre_checkout}")
+
+        # ✅ التحقق من صحة invoice_payload
+        payload = json.loads(pre_checkout.invoice_payload)
+        if not payload.get("userId") or not payload.get("planId"):
+            logging.error("❌ `invoice_payload` غير صالح!")
+            await bot.answer_pre_checkout_query(pre_checkout.id, ok=False, error_message="بيانات الدفع غير صالحة!")
+            return
+
+        # ✅ إذا كان كل شيء صحيح، الموافقة على الدفع
+        await bot.answer_pre_checkout_query(pre_checkout.id, ok=True)
+        logging.info(f"✅ تمت الموافقة على الدفع لـ {pre_checkout.from_user.id}")
+
+    except Exception as e:
+        logging.error(f"❌ خطأ في pre_checkout_query: {e}")
+        await bot.answer_pre_checkout_query(pre_checkout.id, ok=False, error_message="حدث خطأ غير متوقع")
+
+
 # 🔹 وظيفة استقبال `successful_payment`
 @dp.message()
 async def handle_successful_payment(message: types.Message):
