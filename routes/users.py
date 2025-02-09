@@ -13,55 +13,12 @@ user_bp = Blueprint("users", __name__)
 DEFAULT_PROFILE_PHOTO = "/static/default_profile.png"
 
 
-def clean_name(full_name: str) -> str:
-    """ 🔹 تنظيف الاسم من الرموز التعبيرية والعلامات الخاصة """
-    if not full_name:
-        return "N/L"
-    emoji_pattern = re.compile("[\U00010000-\U0010ffff]", flags=re.UNICODE)
-    return emoji_pattern.sub('', full_name).strip()
-
-
-async def get_telegram_user_info(telegram_id: int):
-    """ 🔹 جلب بيانات المستخدم (الاسم واسم المستخدم) من Telegram API """
-    try:
-        telegram_bot = getattr(current_app, "bot", None)  # ✅ استخدام `getattr` بشكل صحيح
-        if not telegram_bot:
-            logging.error("❌ فشل في جلب بيانات المستخدم: البوت غير متوفر!")
-            return "N/L", "N/L"
-
-        user = await telegram_bot.get_chat(telegram_id)
-        full_name = clean_name(user.full_name) if user.full_name else "N/L"
-        username = f"@{user.username}" if user.username else "N/L"
-        return full_name, username
-    except Exception as e:
-        logging.error(f"❌ خطأ أثناء جلب بيانات المستخدم {telegram_id}: {e}")
-        return "N/L", "N/L"
-
-
-async def get_telegram_profile_photo(telegram_id: int) -> str:
-    """ 🔹 جلب صورة الملف الشخصي للمستخدم من Telegram API """
-    try:
-        telegram_bot = getattr(current_app, "bot", None)  # ✅ استخدام `getattr` بشكل صحيح
-        if not telegram_bot:
-            logging.error("❌ فشل في جلب صورة المستخدم: البوت غير متوفر!")
-            return DEFAULT_PROFILE_PHOTO
-
-        user_photos = await telegram_bot.get_user_profile_photos(user_id=telegram_id, limit=1)
-        if user_photos.photos:
-            file = await telegram_bot.get_file(user_photos.photos[0][0].file_id)
-            return f"https://api.telegram.org/file/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/{file.file_path}"
-        return DEFAULT_PROFILE_PHOTO
-    except Exception as e:
-        logging.error(f"❌ خطأ في جلب صورة المستخدم {telegram_id}: {str(e)}")
-        return DEFAULT_PROFILE_PHOTO
-
-
 @user_bp.route("/api/user", methods=["GET"])
 async def get_user_info():
     """
     🔹 جلب بيانات المستخدم والاشتراكات بناءً على `telegram_id`
     ✅ التحقق من قاعدة البيانات
-    ✅ تحديث البيانات من `Telegram API` عند كل طلب
+    ✅ **لم يعد يتم تحديث البيانات من Telegram API عند كل طلب**
     ✅ إرجاع البيانات المحدثة مع الاشتراكات
     ✅ تحسين التعامل مع حالة `is_active`
     """
@@ -77,18 +34,22 @@ async def get_user_info():
             # 🔹 جلب بيانات المستخدم من قاعدة البيانات
             user = await get_user(conn, telegram_id)
 
-            # 🔹 جلب البيانات الحقيقية من Telegram API
-            full_name, username = await get_telegram_user_info(telegram_id)
-            profile_photo = await get_telegram_profile_photo(telegram_id)
+            # ✅ **لن يتم جلب البيانات الحقيقية من Telegram API بعد الآن**
+            full_name = user['full_name'] if user and user['full_name'] else "N/L" # ✅ استخراج الاسم من قاعدة البيانات
+            username = user['username'] if user and user['username'] else "N/L" # ✅ استخراج اسم المستخدم من قاعدة البيانات
+            profile_photo = DEFAULT_PROFILE_PHOTO # ✅ استخدام الصورة الافتراضية مؤقتًا، يمكن جلبها من قاعدة البيانات لاحقًا إذا لزم الأمر
 
-            # ✅ تحديث بيانات المستخدم إذا تغيرت
-            if not user or (user['full_name'] != full_name) or (user['username'] != username):
-                await add_user(conn, telegram_id, username=username, full_name=full_name)
+            # ✅ تحديث بيانات المستخدم إذا لم يكن موجودًا فقط (لأول مرة)
+            if not user:
+                # ✅ في المستقبل، يمكن استدعاء Telegram API هنا لجلب البيانات لأول مرة وتخزينها في قاعدة البيانات
+                # full_name, username = await get_telegram_user_info(telegram_id)
+                # profile_photo = await get_telegram_profile_photo(telegram_id)
+                await add_user(conn, telegram_id, username=username, full_name=full_name) # ✅ إضافة مستخدم جديد حتى لو كانت البيانات الأساسية غير متوفرة في الوقت الحالي
 
-            # 🔹 جلب بيانات الاشتراكات من قاعدة البيانات
+            # 🔹 جلب بيانات الاشتراكات من قاعدة البيانات (كما هو الحال سابقًا)
             subscriptions = await get_user_subscriptions(conn, telegram_id)
 
-            # ✅ ضبط التوقيت المحلي (UTC+3 الرياض)
+            # ✅ ضبط التوقيت المحلي (UTC+3 الرياض) (كما هو الحال سابقًا)
             local_tz = pytz.timezone("Asia/Riyadh")
             now = datetime.now(timezone.utc).astimezone(local_tz)
 
@@ -97,7 +58,7 @@ async def get_user_info():
                 expiry_date = sub['expiry_date']
                 start_date = sub['start_date'] if sub['start_date'] else expiry_date - timedelta(days=30)
 
-                # ✅ التأكد من ضبط timezone
+                # ✅ التأكد من ضبط timezone (كما هو الحال سابقًا)
                 if expiry_date.tzinfo is None:
                     expiry_date = expiry_date.replace(tzinfo=timezone.utc)
                 if start_date.tzinfo is None:
@@ -106,17 +67,14 @@ async def get_user_info():
                 expiry_date = expiry_date.astimezone(local_tz)
                 start_date = start_date.astimezone(local_tz)
 
-                # ✅ حساب مدة الاشتراك والتقدم
+                # ✅ حساب مدة الاشتراك والتقدم (كما هو الحال سابقًا)
                 total_days = (expiry_date - start_date).days if start_date else 30
                 days_left = max((expiry_date - now).days, 0)
                 progress = min(int((days_left / total_days) * 100), 100) if total_days > 0 else 0
 
-                # ✅ التحقق من حالة `is_active` الحقيقية في قاعدة البيانات
-                is_active = sub['is_active']  # 🔹 استرجاع الحالة الفعلية من قاعدة البيانات
-                if is_active:
-                    status = "نشط"  # ✅ إذا كان `is_active = True` فهو نشط
-                else:
-                    status = "منتهي"  # ❌ إذا كان `is_active = False` فهو منتهي
+                # ✅ التحقق من حالة `is_active` الحقيقية في قاعدة البيانات (كما هو الحال سابقًا)
+                is_active = sub['is_active']
+                status = "نشط" if is_active else "منتهي"
 
                 expiry_msg = "انتهى الاشتراك" if not is_active else f"متبقي {days_left} يوم"
 
@@ -130,7 +88,7 @@ async def get_user_info():
                     "expiry_date": expiry_date.isoformat()
                 })
 
-            # ✅ إرجاع البيانات المحدثة
+            # ✅ إرجاع البيانات المحدثة (كما هو الحال سابقًا)
             return jsonify({
                 "telegram_id": telegram_id,
                 "full_name": full_name,
