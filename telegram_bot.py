@@ -50,26 +50,26 @@ import logging
 
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
-    """✅ إرسال زر فتح التطبيق المصغر عند استخدام /start"""
+    """✅ إرسال زر فتح التطبيق المصغر عند استخدام /start (مبسط)"""
     user_id = message.from_user.id
-    full_name = message.from_user.full_name or "مستخدم عزيز"  # ✅ استخدام الاسم الكامل إن وجد
+    full_name = message.from_user.full_name or "مستخدم عزيز"
 
-    # ✅ إعداد الأزرار بتنسيق جديد (زرين في نفس السطر)
+    # ✅ لوحة مفاتيح مبسطة بزر واحد فقط (فتح التطبيق المصغر)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔹 فتح التطبيق", web_app=WebAppInfo(url=WEB_APP_URL))],
-        [InlineKeyboardButton(text="📢 فتح القناة", url=CHANNEL_URL)]
+        # ✅ تم حذف زر "فتح القناة" مؤقتًا للتبسيط
     ])
 
-    # ✅ تسجيل بيانات المستخدم
     logging.info(f"✅ /start من المستخدم: {user_id}, Full Name: {full_name}")
 
-    # ✅ نص الترحيب المحسّن
     welcome_text = (
         f"👋 مرحبًا {full_name}!\n\n"
         "مرحبًا بك في **@Exaado** \n"
         "هنا يمكنك إدارة اشتراكاتك في قنواتنا بسهولة.\n\n"
         "نتمنى لك تجربة رائعة! 🚀"
     )
+
+    await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
 
     # ✅ إرسال الرسالة مع الأزرار
     await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
