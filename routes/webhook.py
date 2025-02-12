@@ -45,34 +45,59 @@ async def webhook():
         logging.info(f"📥 بيانات الطلب المستلمة: {json.dumps(data, indent=2)}")
 
         # ✅ استخراج نوع الحدث بشكل صحيح
-        event_type = data.get("event_type")  # ⚠️ تصحيح الخطأ من vent_type إلى event_type
+        event_type = data.get("event_type")
 
-        # ✅ دعم `transaction_received` و `account_tx`
-        if event_type not in ["transaction_received", "account_tx"]:
+        if event_type == "transaction_received":
+            logging.info(f"✅ معالجة حدث transaction_received")
+            transaction = data.get("data", {})
+            transaction_id = transaction.get("tx_hash")
+            sender_address = transaction.get("sender", {}).get("address")
+            recipient_address = transaction.get("recipient", {}).get("address")
+            amount = transaction.get("amount", 0)
+            status = transaction.get("status")
+
+            # ✅ التحقق من البيانات المطلوبة لـ transaction_received
+            if not all([transaction_id, sender_address, recipient_address, amount, status]):
+                logging.error("❌ بيانات الدفع غير مكتملة لـ transaction_received!")
+                return jsonify({"error": "Invalid transaction data"}), 400
+
+            logging.info(
+                f"✅ معاملة مستلمة (transaction_received): {transaction_id} | المرسل: {sender_address} | المستلم: {recipient_address} | المبلغ: {amount}")
+
+        elif event_type == "account_tx":
+            logging.info(f"✅ معالجة حدث account_tx")
+            account_tx_data = data.get("data", {}) # تغيير اسم المتغير لتوضيح نوع البيانات
+            transaction_id = account_tx_data.get("tx_hash")
+            account_address = data.get("account_id") # استخراج account_id من المستوى الأعلى
+
+            sender_address = account_address # استخدام account_id كعنوان مرسل ومستقبل مؤقت
+            recipient_address = account_address # استخدام account_id كعنوان مرسل ومستقبل مؤقت
+            amount = None # لا يوجد مبلغ في account_tx
+            status = "unknown" # الحالة غير معروفة في account_tx
+
+            # ✅ التحقق من البيانات المطلوبة لـ account_tx
+            if not all([transaction_id, account_address]):
+                logging.error("❌ بيانات الدفع غير مكتملة لـ account_tx!")
+                return jsonify({"error": "Invalid transaction data for account_tx"}), 400
+
+            logging.info(
+                f"✅ معاملة مستلمة (account_tx): {transaction_id} | Account ID: {account_address}") # تسجيل Account ID بدلاً من المرسل والمستقبل
+
+        else:
             logging.info(f"⚠️ تجاهل حدث غير متعلق بالدفع: {event_type}")
             return jsonify({"message": "Event ignored"}), 200
 
-        transaction = data.get("data", {})
-        transaction_id = transaction.get("tx_hash")
-        sender_address = transaction.get("sender", {}).get("address")
-        recipient_address = transaction.get("recipient", {}).get("address")
-        amount = transaction.get("amount", 0)
-        status = transaction.get("status")
 
-        # ✅ التحقق من البيانات المطلوبة
-        if not all([transaction_id, sender_address, recipient_address, amount, status]):
-            logging.error("❌ بيانات الدفع غير مكتملة!")
-            return jsonify({"error": "Invalid transaction data"}), 400
-
-        logging.info(
-            f"✅ معاملة مستلمة: {transaction_id} | المرسل: {sender_address} | المستلم: {recipient_address} | المبلغ: {amount}")
-
-        # ✅ التحقق من أن الدفع ناجح
-        if status.lower() != "completed":
+        # ✅ التحقق من أن الدفع ناجح (فقط لـ transaction_received)
+        if event_type == "transaction_received" and status.lower() != "completed":
             logging.warning(f"⚠️ لم يتم تأكيد المعاملة بعد، الحالة: {status}")
             return jsonify({"message": "Transaction not completed yet"}), 202
 
-        logging.info(f"✅ تم تأكيد الدفع! المعاملة: {transaction_id}")
+        if event_type == "transaction_received":
+            logging.info(f"✅ تم تأكيد الدفع! المعاملة: {transaction_id}")
+        elif event_type == "account_tx":
+            logging.info(f"✅ تم استلام اشعار account_tx للمعاملة: {transaction_id}")
+
 
         # ✅ بيانات المستخدم والاشتراك (يجب تحسينها لاحقًا)
         telegram_id = 7382197778  # ⚠️ قيمة افتراضية - ستُستبدل لاحقًا
