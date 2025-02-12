@@ -45,9 +45,11 @@ async def webhook():
         logging.info(f"📥 بيانات الطلب المستلمة: {json.dumps(data, indent=2)}")
 
         # ✅ استخراج تفاصيل الدفع
-        event = data.get("event")
-        if event != "transaction_received":
-            logging.info(f"⚠️ تجاهل حدث غير متعلق بالدفع: {event}")
+        vent_type = data.get("event_type")  # ⚠️ TonAPI يستخدم `event_type` بدلًا من `event`
+
+        # ✅ دعم `transaction_received` و `account_tx`
+        if event_type not in ["transaction_received", "account_tx"]:
+            logging.info(f"⚠️ تجاهل حدث غير متعلق بالدفع: {event_type}")
             return jsonify({"message": "Event ignored"}), 200
 
         transaction = data.get("data", {})
