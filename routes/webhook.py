@@ -44,8 +44,8 @@ async def webhook():
         data = await request.get_json()
         logging.info(f"📥 بيانات الطلب المستلمة: {json.dumps(data, indent=2)}")
 
-        # ✅ استخراج تفاصيل الدفع
-        vent_type = data.get("event_type")  # ⚠️ TonAPI يستخدم `event_type` بدلًا من `event`
+        # ✅ استخراج نوع الحدث بشكل صحيح
+        event_type = data.get("event_type")  # ⚠️ تصحيح الخطأ من vent_type إلى event_type
 
         # ✅ دعم `transaction_received` و `account_tx`
         if event_type not in ["transaction_received", "account_tx"]:
