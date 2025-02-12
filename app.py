@@ -10,7 +10,8 @@ from config import DATABASE_CONFIG
 from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
-from routes.telegram_webhook import payments_bp
+#from routes.webhook import payments_bp
+from routes.webhook import webhook_bp
 from telegram_bot import start_bot, bot, telegram_bot_bp  # ✅ استخدام `telegram_bot_bp`
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
@@ -38,7 +39,8 @@ app = cors(app, allow_origin=ALLOWED_ORIGINS)
 app.register_blueprint(subscriptions_bp)
 app.register_blueprint(user_bp)
 app.register_blueprint(shop)
-app.register_blueprint(payments_bp)
+#app.register_blueprint(payments_bp)
+app.register_blueprint(webhook_bp)
 app.register_blueprint(telegram_bot_bp)  # ✅ تغيير الاسم إلى `telegram_bot_bp`
 
 # 🔹 تشغيل Webhook للبوت عند بدء التطبيق
