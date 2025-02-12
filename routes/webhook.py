@@ -6,6 +6,7 @@ import json  # استيراد مكتبة json
 
 webhook_bp = Blueprint("webhook", __name__)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+TONAPI_WEBHOOK_TOKEN = os.getenv("TONAPI_WEBHOOK_TOKEN")
 SUBSCRIBE_API_URL = os.getenv("SUBSCRIBE_API_URL", "http://localhost:5000/api/subscribe")
 
 
@@ -19,8 +20,8 @@ def log_request_info():
 def validate_secret():
     """التحقق من صحة مفتاح WEBHOOK_SECRET"""
     secret = request.headers.get("Authorization")
-    if not secret or secret != f"Bearer {WEBHOOK_SECRET}":
-        logging.warning("❌ Unauthorized webhook request: Invalid or missing WEBHOOK_SECRET")
+    if not secret or secret != f"Bearer {TONAPI_WEBHOOK_TOKEN}":
+        logging.warning("❌ Unauthorized webhook request: Invalid or missing TONAPI_WEBHOOK_TOKEN")
         return False
     return True
 
