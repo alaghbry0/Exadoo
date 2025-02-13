@@ -1,4 +1,4 @@
-# payment_confirmation.py (محدث لمعالجة telegramId غير الصالح)
+# payment_confirmation.py (محدث لمعالجة telegramId غير الصالح و payment_status الـ None)
 import logging
 from quart import Blueprint, request, jsonify, current_app
 import json
@@ -61,15 +61,18 @@ async def confirm_payment():
         if existing_payment:
             # ✅ فحص حالة الدفعة الموجودة
             payment_status = existing_payment.get('status')
-            if payment_status.lower() == "pending": # ✅ التحقق من الحالة "pending" (بغض النظر عن حالة الأحرف)
+            if payment_status is not None and payment_status.lower() == "pending": # ✅ التحقق من الحالة "pending" (بغض النظر عن حالة الأحرف) و فحص None
                 logging.warning(f"⚠️ دفعة معلقة موجودة بالفعل لنفس عنوان المحفظة: {user_wallet_address}")
                 return jsonify({"error": "Pending payment already exists for this wallet address"}), 409 # ✅ رمز حالة 409 Conflict
-            elif payment_status.lower() == "completed": # ✅ السماح بالدفع الجديد إذا كانت الحالة "completed"
+            elif payment_status is not None and payment_status.lower() == "completed": # ✅ السماح بالدفع الجديد إذا كانت الحالة "completed" و فحص None
                 logging.info(f"ℹ️ دفعة مكتملة موجودة بالفعل لنفس عنوان المحفظة: {user_wallet_address}. السماح بتسجيل دفعة معلقة جديدة.")
                 # ✅ هنا، سنسمح بتسجيل دفعة معلقة جديدة حتى لو كانت هناك دفعة مكتملة سابقة
-            else:
+            elif payment_status is not None: # ✅ فحص None لحالات الدفع الأخرى
                 logging.info(f"ℹ️ دفعة موجودة بحالة أخرى ({payment_status}) لنفس عنوان المحفظة: {user_wallet_address}. السماح بتسجيل دفعة معلقة جديدة.")
                 # ✅ يمكنك إضافة حالات أخرى هنا إذا كنت تريد معالجة حالات الدفع الأخرى بشكل مختلف
+            else:
+                logging.warning(f"⚠️ حالة الدفعة الموجودة غير معروفة (None) لعنوان المحفظة: {user_wallet_address}. السماح بتسجيل دفعة معلقة جديدة على أي حال.")
+                # ✅ معالجة حالة status=None بشكل صريح - يمكنك تعديل هذا السلوك إذا كنت ترغب في رفض الدفعات في حالة status=None
 
         # تسجيل دفعة معلقة جديدة (كما هو)
         async with current_app.db_pool.acquire() as conn:
