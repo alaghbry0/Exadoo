@@ -1,11 +1,10 @@
+# webhook.py (modified for debugging - log entire data)
 import logging
 import os
 import aiohttp
-from quart import Blueprint, request, jsonify
+from quart import Blueprint, request, jsonify, current_app
 import json
 from database.db_queries import (update_payment_with_txhash)
-
-
 
 webhook_bp = Blueprint("webhook", __name__)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -27,15 +26,11 @@ def validate_secret():
         return False
     return True
 
-
-
 @webhook_bp.route("/api/webhook", methods=["POST"])
 async def webhook():
     """
     نقطة API لاستقبال إشعارات الدفع من TonAPI.
-    يتم استخراج بيانات المعاملة، بما في ذلك custom_payload (الذي يمثل paymentId) وtx_hash.
-    بعد التحقق من صحة البيانات، يتم تحديث سجل الدفع عبر update_payment_with_txhash،
-    ثم استخدام البيانات الفعلية لإرسال طلب تجديد الاشتراك.
+    ... (بقية الوصف كما هو) ...
     """
     try:
         # تسجيل معلومات الطلب
@@ -56,13 +51,17 @@ async def webhook():
             return jsonify({"message": "Event ignored"}), 200
 
         # استخراج بيانات المعاملة الأساسية
-        transaction_id = data.get("tx_hash")
+        transaction_id = data.get("tx_hash") or data.get("Tx_hash") # ✅ Attempt to get tx_hash with different cases
         account_id = data.get("account_id") if event_type == "account_tx" else None
         lt = data.get("lt") if event_type == "account_tx" else None
         sender_address = data.get("data", {}).get("sender", {}).get("address") if event_type == "transaction_received" else None
         recipient_address = data.get("data", {}).get("recipient", {}).get("address") if event_type == "transaction_received" else None
         amount = data.get("data", {}).get("amount", 0) if event_type == "transaction_received" else None
         status = data.get("data", {}).get("status") if event_type == "transaction_received" else None
+
+        # ✅ Debugging logs: Print the entire 'data' dictionary
+        logging.info(f"🔍 Debug - Full data payload: {json.dumps(data.get('data'), indent=2)}")
+
 
         # التحقق من البيانات حسب نوع الحدث
         if event_type == "transaction_received":
@@ -72,10 +71,11 @@ async def webhook():
             if status.lower() != "completed":
                 logging.warning(f"⚠️ لم يتم تأكيد المعاملة بعد، الحالة: {status}")
                 return jsonify({"message": "Transaction not completed yet"}), 202
-        elif event_type == "account_tx":
-            if not all([transaction_id, account_id, lt]):
-                logging.error("❌ بيانات account_tx غير مكتملة!")
-                return jsonify({"error": "Invalid account transaction data"}), 400
+            elif event_type == "account_tx":  # ✅ تم نقل elif إلى السطر التالي
+                if not all([transaction_id, account_id, lt]):
+                    logging.error("❌ بيانات account_tx غير مكتملة!")
+                    return jsonify({"error": "Invalid account transaction data"}), 400
+
 
         logging.info(f"✅ معاملة مستلمة: {transaction_id} | الحساب: {account_id if event_type == 'account_tx' else sender_address} | المستلم: {recipient_address} | المبلغ: {amount}")
 
@@ -86,7 +86,8 @@ async def webhook():
             return jsonify({"error": "Missing custom payload"}), 400
 
         # تحديث سجل الدفع في قاعدة البيانات باستخدام payment_id لتسجيل tx_hash
-        payment_record = await update_payment_with_txhash(payment_id, transaction_id)
+        async with current_app.db_pool.acquire() as conn:  # ✅ استخدام current_app.db_pool هنا
+            payment_record = await update_payment_with_txhash(conn, payment_id, transaction_id)
         if not payment_record:
             return jsonify({"error": "Failed to update payment record"}), 500
 

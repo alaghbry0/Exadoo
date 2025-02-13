@@ -19,41 +19,40 @@ async def confirm_payment():
 
         # استلام البيانات
         payment_id = data.get("paymentId")
-        plan_id_str = data.get("planId") # استلام planId كسلسلة نصية
+        plan_id_str = data.get("planId")
         telegram_id_str = data.get("telegramId")
         telegram_username = data.get("telegramUsername")
         full_name = data.get("fullName")
 
         # التحقق من البيانات الأساسية
-        if not all([payment_id, plan_id_str, telegram_id_str]): # استخدام plan_id_str للتحقق
+        if not all([payment_id, plan_id_str, telegram_id_str]):
             logging.error("❌ بيانات تأكيد الدفع غير مكتملة!")
             return jsonify({"error": "Invalid payment confirmation data"}), 400
 
         logging.info(
-            f"✅ استلام طلب تأكيد الدفع (مدمج): paymentId={payment_id}, planId={plan_id_str}, " # استخدام plan_id_str للتسجيل
+            f"✅ استلام طلب تأكيد الدفع (مدمج): paymentId={payment_id}, planId={plan_id_str}, "
             f"telegram_id={telegram_id_str}, username={telegram_username}, full_name={full_name}"
         )
 
-        amount = 0  # قيمة افتراضية للمبلغ - يجب تحديد المصدر لاحقًا
-        telegram_id = int(telegram_id_str) # تحويل telegram_id إلى عدد صحيح
+        amount = 0
+        telegram_id = int(telegram_id_str)
 
-        # ✅ Temporary hardcoded mapping for subscription_type_id based on planId string
-        if plan_id_str == "premium_plan":
-            subscription_type_id = 1  # Replace with your actual premium plan ID
-        elif plan_id_str == "basic_plan":
-            subscription_type_id = 2  # Replace with your actual basic plan ID
-        else:
-            subscription_type_id = 3  # Default or error case - adjust as needed
-            logging.warning(f"⚠️ Plan ID '{plan_id_str}' not recognized. Using default subscription type ID: {subscription_type_id}")
+        try:
+            subscription_type_id = int(plan_id_str)
+        except ValueError:
+            subscription_type_id = 3
+            logging.warning(f"⚠️ Plan ID '{plan_id_str}' is not a valid integer. Using default subscription type ID: {subscription_type_id}")
+        except TypeError:
+            subscription_type_id = 3
+            logging.warning(f"⚠️ Plan ID is missing in request. Using default subscription type ID: {subscription_type_id}")
 
-
-        # استخدام current_app.db_pool
+        # استخدام current_app.db_pool وتمرير username و full_name إلى record_payment
         async with current_app.db_pool.acquire() as conn:
-            await record_payment(conn, telegram_id, payment_id, amount, subscription_type_id)
+            await record_payment(conn, telegram_id, payment_id, amount, subscription_type_id, username=telegram_username, full_name=full_name) # ✅ تمرير username و full_name
 
         logging.info(
             f"💾 تسجيل بيانات الدفع والمستخدم كدفعة معلقة: paymentId={payment_id}, "
-            f"planId={plan_id_str}, telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, username={telegram_username}, full_name={full_name}" # تسجيل subscription_type_id
+            f"planId={plan_id_str}, telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, username={telegram_username}, full_name={full_name}"
         )
 
         return jsonify({"message": "Payment confirmation and user data received and pending"}), 200
