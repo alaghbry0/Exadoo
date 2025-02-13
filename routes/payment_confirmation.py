@@ -1,8 +1,8 @@
-# payment_confirmation.py (modified to call record_payment correctly)
+# payment_confirmation.py (محدث لمعالجة telegramId غير الصالح)
 import logging
 from quart import Blueprint, request, jsonify, current_app
 import json
-from database.db_queries import record_payment , fetch_pending_payment_by_wallet
+from database.db_queries import record_payment, fetch_pending_payment_by_wallet
 
 payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 
@@ -37,7 +37,13 @@ async def confirm_payment():
         )
 
         amount = 0
-        telegram_id = int(telegram_id_str)
+
+        # ✅ التحقق مما إذا كان telegram_id_str رقمًا صحيحًا صالحًا
+        if not telegram_id_str.isdigit(): # ✅ فحص باستخدام isdigit()
+            logging.error(f"❌ telegramId غير صالح: {telegram_id_str}. يجب أن يكون رقمًا صحيحًا.")
+            return jsonify({"error": "Invalid telegramId. Must be a valid integer."}), 400 # ✅ إرجاع استجابة خطأ 400
+        telegram_id = int(telegram_id_str) # ✅ التحويل إلى int فقط إذا كان صالحًا
+
 
         try:
             subscription_type_id = int(plan_id_str)
