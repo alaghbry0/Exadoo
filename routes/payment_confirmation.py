@@ -1,8 +1,8 @@
-# payment_confirmation.py
+# payment_confirmation.py (modified to call record_payment correctly)
 import logging
 from quart import Blueprint, request, jsonify, current_app
-import json  # استيراد مكتبة json
-from database.db_queries import record_payment
+import json
+from database.db_queries import record_payment , fetch_pending_payment_by_wallet
 
 payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 
@@ -10,6 +10,8 @@ payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 async def confirm_payment():
     """
     نقطة API مُدمجة لتأكيد استلام الدفع ومعالجة بيانات المستخدم.
+    تسمح بتسجيل دفعات معلقة جديدة لنفس عنوان المحفظة إذا كانت الدفعة السابقة مكتملة،
+    وتمنع التسجيل إذا كانت الدفعة السابقة معلقة بالفعل.
     """
 
     logging.info("✅ تم استدعاء نقطة API /api/confirm_payment!")
@@ -17,20 +19,20 @@ async def confirm_payment():
         data = await request.get_json()
         logging.info(f"📥 بيانات الطلب المستلمة في /api/confirm_payment (مدمجة): {json.dumps(data, indent=2)}")
 
-        # استلام البيانات
-        user_wallet_address = data.get("userWalletAddress") # ✅ استلام userWalletAddress بدلاً من paymentId
+        # استلام البيانات (كما هو)
+        user_wallet_address = data.get("userWalletAddress")
         plan_id_str = data.get("planId")
         telegram_id_str = data.get("telegramId")
         telegram_username = data.get("telegramUsername")
         full_name = data.get("fullName")
 
-        # التحقق من البيانات الأساسية
-        if not all([user_wallet_address, plan_id_str, telegram_id_str]): # ✅ التحقق من user_wallet_address بدلاً من paymentId
+        # التحقق من البيانات الأساسية (كما هو)
+        if not all([user_wallet_address, plan_id_str, telegram_id_str]):
             logging.error("❌ بيانات تأكيد الدفع غير مكتملة!")
             return jsonify({"error": "Invalid payment confirmation data"}), 400
 
         logging.info(
-            f"✅ استلام طلب تأكيد الدفع (مدمج): userWalletAddress={user_wallet_address}, planId={plan_id_str}, " # ✅ تسجيل userWalletAddress
+            f"✅ استلام طلب تأكيد الدفع (مدمج): userWalletAddress={user_wallet_address}, planId={plan_id_str}, "
             f"telegram_id={telegram_id_str}, username={telegram_username}, full_name={full_name}"
         )
 
@@ -46,12 +48,29 @@ async def confirm_payment():
             subscription_type_id = 3
             logging.warning(f"⚠️ Plan ID is missing in request. Using default subscription type ID: {subscription_type_id}")
 
-        # استخدام current_app.db_pool وتمرير username و full_name إلى record_payment
+        # ✅ البحث عن دفعة موجودة لنفس عنوان المحفظة (بغض النظر عن الحالة)
         async with current_app.db_pool.acquire() as conn:
-            await record_payment(conn, telegram_id, user_wallet_address, amount, subscription_type_id, username=telegram_username, full_name=full_name, user_wallet_address=user_wallet_address) # ✅ تمرير username, full_name, user_wallet_address
+            existing_payment = await fetch_pending_payment_by_wallet(conn, user_wallet_address) # ✅ استخدام fetch_payment_by_wallet بدون تصفية الحالة
+
+        if existing_payment:
+            # ✅ فحص حالة الدفعة الموجودة
+            payment_status = existing_payment.get('status')
+            if payment_status.lower() == "pending": # ✅ التحقق من الحالة "pending" (بغض النظر عن حالة الأحرف)
+                logging.warning(f"⚠️ دفعة معلقة موجودة بالفعل لنفس عنوان المحفظة: {user_wallet_address}")
+                return jsonify({"error": "Pending payment already exists for this wallet address"}), 409 # ✅ رمز حالة 409 Conflict
+            elif payment_status.lower() == "completed": # ✅ السماح بالدفع الجديد إذا كانت الحالة "completed"
+                logging.info(f"ℹ️ دفعة مكتملة موجودة بالفعل لنفس عنوان المحفظة: {user_wallet_address}. السماح بتسجيل دفعة معلقة جديدة.")
+                # ✅ هنا، سنسمح بتسجيل دفعة معلقة جديدة حتى لو كانت هناك دفعة مكتملة سابقة
+            else:
+                logging.info(f"ℹ️ دفعة موجودة بحالة أخرى ({payment_status}) لنفس عنوان المحفظة: {user_wallet_address}. السماح بتسجيل دفعة معلقة جديدة.")
+                # ✅ يمكنك إضافة حالات أخرى هنا إذا كنت تريد معالجة حالات الدفع الأخرى بشكل مختلف
+
+        # تسجيل دفعة معلقة جديدة (كما هو)
+        async with current_app.db_pool.acquire() as conn:
+            await record_payment(conn, telegram_id, user_wallet_address, amount, subscription_type_id, username=telegram_username, full_name=full_name) # ✅ استدعاء record_payment بدون payment_id
 
         logging.info(
-            f"💾 تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, " # ✅ تسجيل userWalletAddress
+            f"💾 تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, "
             f"planId={plan_id_str}, telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, username={telegram_username}, full_name={full_name}"
         )
 

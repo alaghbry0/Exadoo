@@ -4,7 +4,7 @@ import os
 import aiohttp
 from quart import Blueprint, request, jsonify, current_app
 import json
-from database.db_queries import (update_payment_with_txhash, fetch_pending_payment_by_wallet) # ✅ استيراد fetch_pending_payment_by_wallet
+from database.db_queries import update_payment_with_txhash, fetch_pending_payment_by_wallet
 
 webhook_bp = Blueprint("webhook", __name__)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -30,7 +30,6 @@ def validate_secret():
 async def webhook():
     """
     نقطة API لاستقبال إشعارات الدفع من TonAPI.
-    ... (بقية الوصف كما هو) ...
     """
     try:
         # تسجيل معلومات الطلب
@@ -51,21 +50,31 @@ async def webhook():
             return jsonify({"message": "Event ignored"}), 200
 
         # استخراج بيانات المعاملة الأساسية
-        transaction_id = data.get("tx_hash") or data.get("Tx_hash") # ✅ Attempt to get tx_hash with different cases
-        account_id = data.get("account_id") if event_type == "account_tx" else None
-        lt = data.get("lt") if event_type == "account_tx" else None
-        sender_address = data.get("data", {}).get("sender", {}).get("address") if event_type == "transaction_received" else None
-        recipient_address = data.get("data", {}).get("recipient", {}).get("address") if event_type == "transaction_received" else None
-        amount = data.get("data", {}).get("amount", 0) if event_type == "transaction_received" else None
-        status = data.get("data", {}).get("status") if event_type == "transaction_received" else None
+        transaction_id = data.get("tx_hash") or data.get("Tx_hash")  # محاولة الحصول على tx_hash بحالات مختلفة
 
-        # ✅ Debugging logs: Print the entire 'data' dictionary
+        if event_type == "account_tx":
+            account_id = data.get("account_id")
+            lt = data.get("lt")
+            # استخدم account_id كعنوان للمحفظة في حالة account_tx
+            user_wallet_address_webhook = account_id
+            # القيم التالية غير متوفرة في account_tx
+            sender_address = None
+            recipient_address = None
+            amount = None
+            status = None
+        else:  # event_type == "transaction_received"
+            account_id = None
+            lt = None
+            sender_address = data.get("data", {}).get("sender", {}).get("address")
+            recipient_address = data.get("data", {}).get("recipient", {}).get("address")
+            amount = data.get("data", {}).get("amount", 0)
+            status = data.get("data", {}).get("status")
+            user_wallet_address_webhook = sender_address
+
+        # Debugging logs: عرض بيانات payload كاملة
         logging.info(f"🔍 Debug - Full data payload: {json.dumps(data.get('data'), indent=2)}")
 
-
-        # التحقق من البيانات حسب نوع الحدث وتحديد user_wallet_address_webhook
-        user_wallet_address_webhook = None # ✅ تهيئة المتغير
-
+        # التحقق من البيانات حسب نوع الحدث
         if event_type == "transaction_received":
             if not all([transaction_id, sender_address, recipient_address, amount, status]):
                 logging.error("❌ بيانات transaction_received غير مكتملة!")
@@ -73,49 +82,36 @@ async def webhook():
             if status.lower() != "completed":
                 logging.warning(f"⚠️ لم يتم تأكيد المعاملة بعد، الحالة: {status}")
                 return jsonify({"message": "Transaction not completed yet"}), 202
-            user_wallet_address_webhook = sender_address # ✅ استخدام sender_address لـ transaction_received
-            if not user_wallet_address_webhook: # ✅ فحص وجود sender_address لـ transaction_received
-                logging.error("❌ لم يتم العثور على sender_address في بيانات transaction_received من Webhook")
-                return jsonify({"error": "Missing sender address from webhook data (transaction_received)"}), 400
-
-
-        elif event_type == "account_tx":  # ✅ معالجة حدث account_tx
+        elif event_type == "account_tx":
             if not all([transaction_id, account_id, lt]):
                 logging.error("❌ بيانات account_tx غير مكتملة!")
                 return jsonify({"error": "Invalid account transaction data"}), 400
-            user_wallet_address_webhook = account_id # ✅ استخدام account_id لـ account_tx
-            if not user_wallet_address_webhook: # ✅ فحص وجود account_id لـ account_tx
-                logging.error("❌ لم يتم العثور على account_id في بيانات account_tx من Webhook")
-                return jsonify({"error": "Missing account_id from webhook data (account_tx)"}), 400
-        else:
-            logging.error(f"❌ نوع حدث غير متوقع: {event_type}") # ✅ تسجيل خطأ لأنواع الأحداث غير المتوقعة
-            return jsonify({"error": "Unexpected event type"}), 400
 
+        logging.info(f"✅ معاملة مستلمة: {transaction_id} | الحساب: {user_wallet_address_webhook} | المستلم: {recipient_address} | المبلغ: {amount}")
 
-        logging.info(f"✅ معاملة مستلمة: {transaction_id} | الحساب: {account_id if event_type == 'account_tx' else sender_address} | المستلم: {recipient_address} | المبلغ: {amount} | نوع الحدث: {event_type} | عنوان المحفظة المستخدم للمطابقة: {user_wallet_address_webhook}") # ✅ تضمين نوع الحدث وعنوان المحفظة المستخدم للمطابقة في السجل
-
+        # التحقق من وجود عنوان المحفظة
+        if not user_wallet_address_webhook:
+            logging.error("❌ لم يتم العثور على عنوان المحفظة من Webhook")
+            return jsonify({"error": "Missing wallet address from webhook data"}), 400
 
         # البحث عن سجل الدفع المعلق باستخدام user_wallet_address_webhook
         async with current_app.db_pool.acquire() as conn:
-            payment_record = await fetch_pending_payment_by_wallet(conn, user_wallet_address_webhook) # ✅ استخدام fetch_pending_payment_by_wallet
+            payment_record = await fetch_pending_payment_by_wallet(conn, user_wallet_address_webhook)
         if not payment_record:
-            logging.error(f"❌ لم يتم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address_webhook} | نوع الحدث: {event_type}") # ✅ تضمين نوع الحدث في رسالة الخطأ
-            return jsonify({"error": "Pending payment record not found for this wallet address"}), 404 # ✅ تغيير رمز الحالة إلى 404
-
+            logging.error(f"❌ لم يتم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address_webhook}")
+            return jsonify({"error": "Pending payment record not found for this wallet address"}), 404
 
         # تحديث سجل الدفع في قاعدة البيانات باستخدام payment_id لتسجيل tx_hash
         async with current_app.db_pool.acquire() as conn:
-            updated_payment_record = await update_payment_with_txhash(conn, payment_record.get('payment_id'), transaction_id) # ✅ استخدام payment_id من payment_record
+            updated_payment_record = await update_payment_with_txhash(conn, payment_record.get('payment_id'), transaction_id)
         if not updated_payment_record:
             return jsonify({"error": "Failed to update payment record"}), 500
 
-
         # استخدام البيانات الفعلية من سجل الدفع المُحدث
-        telegram_id = payment_record.get("telegram_id") # ✅ استخدام payment_record بدلاً من updated_payment_record
-        subscription_type_id = payment_record.get("subscription_type_id") # ✅ استخدام payment_record بدلاً من updated_payment_record
-        username = payment_record.get("username") # ✅ استخدام payment_record بدلاً من updated_payment_record
-        full_name = payment_record.get("full_name") # ✅ استخدام payment_record بدلاً من updated_payment_record
-
+        telegram_id = payment_record.get("telegram_id")
+        subscription_type_id = payment_record.get("subscription_type_id")
+        username = payment_record.get("username")
+        full_name = payment_record.get("full_name")
 
         # تجهيز بيانات الاشتراك باستخدام المعلومات الفعلية
         async with aiohttp.ClientSession() as session:

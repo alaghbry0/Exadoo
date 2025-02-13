@@ -293,20 +293,26 @@ async def get_user_subscriptions(connection, telegram_id: int):
         return []
 
 
-async def record_payment(conn, telegram_id, payment_id, amount, subscription_type_id, username=None, full_name=None, user_wallet_address=None): # ✅ إضافة user_wallet_address
-    """تسجيل عملية الدفع في قاعدة البيانات مع بيانات المستخدم."""
+# db_queries.py - record_payment function signature
+async def record_payment(conn, telegram_id, user_wallet_address, amount, subscription_type_id, username=None, full_name=None): # ✅ إزالة payment_id من المعاملات
+    """تسجيل بيانات الدفع والمستخدم في قاعدة البيانات كدفعة معلقة."""
     try:
-        await conn.execute(
-            """
-            INSERT INTO payments (user_id, subscription_type_id, amount, payment_id, payment_custom_id, payment_date, telegram_id, username, full_name, user_wallet_address, status) -- ✅ إضافة user_wallet_address وحالة الدفع
-            VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9, 'pending') -- ✅ إضافة قيمة user_wallet_address وقيمة الحالة 'pending'
-            """,
-            telegram_id, subscription_type_id, amount, payment_id, payment_id, telegram_id, username, full_name, user_wallet_address # ✅ تمرير user_wallet_address كوسيط
-        )
-        logging.info(f"✅ تم تسجيل الدفع وبيانات المستخدم كدفعة معلقة بنجاح: {payment_id} | عنوان المحفظة: {user_wallet_address}") # ✅ تضمين عنوان المحفظة في السجل
+        sql = """
+            INSERT INTO payments (user_id, subscription_type_id, amount, payment_date, telegram_id, username, full_name, user_wallet_address, status) -- ✅ إزالة payment_id من قائمة الأعمدة
+            VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, 'pending') -- ✅ إزالة $4 (payment_id) من قائمة القيم
+            RETURNING payment_id, payment_date;
+        """
+        result = await conn.fetchrow(sql, telegram_id, subscription_type_id, amount, telegram_id, username, full_name, user_wallet_address) # ✅ إزالة payment_id من استدعاء fetchrow
+        if result:
+            payment_id, payment_date = result['payment_id'], result['payment_date']
+            logging.info(f"✅ تم تسجيل دفعة معلقة جديدة بنجاح في قاعدة البيانات. معرف الدفع: {payment_id}, تاريخ الدفع: {payment_date}")
+            return {"payment_id": payment_id, "payment_date": payment_date}
+        else:
+            logging.error("❌ فشل تسجيل دفعة معلقة في قاعدة البيانات.")
+            return None
     except Exception as e:
-        logging.error(f"❌ فشل في تسجيل الدفع وبيانات المستخدم: {e}")
-
+        logging.error(f"❌ خطأ أثناء تسجيل الدفع في قاعدة البيانات: {e}", exc_info=True)
+        return None
 
 async def update_payment_with_txhash(conn, payment_id: str, tx_hash: str) -> Optional[dict]:
     """
