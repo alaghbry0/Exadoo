@@ -3,7 +3,8 @@ import asyncpg
 import logging
 import os
 import asyncio
-
+import hypercorn.config
+import hypercorn.asyncio
 import aiohttp  # ✅ استيراد aiohttp
 from quart import Quart
 from quart_cors import cors
@@ -91,8 +92,13 @@ async def close_resources():
 async def home():
     return "🚀 Exadoo API is running!"
 
-# 🔹 تشغيل التطبيق
+
+# 🔹 تشغيل التطبيق باستخدام Hypercorn
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
+    port = int(os.getenv("PORT", 5000))  # Heroku يحدد المنفذ تلقائيًا
     logging.info(f"🚀 تشغيل Exadoo API على المنفذ {port}...")
-    app.run(debug=False, host="0.0.0.0", port=port)
+
+    config = hypercorn.Config()
+    config.bind = [f"0.0.0.0:{port}"]  # استخدام المنفذ الصحيح
+
+    asyncio.run(hypercorn.asyncio.serve(app, config))
