@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone  # <-- تأكد من وجود
 from config import DATABASE_CONFIG
 import pytz
 import logging
-
+from typing import Optional
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
@@ -298,17 +298,17 @@ async def record_payment(conn, user_id, payment_id, amount, subscription_type_id
     try:
         await conn.execute(
             """
-            INSERT INTO payments (user_id, subscription_type_id, amount, payment_custom_id, payment_date)
-            VALUES ($1, $2, $3, $4, NOW())
+            INSERT INTO payments (user_id, subscription_type_id, amount, payment_id, payment_custom_id, payment_date)
+            VALUES ($1, $2, $3, $4, $5, NOW())
             """,
-            user_id, subscription_type_id, amount, payment_id
+            user_id, subscription_type_id, amount, payment_id, payment_id
         )
         logging.info(f"✅ تم تسجيل الدفع بنجاح: {payment_id}")
     except Exception as e:
         logging.error(f"❌ فشل في تسجيل الدفع: {e}")
 
 
-from typing import Optional
+
 
 async def update_payment_with_txhash(payment_id: str, tx_hash: str) -> Optional[dict]:
     """
