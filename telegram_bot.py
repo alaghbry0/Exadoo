@@ -71,9 +71,6 @@ async def start_command(message: types.Message):
 
     await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
 
-    # ✅ إرسال الرسالة مع الأزرار
-    await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
-
 
 # 🔹 وظيفة إرسال بيانات الدفع إلى `/api/subscribe`
 async def send_payment_to_subscribe_api(telegram_id: int, plan_id: int, payment_id: str, retries=3):

@@ -298,7 +298,7 @@ async def record_payment(conn, user_id, payment_id, amount, subscription_type_id
     try:
         await conn.execute(
             """
-            INSERT INTO payments (user_id, subscription_type_id, amount, payment_id, payment_date)
+            INSERT INTO payments (user_id, subscription_type_id, amount, payment_custom_id, payment_date)
             VALUES ($1, $2, $3, $4, NOW())
             """,
             user_id, subscription_type_id, amount, payment_id
@@ -306,4 +306,36 @@ async def record_payment(conn, user_id, payment_id, amount, subscription_type_id
         logging.info(f"✅ تم تسجيل الدفع بنجاح: {payment_id}")
     except Exception as e:
         logging.error(f"❌ فشل في تسجيل الدفع: {e}")
+
+
+from typing import Optional
+
+async def update_payment_with_txhash(payment_id: str, tx_hash: str) -> Optional[dict]:
+    """
+    تقوم هذه الدالة بتحديث سجل الدفع في قاعدة البيانات باستخدام payment_id لتسجيل tx_hash
+    وتحديث حالة الدفع إلى 'completed'. تُعيد السجل المحدث كقاموس يحتوي على بيانات المستخدم،
+    أو None إذا لم يتم العثور على السجل أو حدث خطأ.
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE payments
+                SET tx_hash = $1,
+                    status = 'completed',
+                    updated_date = NOW()
+                WHERE payment_custom_id = $2
+                RETURNING telegram_id, subscription_type_id, username, full_name;
+                """,
+                tx_hash, payment_id
+            )
+            if row:
+                logging.info(f"✅ تم تحديث سجل الدفع بنجاح للـ payment_id: {payment_id}")
+                return dict(row)
+            else:
+                logging.error(f"❌ لم يتم العثور على سجل الدفع للـ payment_id: {payment_id}")
+                return None
+    except Exception as e:
+        logging.error(f"❌ فشل تحديث سجل الدفع: {e}", exc_info=True)
+        return None
 

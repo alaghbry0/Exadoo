@@ -3,6 +3,9 @@ import os
 import aiohttp
 from quart import Blueprint, request, jsonify
 import json
+from database.db_queries import (update_payment_with_txhash)
+
+
 
 webhook_bp = Blueprint("webhook", __name__)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -24,33 +27,35 @@ def validate_secret():
         return False
     return True
 
+
+
 @webhook_bp.route("/api/webhook", methods=["POST"])
 async def webhook():
     """
     نقطة API لاستقبال إشعارات الدفع من TonAPI.
-    Webhook هو المصدر الموثوق لتفعيل الاشتراك.
+    يتم استخراج بيانات المعاملة، بما في ذلك custom_payload (الذي يمثل paymentId) وtx_hash.
+    بعد التحقق من صحة البيانات، يتم تحديث سجل الدفع عبر update_payment_with_txhash،
+    ثم استخدام البيانات الفعلية لإرسال طلب تجديد الاشتراك.
     """
     try:
-        # ✅ تسجيل معلومات الطلب
+        # تسجيل معلومات الطلب
         log_request_info()
 
-        # ✅ التحقق من WEBHOOK_SECRET قبل معالجة البيانات
+        # التحقق من صحة المفتاح
         if not validate_secret():
             return jsonify({"error": "Unauthorized request"}), 403
 
-        # ✅ استقبال البيانات
+        # استقبال بيانات المعاملة
         data = await request.get_json()
         logging.info(f"📥 بيانات الطلب المستلمة: {json.dumps(data, indent=2)}")
 
-        # ✅ استخراج نوع الحدث بشكل صحيح
+        # استخراج نوع الحدث
         event_type = data.get("event_type")
-
-        # ✅ دعم `transaction_received` و `account_tx`
         if event_type not in ["transaction_received", "account_tx"]:
             logging.info(f"⚠️ تجاهل حدث غير متعلق بالدفع: {event_type}")
             return jsonify({"message": "Event ignored"}), 200
 
-        # ✅ بيانات الدفع المشتركة
+        # استخراج بيانات المعاملة الأساسية
         transaction_id = data.get("tx_hash")
         account_id = data.get("account_id") if event_type == "account_tx" else None
         lt = data.get("lt") if event_type == "account_tx" else None
@@ -59,28 +64,39 @@ async def webhook():
         amount = data.get("data", {}).get("amount", 0) if event_type == "transaction_received" else None
         status = data.get("data", {}).get("status") if event_type == "transaction_received" else None
 
-        # ✅ التحقق من البيانات المطلوبة بناءً على نوع الحدث
+        # التحقق من البيانات حسب نوع الحدث
         if event_type == "transaction_received":
             if not all([transaction_id, sender_address, recipient_address, amount, status]):
-                logging.error("❌ بيانات `transaction_received` غير مكتملة!")
+                logging.error("❌ بيانات transaction_received غير مكتملة!")
                 return jsonify({"error": "Invalid transaction data"}), 400
             if status.lower() != "completed":
                 logging.warning(f"⚠️ لم يتم تأكيد المعاملة بعد، الحالة: {status}")
                 return jsonify({"message": "Transaction not completed yet"}), 202
         elif event_type == "account_tx":
             if not all([transaction_id, account_id, lt]):
-                logging.error("❌ بيانات `account_tx` غير مكتملة!")
+                logging.error("❌ بيانات account_tx غير مكتملة!")
                 return jsonify({"error": "Invalid account transaction data"}), 400
 
         logging.info(f"✅ معاملة مستلمة: {transaction_id} | الحساب: {account_id if event_type == 'account_tx' else sender_address} | المستلم: {recipient_address} | المبلغ: {amount}")
 
-        # ✅ بيانات المستخدم والاشتراك (يجب تحسينها لاحقًا)
-        telegram_id = 7382197778  # ⚠️ قيمة افتراضية - ستُستبدل لاحقًا
-        subscription_type_id = 1  # ⚠️ قيمة افتراضية - ستُستبدل لاحقًا
-        username = "test_user"  # ⚠️ قيمة افتراضية - ستُستبدل لاحقًا
-        full_name = "Test User"  # ⚠️ قيمة افتراضية - ستُستبدل لاحقًا
+        # استخراج custom payload الذي يحتوي على paymentId
+        payment_id = data.get("data", {}).get("custom_payload")
+        if not payment_id:
+            logging.error("❌ لم يتم العثور على custom_payload في بيانات المعاملة")
+            return jsonify({"error": "Missing custom payload"}), 400
 
-        # ✅ تجهيز بيانات الاشتراك وإرسالها إلى `/api/subscribe`
+        # تحديث سجل الدفع في قاعدة البيانات باستخدام payment_id لتسجيل tx_hash
+        payment_record = await update_payment_with_txhash(payment_id, transaction_id)
+        if not payment_record:
+            return jsonify({"error": "Failed to update payment record"}), 500
+
+        # استخدام البيانات الفعلية من سجل الدفع المُحدث
+        telegram_id = payment_record.get("telegram_id")
+        subscription_type_id = payment_record.get("subscription_type_id")
+        username = payment_record.get("username")
+        full_name = payment_record.get("full_name")
+
+        # تجهيز بيانات الاشتراك باستخدام المعلومات الفعلية
         async with aiohttp.ClientSession() as session:
             headers = {
                 "Authorization": f"Bearer {WEBHOOK_SECRET}",
@@ -89,7 +105,7 @@ async def webhook():
             subscription_payload = {
                 "telegram_id": telegram_id,
                 "subscription_type_id": subscription_type_id,
-                "payment_id": transaction_id,
+                "payment_id": transaction_id,  # استخدام tx_hash النهائي
                 "username": username,
                 "full_name": full_name,
                 "webhook_account_id": account_id if event_type == "account_tx" else None,
