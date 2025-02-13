@@ -82,10 +82,18 @@ async def webhook():
             if status.lower() != "completed":
                 logging.warning(f"⚠️ لم يتم تأكيد المعاملة بعد، الحالة: {status}")
                 return jsonify({"message": "Transaction not completed yet"}), 202
-        elif event_type == "account_tx":
-            if not all([transaction_id, account_id, lt]):
-                logging.error("❌ بيانات account_tx غير مكتملة!")
-                return jsonify({"error": "Invalid account transaction data"}), 400
+            elif event_type == "account_tx":
+                account_id = data.get("account_id")
+                lt = data.get("lt")
+                # محاولة استخراج عنوان المرسل من بيانات account_tx - **قد تحتاج إلى تعديل هذا المسار**
+                sender_address_webhook = data.get("in_msg", {}).get("message", {}).get("info", {}).get("src", {}).get(
+                    "address")
+                user_wallet_address_webhook = sender_address_webhook  # استخدام عنوان المرسل للبحث
+                # القيم التالية غير متوفرة في account_tx
+                sender_address = sender_address_webhook  # تعيين sender_address للمعلومات المسجلة
+                recipient_address = None  # غير متوفر في account_tx بشكل مباشر
+                amount = None
+                status = None
 
         logging.info(f"✅ معاملة مستلمة: {transaction_id} | الحساب: {user_wallet_address_webhook} | المستلم: {recipient_address} | المبلغ: {amount}")
 
