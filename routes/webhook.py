@@ -63,7 +63,9 @@ async def webhook():
         logging.info(f"🔍 Debug - Full data payload: {json.dumps(data.get('data'), indent=2)}")
 
 
-        # التحقق من البيانات حسب نوع الحدث
+        # التحقق من البيانات حسب نوع الحدث وتحديد user_wallet_address_webhook
+        user_wallet_address_webhook = None # ✅ تهيئة المتغير
+
         if event_type == "transaction_received":
             if not all([transaction_id, sender_address, recipient_address, amount, status]):
                 logging.error("❌ بيانات transaction_received غير مكتملة!")
@@ -71,32 +73,33 @@ async def webhook():
             if status.lower() != "completed":
                 logging.warning(f"⚠️ لم يتم تأكيد المعاملة بعد، الحالة: {status}")
                 return jsonify({"message": "Transaction not completed yet"}), 202
-        elif event_type == "account_tx":  # ✅ تم نقل elif إلى السطر التالي
+            user_wallet_address_webhook = sender_address # ✅ استخدام sender_address لـ transaction_received
+            if not user_wallet_address_webhook: # ✅ فحص وجود sender_address لـ transaction_received
+                logging.error("❌ لم يتم العثور على sender_address في بيانات transaction_received من Webhook")
+                return jsonify({"error": "Missing sender address from webhook data (transaction_received)"}), 400
+
+
+        elif event_type == "account_tx":  # ✅ معالجة حدث account_tx
             if not all([transaction_id, account_id, lt]):
                 logging.error("❌ بيانات account_tx غير مكتملة!")
                 return jsonify({"error": "Invalid account transaction data"}), 400
+            user_wallet_address_webhook = account_id # ✅ استخدام account_id لـ account_tx
+            if not user_wallet_address_webhook: # ✅ فحص وجود account_id لـ account_tx
+                logging.error("❌ لم يتم العثور على account_id في بيانات account_tx من Webhook")
+                return jsonify({"error": "Missing account_id from webhook data (account_tx)"}), 400
+        else:
+            logging.error(f"❌ نوع حدث غير متوقع: {event_type}") # ✅ تسجيل خطأ لأنواع الأحداث غير المتوقعة
+            return jsonify({"error": "Unexpected event type"}), 400
 
 
-        logging.info(f"✅ معاملة مستلمة: {transaction_id} | الحساب: {account_id if event_type == 'account_tx' else sender_address} | المستلم: {recipient_address} | المبلغ: {amount}")
-
-        # **إزالة استخراج payment_id من custom_payload**
-        # payment_id = data.get("data", {}).get("custom_payload")
-        # if not payment_id:
-        #     logging.error("❌ لم يتم العثور على custom_payload في بيانات المعاملة")
-        #     return jsonify({"error": "Missing custom payload"}), 400
-
-        user_wallet_address_webhook = sender_address # ✅ استخدام sender_address من Webhook
-
-        if not user_wallet_address_webhook: # ✅ التحقق من وجود user_wallet_address_webhook
-            logging.error("❌ لم يتم العثور على sender_address في بيانات المعاملة من Webhook")
-            return jsonify({"error": "Missing sender address from webhook data"}), 400
+        logging.info(f"✅ معاملة مستلمة: {transaction_id} | الحساب: {account_id if event_type == 'account_tx' else sender_address} | المستلم: {recipient_address} | المبلغ: {amount} | نوع الحدث: {event_type} | عنوان المحفظة المستخدم للمطابقة: {user_wallet_address_webhook}") # ✅ تضمين نوع الحدث وعنوان المحفظة المستخدم للمطابقة في السجل
 
 
         # البحث عن سجل الدفع المعلق باستخدام user_wallet_address_webhook
         async with current_app.db_pool.acquire() as conn:
             payment_record = await fetch_pending_payment_by_wallet(conn, user_wallet_address_webhook) # ✅ استخدام fetch_pending_payment_by_wallet
         if not payment_record:
-            logging.error(f"❌ لم يتم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address_webhook}")
+            logging.error(f"❌ لم يتم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address_webhook} | نوع الحدث: {event_type}") # ✅ تضمين نوع الحدث في رسالة الخطأ
             return jsonify({"error": "Pending payment record not found for this wallet address"}), 404 # ✅ تغيير رمز الحالة إلى 404
 
 
