@@ -18,19 +18,19 @@ async def confirm_payment():
         logging.info(f"📥 بيانات الطلب المستلمة في /api/confirm_payment (مدمجة): {json.dumps(data, indent=2)}")
 
         # استلام البيانات
-        payment_id = data.get("paymentId")
+        user_wallet_address = data.get("userWalletAddress") # ✅ استلام userWalletAddress بدلاً من paymentId
         plan_id_str = data.get("planId")
         telegram_id_str = data.get("telegramId")
         telegram_username = data.get("telegramUsername")
         full_name = data.get("fullName")
 
         # التحقق من البيانات الأساسية
-        if not all([payment_id, plan_id_str, telegram_id_str]):
+        if not all([user_wallet_address, plan_id_str, telegram_id_str]): # ✅ التحقق من user_wallet_address بدلاً من paymentId
             logging.error("❌ بيانات تأكيد الدفع غير مكتملة!")
             return jsonify({"error": "Invalid payment confirmation data"}), 400
 
         logging.info(
-            f"✅ استلام طلب تأكيد الدفع (مدمج): paymentId={payment_id}, planId={plan_id_str}, "
+            f"✅ استلام طلب تأكيد الدفع (مدمج): userWalletAddress={user_wallet_address}, planId={plan_id_str}, " # ✅ تسجيل userWalletAddress
             f"telegram_id={telegram_id_str}, username={telegram_username}, full_name={full_name}"
         )
 
@@ -48,10 +48,10 @@ async def confirm_payment():
 
         # استخدام current_app.db_pool وتمرير username و full_name إلى record_payment
         async with current_app.db_pool.acquire() as conn:
-            await record_payment(conn, telegram_id, payment_id, amount, subscription_type_id, username=telegram_username, full_name=full_name) # ✅ تمرير username و full_name
+            await record_payment(conn, telegram_id, user_wallet_address, amount, subscription_type_id, username=telegram_username, full_name=full_name, user_wallet_address=user_wallet_address) # ✅ تمرير username, full_name, user_wallet_address
 
         logging.info(
-            f"💾 تسجيل بيانات الدفع والمستخدم كدفعة معلقة: paymentId={payment_id}, "
+            f"💾 تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, " # ✅ تسجيل userWalletAddress
             f"planId={plan_id_str}, telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, username={telegram_username}, full_name={full_name}"
         )
 

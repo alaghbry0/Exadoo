@@ -293,21 +293,19 @@ async def get_user_subscriptions(connection, telegram_id: int):
         return []
 
 
-async def record_payment(conn, telegram_id, payment_id, amount, subscription_type_id, username=None, full_name=None):
+async def record_payment(conn, telegram_id, payment_id, amount, subscription_type_id, username=None, full_name=None, user_wallet_address=None): # ✅ إضافة user_wallet_address
     """تسجيل عملية الدفع في قاعدة البيانات مع بيانات المستخدم."""
     try:
         await conn.execute(
             """
-            INSERT INTO payments (user_id, subscription_type_id, amount, payment_id, payment_custom_id, payment_date, telegram_id, username, full_name) -- ✅ إضافة telegram_id, username, full_name إلى حقول الإدراج
-            VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8) -- ✅ إضافة قيم telegram_id, username, full_name إلى قيم VALUES
+            INSERT INTO payments (user_id, subscription_type_id, amount, payment_id, payment_custom_id, payment_date, telegram_id, username, full_name, user_wallet_address, status) -- ✅ إضافة user_wallet_address وحالة الدفع
+            VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9, 'pending') -- ✅ إضافة قيمة user_wallet_address وقيمة الحالة 'pending'
             """,
-            telegram_id, subscription_type_id, amount, payment_id, payment_id, telegram_id, username, full_name # ✅ تمرير telegram_id, username, full_name كوسائط
+            telegram_id, subscription_type_id, amount, payment_id, payment_id, telegram_id, username, full_name, user_wallet_address # ✅ تمرير user_wallet_address كوسيط
         )
-        logging.info(f"✅ تم تسجيل الدفع وبيانات المستخدم بنجاح: {payment_id}")
+        logging.info(f"✅ تم تسجيل الدفع وبيانات المستخدم كدفعة معلقة بنجاح: {payment_id} | عنوان المحفظة: {user_wallet_address}") # ✅ تضمين عنوان المحفظة في السجل
     except Exception as e:
         logging.error(f"❌ فشل في تسجيل الدفع وبيانات المستخدم: {e}")
-
-
 
 
 async def update_payment_with_txhash(conn, payment_id: str, tx_hash: str) -> Optional[dict]:
@@ -324,7 +322,7 @@ async def update_payment_with_txhash(conn, payment_id: str, tx_hash: str) -> Opt
             SET tx_hash = $1,
                 status = 'completed',
                 payment_date = NOW()  -- ✅ تحديث payment_date بدلاً من updated_date
-            WHERE payment_custom_id = $2
+            WHERE payment_id = $2 -- ✅ المطابقة الآن بـ payment_id وليس payment_custom_id
             RETURNING telegram_id, subscription_type_id, username, full_name;
             """,
             tx_hash, payment_id
@@ -337,4 +335,32 @@ async def update_payment_with_txhash(conn, payment_id: str, tx_hash: str) -> Opt
             return None
     except Exception as e:
         logging.error(f"❌ فشل تحديث سجل الدفع: {e}", exc_info=True)
+        return None
+
+
+async def fetch_pending_payment_by_wallet(conn, user_wallet_address: str) -> Optional[dict]:
+    """
+    تقوم هذه الدالة بجلب سجل دفع معلق من قاعدة البيانات بناءً على عنوان محفظة المستخدم.
+    تستخدم اتصال قاعدة البيانات المُمرر `conn` لتنفيذ العملية.
+    تُعيد السجل المعلق كقاموس، أو None إذا لم يتم العثور على سجل معلق لعنوان المحفظة المحدد.
+    """
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT payment_id, telegram_id, subscription_type_id, username, full_name
+            FROM payments
+            WHERE user_wallet_address = $1 AND status = 'pending'
+            ORDER BY payment_date ASC
+            LIMIT 1; -- جلب أقدم طلب معلق في حالة وجود عدة طلبات معلقة لنفس المحفظة
+            """,
+            user_wallet_address
+        )
+        if row:
+            logging.info(f"✅ تم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address}")
+            return dict(row)
+        else:
+            logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address}") # تم تغيير الخطأ إلى تحذير
+            return None
+    except Exception as e:
+        logging.error(f"❌ فشل في جلب سجل الدفع المعلق: {e}", exc_info=True)
         return None

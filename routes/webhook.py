@@ -4,7 +4,7 @@ import os
 import aiohttp
 from quart import Blueprint, request, jsonify, current_app
 import json
-from database.db_queries import (update_payment_with_txhash)
+from database.db_queries import (update_payment_with_txhash, fetch_pending_payment_by_wallet) # ✅ استيراد fetch_pending_payment_by_wallet
 
 webhook_bp = Blueprint("webhook", __name__)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -71,31 +71,48 @@ async def webhook():
             if status.lower() != "completed":
                 logging.warning(f"⚠️ لم يتم تأكيد المعاملة بعد، الحالة: {status}")
                 return jsonify({"message": "Transaction not completed yet"}), 202
-            elif event_type == "account_tx":  # ✅ تم نقل elif إلى السطر التالي
-                if not all([transaction_id, account_id, lt]):
-                    logging.error("❌ بيانات account_tx غير مكتملة!")
-                    return jsonify({"error": "Invalid account transaction data"}), 400
+        elif event_type == "account_tx":  # ✅ تم نقل elif إلى السطر التالي
+            if not all([transaction_id, account_id, lt]):
+                logging.error("❌ بيانات account_tx غير مكتملة!")
+                return jsonify({"error": "Invalid account transaction data"}), 400
 
 
         logging.info(f"✅ معاملة مستلمة: {transaction_id} | الحساب: {account_id if event_type == 'account_tx' else sender_address} | المستلم: {recipient_address} | المبلغ: {amount}")
 
-        # استخراج custom payload الذي يحتوي على paymentId
-        payment_id = data.get("data", {}).get("custom_payload")
-        if not payment_id:
-            logging.error("❌ لم يتم العثور على custom_payload في بيانات المعاملة")
-            return jsonify({"error": "Missing custom payload"}), 400
+        # **إزالة استخراج payment_id من custom_payload**
+        # payment_id = data.get("data", {}).get("custom_payload")
+        # if not payment_id:
+        #     logging.error("❌ لم يتم العثور على custom_payload في بيانات المعاملة")
+        #     return jsonify({"error": "Missing custom payload"}), 400
+
+        user_wallet_address_webhook = sender_address # ✅ استخدام sender_address من Webhook
+
+        if not user_wallet_address_webhook: # ✅ التحقق من وجود user_wallet_address_webhook
+            logging.error("❌ لم يتم العثور على sender_address في بيانات المعاملة من Webhook")
+            return jsonify({"error": "Missing sender address from webhook data"}), 400
+
+
+        # البحث عن سجل الدفع المعلق باستخدام user_wallet_address_webhook
+        async with current_app.db_pool.acquire() as conn:
+            payment_record = await fetch_pending_payment_by_wallet(conn, user_wallet_address_webhook) # ✅ استخدام fetch_pending_payment_by_wallet
+        if not payment_record:
+            logging.error(f"❌ لم يتم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address_webhook}")
+            return jsonify({"error": "Pending payment record not found for this wallet address"}), 404 # ✅ تغيير رمز الحالة إلى 404
+
 
         # تحديث سجل الدفع في قاعدة البيانات باستخدام payment_id لتسجيل tx_hash
-        async with current_app.db_pool.acquire() as conn:  # ✅ استخدام current_app.db_pool هنا
-            payment_record = await update_payment_with_txhash(conn, payment_id, transaction_id)
-        if not payment_record:
+        async with current_app.db_pool.acquire() as conn:
+            updated_payment_record = await update_payment_with_txhash(conn, payment_record.get('payment_id'), transaction_id) # ✅ استخدام payment_id من payment_record
+        if not updated_payment_record:
             return jsonify({"error": "Failed to update payment record"}), 500
 
+
         # استخدام البيانات الفعلية من سجل الدفع المُحدث
-        telegram_id = payment_record.get("telegram_id")
-        subscription_type_id = payment_record.get("subscription_type_id")
-        username = payment_record.get("username")
-        full_name = payment_record.get("full_name")
+        telegram_id = payment_record.get("telegram_id") # ✅ استخدام payment_record بدلاً من updated_payment_record
+        subscription_type_id = payment_record.get("subscription_type_id") # ✅ استخدام payment_record بدلاً من updated_payment_record
+        username = payment_record.get("username") # ✅ استخدام payment_record بدلاً من updated_payment_record
+        full_name = payment_record.get("full_name") # ✅ استخدام payment_record بدلاً من updated_payment_record
+
 
         # تجهيز بيانات الاشتراك باستخدام المعلومات الفعلية
         async with aiohttp.ClientSession() as session:
