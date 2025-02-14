@@ -1,13 +1,14 @@
-# payment_confirmation.py (modified - corrected telegram_id data type)
+# payment_confirmation.py (modified - corrected telegram_id data type and URL conversion)
 import logging
 from quart import Blueprint, request, jsonify, current_app
 import json
 from database.db_queries import record_payment
-import os # ✅ استيراد مكتبة os
-import aiohttp
+import os  # ✅ استيراد مكتبة os
+import aiohttp  # ✅ استيراد مكتبة aiohttp
 
 payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
-WEBHOOK_SECRET_BACKEND = os.getenv("WEBHOOK_SECRET") # ✅ تحميل WEBHOOK_SECRET للخادم
+WEBHOOK_SECRET_BACKEND = os.getenv("WEBHOOK_SECRET")  # ✅ تحميل WEBHOOK_SECRET للخادم
+SUBSCRIBE_API_URL = os.getenv("SUBSCRIBE_API_URL", "http://localhost:5000/api/subscribe")
 
 @payment_confirmation_bp.route("/api/confirm_payment", methods=["POST"])
 async def confirm_payment():
@@ -24,12 +25,12 @@ async def confirm_payment():
         webhook_secret_frontend = data.get("webhookSecret")
         if not webhook_secret_frontend or webhook_secret_frontend != WEBHOOK_SECRET_BACKEND:
             logging.warning("❌ طلب غير مصرح به إلى /api/confirm_payment: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
-            return jsonify({"error": "Unauthorized request"}), 403 # إرجاع رمز حالة 403 للرفض
+            return jsonify({"error": "Unauthorized request"}), 403  # إرجاع رمز حالة 403 للرفض
 
         # استخراج البيانات الأساسية من الطلب (بقية البيانات كما هي)
         user_wallet_address = data.get("userWalletAddress")
         plan_id_str = data.get("planId")
-        telegram_id_str = data.get("telegramId") # ✅ تصحيح: استخدام "telegramId" بحرف 'I' كبير
+        telegram_id_str = data.get("telegramId")  # ✅ تصحيح: استخدام "telegramId" بحرف 'I' كبير
         telegram_username = data.get("telegramUsername")
         full_name = data.get("fullName")
 
@@ -58,20 +59,19 @@ async def confirm_payment():
 
         # ✅ تحويل telegram_id_str إلى عدد صحيح
         try:
-            telegram_id = int(telegram_id_str) # ✅ تحويل telegram_id_str إلى عدد صحيح
+            telegram_id = int(telegram_id_str)  # ✅ تحويل telegram_id_str إلى عدد صحيح
         except ValueError:
             logging.error(f"❌ telegramId ليس عددًا صحيحًا: {telegram_id_str}. تعذر تسجيل الدفعة.")
-            return jsonify({"error": "Invalid telegramId", "details": "telegramId must be an integer."}), 400 # إرجاع رمز حالة 400 لطلب غير صالح
-
+            return jsonify({"error": "Invalid telegramId", "details": "telegramId must be an integer."}), 400  # إرجاع رمز حالة 400 لطلب غير صالح
 
         # تسجيل دفعة معلقة جديدة دون التحقق من وجود دفعة سابقة (كما هي)
         async with current_app.db_pool.acquire() as conn:
             result = await record_payment(
                 conn,
-                telegram_id, # ✅ استخدام telegram_id (عدد صحيح)
+                telegram_id,  # ✅ استخدام telegram_id (عدد صحيح)
                 user_wallet_address,
                 amount,
-                subscription_type_id, # ✅ الآن subscription_type_id مُعرّف
+                subscription_type_id,  # ✅ الآن subscription_type_id مُعرّف
                 username=telegram_username,
                 full_name=full_name
             )
@@ -84,15 +84,15 @@ async def confirm_payment():
             )
 
             # ✅ استدعاء نقطة نهاية /api/subscribe لتجديد الاشتراك
-            async with aiohttp.ClientSession() as session: # ✅ تأكد من وجود استيراد aiohttp في الملف
+            async with aiohttp.ClientSession() as session:  # ✅ تأكد من وجود استيراد aiohttp في الملف
                 headers = {
-                    "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}", # ✅ استخدام مفتاح الخلفية للتوثيق الداخلي
+                    "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",  # ✅ استخدام مفتاح الخلفية للتوثيق الداخلي
                     "Content-Type": "application/json"
                 }
                 subscription_payload = {
-                    "telegram_id": telegram_id, # ✅ استخدام telegram_id (عدد صحيح)
-                    "subscription_type_id": subscription_type_id, # ✅ الآن subscription_type_id مُعرّف
-                    "payment_id": "manual_confirmation_" + user_wallet_address, # ✅ إنشاء payment_id فريد للتأكيد اليدوي
+                    "telegram_id": telegram_id,  # ✅ استخدام telegram_id (عدد صحيح)
+                    "subscription_type_id": subscription_type_id,  # ✅ الآن subscription_type_id مُعرّف
+                    "payment_id": "manual_confirmation_" + user_wallet_address,  # ✅ إنشاء payment_id فريد للتأكيد اليدوي
                     "username": telegram_username,
                     "full_name": full_name,
                     # لا يتم تضمين بيانات Webhook هنا لأننا لا نستخدم Webhook في هذا التدفق
@@ -100,7 +100,10 @@ async def confirm_payment():
 
                 logging.info(f"📞 استدعاء /api/subscribe لتجديد الاشتراك: {json.dumps(subscription_payload, indent=2)}")
 
-                async with session.post(str(current_app.config.get("SUBSCRIBE_API_URL")), json=subscription_payload, headers=headers) as response: # ✅ استخدام عنوان URL من config
+                # ✅ استخدام str() لتحويل عنوان URL بشكل صريح
+                subscribe_api_url = str(current_app.config.get("SUBSCRIBE_API_URL"))
+
+                async with session.post(subscribe_api_url, json=subscription_payload, headers=headers) as response:  # ✅ استخدام عنوان URL من config
                     subscribe_response = await response.json()
                     if response.status == 200:
                         logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_response}")
@@ -108,7 +111,6 @@ async def confirm_payment():
                     else:
                         logging.error(f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {subscribe_response}")
                         return jsonify({"error": "Failed to initiate subscription update", "subscribe_error": subscribe_response}), response.status
-
 
         else:
             logging.error("❌ فشل تسجيل الدفعة في قاعدة البيانات.")
