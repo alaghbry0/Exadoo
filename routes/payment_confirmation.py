@@ -100,7 +100,7 @@ async def confirm_payment():
 
                 logging.info(f"📞 استدعاء /api/subscribe لتجديد الاشتراك: {json.dumps(subscription_payload, indent=2)}")
 
-                async with session.post(current_app.config.get("SUBSCRIBE_API_URL"), json=subscription_payload, headers=headers) as response: # ✅ استخدام عنوان URL من config
+                async with session.post(str(current_app.config.get("SUBSCRIBE_API_URL")), json=subscription_payload, headers=headers) as response: # ✅ استخدام عنوان URL من config
                     subscribe_response = await response.json()
                     if response.status == 200:
                         logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_response}")
