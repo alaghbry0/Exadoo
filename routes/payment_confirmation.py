@@ -1,4 +1,4 @@
-# payment_confirmation.py (modified)
+# payment_confirmation.py (modified - corrected telegramId case)
 import logging
 from quart import Blueprint, request, jsonify, current_app
 import json
@@ -28,7 +28,7 @@ async def confirm_payment():
         # استخراج البيانات الأساسية من الطلب (بقية البيانات كما هي)
         user_wallet_address = data.get("userWalletAddress")
         plan_id_str = data.get("planId")
-        telegram_id_str = data.get("telegramId")
+        telegram_id_str = data.get("telegramId") # ✅ تصحيح: استخدام "telegramId" بحرف 'I' كبير
         telegram_username = data.get("telegramUsername")
         full_name = data.get("fullName")
 
@@ -47,7 +47,7 @@ async def confirm_payment():
         async with current_app.db_pool.acquire() as conn:
             result = await record_payment(
                 conn,
-                telegram_id,
+                telegram_id_str, # ✅ تصحيح: استخدام telegram_id_str هنا (تم استخدامه بشكل صحيح في الأصل)
                 user_wallet_address,
                 amount,
                 subscription_type_id,
@@ -58,7 +58,7 @@ async def confirm_payment():
         if result:
             logging.info(
                 f"💾 تم تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, "
-                f"planId={plan_id_str}, telegramId={telegram_id}, subscription_type_id={subscription_type_id}, "
+                f"planId={plan_id_str}, telegramId={telegram_id_str}, subscription_type_id={subscription_type_id}, "
                 f"username={telegram_username}, full_name={full_name}"
             )
 
@@ -69,7 +69,7 @@ async def confirm_payment():
                     "Content-Type": "application/json"
                 }
                 subscription_payload = {
-                    "telegram_id": telegram_id,
+                    "telegram_id": telegram_id_str, # ✅ تصحيح: استخدام telegram_id_str هنا
                     "subscription_type_id": subscription_type_id,
                     "payment_id": "manual_confirmation_" + user_wallet_address, # ✅ إنشاء payment_id فريد للتأكيد اليدوي
                     "username": telegram_username,
