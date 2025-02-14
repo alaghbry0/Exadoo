@@ -12,6 +12,7 @@ SUBSCRIBE_API_URL = os.getenv("SUBSCRIBE_API_URL", "http://localhost:5000/api/su
 
 @payment_confirmation_bp.route("/api/confirm_payment", methods=["POST"])
 async def confirm_payment():
+    logging.info(f"🧪 قيمة SUBSCRIBE_API_URL من os.getenv: {os.getenv('SUBSCRIBE_API_URL')}")  # ✅ تسجيل قيمة os.getenv
     """
     نقطة API لتأكيد استلام الدفع ومعالجة بيانات المستخدم.
     تسجل دفعة معلقة جديدة دون التحقق من وجود دفعات معلقة سابقة.
