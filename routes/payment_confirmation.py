@@ -1,4 +1,4 @@
-# payment_confirmation.py (modified - corrected subscription_type_id definition)
+# payment_confirmation.py (modified - corrected telegram_id data type)
 import logging
 from quart import Blueprint, request, jsonify, current_app
 import json
@@ -55,12 +55,19 @@ async def confirm_payment():
             subscription_type_id = 1  # Default to Basic plan if plan_id_str ليس عددًا صحيحًا
             logging.warning(f"⚠️ planId ليس عددًا صحيحًا: {plan_id_str}. تم استخدام الخطة الأساسية افتراضيًا.")
 
+        # ✅ تحويل telegram_id_str إلى عدد صحيح
+        try:
+            telegram_id = int(telegram_id_str) # ✅ تحويل telegram_id_str إلى عدد صحيح
+        except ValueError:
+            logging.error(f"❌ telegramId ليس عددًا صحيحًا: {telegram_id_str}. تعذر تسجيل الدفعة.")
+            return jsonify({"error": "Invalid telegramId", "details": "telegramId must be an integer."}), 400 # إرجاع رمز حالة 400 لطلب غير صالح
+
 
         # تسجيل دفعة معلقة جديدة دون التحقق من وجود دفعة سابقة (كما هي)
         async with current_app.db_pool.acquire() as conn:
             result = await record_payment(
                 conn,
-                telegram_id_str, # ✅ تصحيح: استخدام telegram_id_str هنا (تم استخدامه بشكل صحيح في الأصل)
+                telegram_id, # ✅ استخدام telegram_id (عدد صحيح)
                 user_wallet_address,
                 amount,
                 subscription_type_id, # ✅ الآن subscription_type_id مُعرّف
@@ -71,7 +78,7 @@ async def confirm_payment():
         if result:
             logging.info(
                 f"💾 تم تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, "
-                f"planId={plan_id_str}, telegramId={telegram_id_str}, subscription_type_id={subscription_type_id}, "
+                f"planId={plan_id_str}, telegramId={telegram_id}, subscription_type_id={subscription_type_id}, "
                 f"username={telegram_username}, full_name={full_name}"
             )
 
@@ -82,7 +89,7 @@ async def confirm_payment():
                     "Content-Type": "application/json"
                 }
                 subscription_payload = {
-                    "telegram_id": telegram_id_str, # ✅ تصحيح: استخدام telegram_id_str هنا
+                    "telegram_id": telegram_id, # ✅ استخدام telegram_id (عدد صحيح)
                     "subscription_type_id": subscription_type_id, # ✅ الآن subscription_type_id مُعرّف
                     "payment_id": "manual_confirmation_" + user_wallet_address, # ✅ إنشاء payment_id فريد للتأكيد اليدوي
                     "username": telegram_username,
