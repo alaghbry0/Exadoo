@@ -8,7 +8,7 @@ import aiohttp  # ✅ استيراد مكتبة aiohttp
 
 payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 WEBHOOK_SECRET_BACKEND = os.getenv("WEBHOOK_SECRET")  # ✅ تحميل WEBHOOK_SECRET للخادم
-SUBSCRIBE_API_URL = os.getenv("SUBSCRIBE_API_URL", "http://localhost:5000/api/subscribe")
+subscribe_api_url = os.getenv("SUBSCRIBE_API_URL")
 
 @payment_confirmation_bp.route("/api/confirm_payment", methods=["POST"])
 async def confirm_payment():
@@ -101,10 +101,9 @@ async def confirm_payment():
 
                 logging.info(f"📞 استدعاء /api/subscribe لتجديد الاشتراك: {json.dumps(subscription_payload, indent=2)}")
 
-                # ✅ استخدام str() لتحويل عنوان URL بشكل صريح
-                subscribe_api_url = str(current_app.config.get("SUBSCRIBE_API_URL"))
 
-                async with session.post(subscribe_api_url, json=subscription_payload, headers=headers) as response:  # ✅ استخدام عنوان URL من config
+                async with session.post(subscribe_api_url, json=subscription_payload, headers=headers) as response:
+                    # ... (بقية الكود)  # ✅ استخدام عنوان URL من config
                     subscribe_response = await response.json()
                     if response.status == 200:
                         logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_response}")
