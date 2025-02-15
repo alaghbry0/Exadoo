@@ -14,8 +14,9 @@ from routes.users import user_bp
 from routes.shop import shop
 from routes.payment_confirmation import payment_confirmation_bp
 #from routes.webhook import payments_bp
-from routes.webhook import webhook_bp
+#from routes.webhook import webhook_bp
 from telegram_bot import start_bot, bot, telegram_bot_bp  # ✅ استخدام `telegram_bot_bp`
+from chatbot.chatbot import chatbot_bp
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
 from Crypto.Signature import pkcs1_15
@@ -43,9 +44,12 @@ app.register_blueprint(subscriptions_bp)
 app.register_blueprint(user_bp)
 app.register_blueprint(shop)
 app.register_blueprint(payment_confirmation_bp)
-#app.register_blueprint(payments_bp)
-app.register_blueprint(webhook_bp)
+#app.register_blueprint(webhook_bp)
 app.register_blueprint(telegram_bot_bp)  # ✅ تغيير الاسم إلى `telegram_bot_bp`
+# تسجيل Blueprint البوت الخاص بالدردشة مع URL prefix
+app.register_blueprint(chatbot_bp, url_prefix="/bot")
+
+
 
 # 🔹 تشغيل Webhook للبوت عند بدء التطبيق
 @app.before_serving
