@@ -1,4 +1,5 @@
-# payment_confirmation.py (modified - corrected telegram_id data type and URL conversion)
+# payment_confirmation.py (modified - unique payment_id using UUID)
+import uuid  # ✅ استيراد وحدة uuid
 import logging
 from quart import Blueprint, request, jsonify, current_app
 import json
@@ -80,9 +81,12 @@ async def confirm_payment():
         if result:
             logging.info(
                 f"💾 تم تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, "
-                f"planId={plan_id_str}, telegramId={telegram_id}, subscription_type_id={subscription_type_id}, "
+                f"planId={plan_id_str}, telegramId={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={result[0]}, "
                 f"username={telegram_username}, full_name={full_name}"
             )
+
+            # ✅ إنشاء payment_id فريد باستخدام UUID **(تم النقل إلى هنا)**
+            payment_id = f"manual_confirmation_{uuid.uuid4()}"
 
             # ✅ استدعاء نقطة نهاية /api/subscribe لتجديد الاشتراك
             async with aiohttp.ClientSession() as session:  # ✅ تأكد من وجود استيراد aiohttp في الملف
@@ -93,7 +97,7 @@ async def confirm_payment():
                 subscription_payload = {
                     "telegram_id": telegram_id,  # ✅ استخدام telegram_id (عدد صحيح)
                     "subscription_type_id": subscription_type_id,  # ✅ الآن subscription_type_id مُعرّف
-                    "payment_id": "manual_confirmation_" + user_wallet_address,  # ✅ إنشاء payment_id فريد للتأكيد اليدوي
+                    "payment_id": payment_id,  # ✅ استخدام payment_id الفريد
                     "username": telegram_username,
                     "full_name": full_name,
                     # لا يتم تضمين بيانات Webhook هنا لأننا لا نستخدم Webhook في هذا التدفق
