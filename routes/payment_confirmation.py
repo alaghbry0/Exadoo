@@ -1,4 +1,4 @@
-# payment_confirmation.py (modified - unique payment_id using UUID)
+# payment_confirmation.py (modified - unique payment_id using UUID - warning fixed)
 import uuid  # ✅ استيراد وحدة uuid
 import logging
 from quart import Blueprint, request, jsonify, current_app
@@ -79,42 +79,51 @@ async def confirm_payment():
             )
 
         if result:
-            logging.info(
-                f"💾 تم تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, "
-                f"planId={plan_id_str}, telegramId={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={result[0]}, "
-                f"username={telegram_username}, full_name={full_name}"
-            )
+            # ✅ التحقق من أن result ليس فارغًا ويحتوي على العنصر الأول
+            if isinstance(result, list) and len(result) > 0:  # ✅ فحص إضافي للتأكد من أن result قائمة وغير فارغة
+                payment_id_db = result[0]  # ✅ استخراج payment_id من result بأمان
+                logging.info(
+                    f"💾 تم تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, "
+                    f"planId={plan_id_str}, telegramId={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={payment_id_db}, "  # ✅ استخدام payment_id_db
+                    f"username={telegram_username}, full_name={full_name}"
+                )
 
-            # ✅ إنشاء payment_id فريد باستخدام UUID **(تم النقل إلى هنا)**
-            payment_id = f"manual_confirmation_{uuid.uuid4()}"
+                # ✅ إنشاء payment_id فريد باستخدام UUID
+                payment_id = f"manual_confirmation_{uuid.uuid4()}"
 
-            # ✅ استدعاء نقطة نهاية /api/subscribe لتجديد الاشتراك
-            async with aiohttp.ClientSession() as session:  # ✅ تأكد من وجود استيراد aiohttp في الملف
-                headers = {
-                    "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",  # ✅ استخدام مفتاح الخلفية للتوثيق الداخلي
-                    "Content-Type": "application/json"
-                }
-                subscription_payload = {
-                    "telegram_id": telegram_id,  # ✅ استخدام telegram_id (عدد صحيح)
-                    "subscription_type_id": subscription_type_id,  # ✅ الآن subscription_type_id مُعرّف
-                    "payment_id": payment_id,  # ✅ استخدام payment_id الفريد
-                    "username": telegram_username,
-                    "full_name": full_name,
-                    # لا يتم تضمين بيانات Webhook هنا لأننا لا نستخدم Webhook في هذا التدفق
-                }
+                # ✅ استدعاء نقطة نهاية /api/subscribe لتجديد الاشتراك
+                async with aiohttp.ClientSession() as session:  # ✅ تأكد من وجود استيراد aiohttp في الملف
+                    headers = {
+                        "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",  # ✅ استخدام مفتاح الخلفية للتوثيق الداخلي
+                        "Content-Type": "application/json"
+                    }
+                    subscription_payload = {
+                        "telegram_id": telegram_id,  # ✅ استخدام telegram_id (عدد صحيح)
+                        "subscription_type_id": subscription_type_id,  # ✅ الآن subscription_type_id مُعرّف
+                        "payment_id": payment_id,  # ✅ استخدام payment_id الفريد
+                        "username": telegram_username,
+                        "full_name": full_name,
+                        # لا يتم تضمين بيانات Webhook هنا لأننا لا نستخدم Webhook في هذا التدفق
+                    }
 
-                logging.info(f"📞 استدعاء /api/subscribe لتجديد الاشتراك: {json.dumps(subscription_payload, indent=2)}")
+                    logging.info(f"📞 استدعاء /api/subscribe لتجديد الاشتراك: {json.dumps(subscription_payload, indent=2)}")
 
+                    async with session.post(subscribe_api_url, json=subscription_payload, headers=headers) as response:
+                        # ... (بقية الكود)  # ✅ استخدام عنوان URL من config
+                        subscribe_response = await response.json()
+                        if response.status == 200:
+                            logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_response}")
+                            return jsonify({"message": "Payment confirmation and subscription update initiated successfully"}), 200
+                        else:
+                            logging.error(f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {subscribe_response}")
+                            return jsonify({"error": "Failed to initiate subscription update", "subscribe_error": subscribe_response}), response.status
 
-                async with session.post(subscribe_api_url, json=subscription_payload, headers=headers) as response:
-                    # ... (بقية الكود)  # ✅ استخدام عنوان URL من config
-                    subscribe_response = await response.json()
-                    if response.status == 200:
-                        logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_response}")
-                        return jsonify({"message": "Payment confirmation and subscription update initiated successfully"}), 200
-                    else:
-                        logging.error(f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {subscribe_response}")
-                        return jsonify({"error": "Failed to initiate subscription update", "subscribe_error": subscribe_response}), response.status
+            else:
+                logging.warning(
+                    f"⚠️ دالة record_payment رجعت قيمة غير متوقعة: {result}.  ربما لم يتم إرجاع payment_id.")  # ✅ تسجيل تحذير إذا كانت result غير متوقعة
+                # ✅ لا يتم تعيين payment_id_from_db هنا لأنه غير مستخدم في هذا الفرع
+
+                return jsonify({"error": "Failed to record payment"}), 500 # ✅ إرجاع خطأ مباشرةً في حالة فشل تسجيل الدفعة
 
         else:
             logging.error("❌ فشل تسجيل الدفعة في قاعدة البيانات.")
