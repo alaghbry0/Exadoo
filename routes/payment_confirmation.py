@@ -100,7 +100,7 @@ async def confirm_payment():
                     subscription_payload = {
                         "telegram_id": telegram_id,  # ✅ استخدام telegram_id (عدد صحيح)
                         "subscription_type_id": subscription_type_id,  # ✅ الآن subscription_type_id مُعرّف
-                        "payment_id": payment_id,  # ✅ استخدام payment_id الفريد
+                        "payment_id": txHash,  # ✅ استخدام payment_id الفريد
                         "username": telegram_username,
                         "full_name": full_name,
                         # لا يتم تضمين بيانات Webhook هنا لأننا لا نستخدم Webhook في هذا التدفق
