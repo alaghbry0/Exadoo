@@ -29,7 +29,7 @@ async def parse_transactions(provider: LiteBalancer): # ✅ دالة parse_trans
 
     logging.info(f"🔍 جلب آخر المعاملات من محفظة البوت: {my_wallet_address}") # ✅ تسجيل المحفظة التي يتم فحصها
     try:
-        transactions = await provider.get_transactions(address=my_wallet_address, count=5) # جلب آخر 5 معاملات
+        transactions = await provider.get_transactions(address=my_wallet_address, count=20) # جلب آخر 5 معاملات
         logging.info(f"✅ تم جلب {len(transactions)} معاملة.") # ✅ تسجيل عدد المعاملات التي تم جلبها
 
         for transaction in transactions:
