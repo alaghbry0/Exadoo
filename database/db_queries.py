@@ -294,18 +294,18 @@ async def get_user_subscriptions(connection, telegram_id: int):
 
 
 # db_queries.py - record_payment function signature
-async def record_payment(conn, telegram_id, user_wallet_address, amount, subscription_type_id, username=None, full_name=None): # ✅ إزالة payment_id من المعاملات
+async def record_payment(conn, telegram_id, user_wallet_address, amount, subscription_type_id, username=None, full_name=None, order_id=None): # ✅ إضافة order_id كمعامل
     """تسجيل بيانات الدفع والمستخدم في قاعدة البيانات كدفعة معلقة."""
     try:
         sql = """
-            INSERT INTO payments (user_id, subscription_type_id, amount, payment_date, telegram_id, username, full_name, user_wallet_address, status) -- ✅ إزالة payment_id من قائمة الأعمدة
-            VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, 'pending') -- ✅ إزالة $4 (payment_id) من قائمة القيم
+            INSERT INTO payments (user_id, subscription_type_id, amount, payment_date, telegram_id, username, full_name, user_wallet_address, status, order_id) -- ✅ إضافة عمود order_id
+            VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, 'pending', $8) -- ✅ إضافة $8 (order_id) إلى قائمة القيم
             RETURNING payment_id, payment_date;
         """
-        result = await conn.fetchrow(sql, telegram_id, subscription_type_id, amount, telegram_id, username, full_name, user_wallet_address) # ✅ إزالة payment_id من استدعاء fetchrow
+        result = await conn.fetchrow(sql, telegram_id, subscription_type_id, amount, telegram_id, username, full_name, user_wallet_address, order_id) # ✅ تمرير order_id إلى الاستعلام
         if result:
             payment_id, payment_date = result['payment_id'], result['payment_date']
-            logging.info(f"✅ تم تسجيل دفعة معلقة جديدة بنجاح في قاعدة البيانات. معرف الدفع: {payment_id}, تاريخ الدفع: {payment_date}")
+            logging.info(f"✅ تم تسجيل دفعة معلقة جديدة بنجاح في قاعدة البيانات. معرف الدفع: {payment_id}, تاريخ الدفع: {payment_date}, order_id: {order_id}") # ✅ تسجيل order_id في السجل
             return {"payment_id": payment_id, "payment_date": payment_date}
         else:
             logging.error("❌ فشل تسجيل دفعة معلقة في قاعدة البيانات.")
@@ -327,9 +327,9 @@ async def update_payment_with_txhash(conn, payment_id: str, tx_hash: str) -> Opt
             UPDATE payments
             SET tx_hash = $1,
                 status = 'completed',
-                payment_date = NOW()  -- ✅ تحديث payment_date بدلاً من updated_date
-            WHERE payment_id = $2 -- ✅ المطابقة الآن بـ payment_id وليس payment_custom_id
-            RETURNING telegram_id, subscription_type_id, username, full_name;
+                payment_date = NOW()
+            WHERE payment_id = $2
+            RETURNING telegram_id, subscription_type_id, username, full_name, user_wallet_address, order_id; -- ✅ إرجاع user_wallet_address و order_id
             """,
             tx_hash, payment_id
         )
@@ -353,11 +353,11 @@ async def fetch_pending_payment_by_wallet(conn, user_wallet_address: str) -> Opt
     try:
         row = await conn.fetchrow(
             """
-            SELECT payment_id, telegram_id, subscription_type_id, username, full_name
+            SELECT payment_id, telegram_id, subscription_type_id, username, full_name, user_wallet_address, order_id -- ✅ جلب order_id
             FROM payments
             WHERE user_wallet_address = $1 AND status = 'pending'
             ORDER BY payment_date ASC
-            LIMIT 1; -- جلب أقدم طلب معلق في حالة وجود عدة طلبات معلقة لنفس المحفظة
+            LIMIT 1;
             """,
             user_wallet_address
         )
@@ -365,7 +365,7 @@ async def fetch_pending_payment_by_wallet(conn, user_wallet_address: str) -> Opt
             logging.info(f"✅ تم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address}")
             return dict(row)
         else:
-            logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address}") # تم تغيير الخطأ إلى تحذير
+            logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address}")
             return None
     except Exception as e:
         logging.error(f"❌ فشل في جلب سجل الدفع المعلق: {e}", exc_info=True)
