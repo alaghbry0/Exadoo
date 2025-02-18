@@ -36,9 +36,9 @@ app = Quart(__name__)
 app.aiohttp_session = None
 
 # 🔹 ضبط CORS للسماح بمصادر محددة فقط
-#ALLOWED_ORIGINS = ["https://exadooo-git-main-mohammeds-projects-3d2877c6.vercel.app", "https://exadoo.onrender.com", "https://telegram.org, http://localhost:5000"]
-#app = cors(app, allow_origin=ALLOWED_ORIGINS)
-cors(app, allow_origin=["*"])
+ALLOWED_ORIGINS = ["https://exadooo-git-main-mohammeds-projects-3d2877c6.vercel.app", "https://exadoo.onrender.com", "https://telegram.org, http://localhost:5000"]
+app = cors(app, allow_origin=ALLOWED_ORIGINS)
+
 
 # 🔹 تسجيل نقاط API
 app.register_blueprint(subscriptions_bp)
