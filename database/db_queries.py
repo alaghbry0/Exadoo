@@ -344,28 +344,26 @@ async def update_payment_with_txhash(conn, payment_id: str, tx_hash: str) -> Opt
         return None
 
 
-async def fetch_pending_payment_by_wallet(conn, user_wallet_address: str) -> Optional[dict]:
+async def fetch_pending_payment_by_orderid(conn, order_id: str) -> Optional[dict]:
     """
-    تقوم هذه الدالة بجلب سجل دفع معلق من قاعدة البيانات بناءً على عنوان محفظة المستخدم.
-    تستخدم اتصال قاعدة البيانات المُمرر `conn` لتنفيذ العملية.
-    تُعيد السجل المعلق كقاموس، أو None إذا لم يتم العثور على سجل معلق لعنوان المحفظة المحدد.
+    تقوم هذه الدالة بجلب سجل دفع معلق من قاعدة البيانات بناءً على orderId فقط.
+    يتم تطبيع (trim) للـ orderId لتفادي اختلافات التنسيق.
     """
     try:
-        row = await conn.fetchrow(
-            """
-            SELECT payment_id, telegram_id, subscription_type_id, username, full_name, user_wallet_address, order_id -- ✅ جلب order_id
+        sql = """
+            SELECT payment_id, telegram_id, subscription_type_id, username, full_name, user_wallet_address, order_id, amount
             FROM payments
-            WHERE user_wallet_address = $1 AND status = 'pending'
+            WHERE TRIM(order_id) = TRIM($1)
+              AND status = 'pending'
             ORDER BY payment_date ASC
             LIMIT 1;
-            """,
-            user_wallet_address
-        )
+        """
+        row = await conn.fetchrow(sql, order_id)
         if row:
-            logging.info(f"✅ تم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address}")
+            logging.info(f"✅ تم العثور على سجل دفع معلق لـ orderId: {order_id}")
             return dict(row)
         else:
-            logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لعنوان المحفظة: {user_wallet_address}")
+            logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لـ orderId: {order_id}")
             return None
     except Exception as e:
         logging.error(f"❌ فشل في جلب سجل الدفع المعلق: {e}", exc_info=True)
