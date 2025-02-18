@@ -213,9 +213,12 @@ async def periodic_check_payments():
             logging.error(f"❌ خطأ في الفحص الدوري للمعاملات: {str(e)}", exc_info=True)
         finally:
             if provider:
-                await provider.close_all()
+                try:
+                    await provider.close_all()
+                except AttributeError as e:
+                    logging.warning(f"⚠️ أثناء إغلاق provider: {e}")
         logging.info("✅ انتهاء دورة parse_transactions الدورية. سيتم إعادة التشغيل بعد 60 ثانية.")
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
 
 @payment_confirmation_bp.before_app_serving
 async def startup():
