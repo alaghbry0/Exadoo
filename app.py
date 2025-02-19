@@ -12,6 +12,7 @@ from config import DATABASE_CONFIG
 from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
+from routes.admin_routes import admin_routes
 from routes.payment_confirmation import payment_confirmation_bp
 #from routes.webhook import payments_bp
 #from routes.webhook import webhook_bp
@@ -41,6 +42,7 @@ app = cors(app, allow_origin=ALLOWED_ORIGINS)
 
 
 # 🔹 تسجيل نقاط API
+app.register_blueprint(admin_routes)
 app.register_blueprint(subscriptions_bp)
 app.register_blueprint(user_bp)
 app.register_blueprint(shop)

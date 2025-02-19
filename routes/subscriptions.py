@@ -1,6 +1,5 @@
 import logging
 import pytz
-
 import os
 from quart import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta, timezone
@@ -17,6 +16,7 @@ IS_DEVELOPMENT = True  # يمكن تغييره بناءً على بيئة الت
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # تحميل مفتاح Webhook من المتغيرات البيئية
 
+
 @subscriptions_bp.route("/api/subscribe", methods=["POST"])
 async def subscribe():
     """
@@ -32,25 +32,28 @@ async def subscribe():
 
         # ✅ استقبال البيانات
         data = await request.get_json()
-        logging.info(
-            f"📥 بيانات الطلب المستلمة في /api/subscribe: {json.dumps(data, indent=2)}")  # ✅ تسجيل البيانات المستلمة
+        logging.info(f"📥 بيانات الطلب المستلمة في /api/subscribe: {json.dumps(data, indent=2)}")
+
         telegram_id = data.get("telegram_id")
-        subscription_type_id = data.get("subscription_type_id")
+        # استقبل الآن subscription_plan_id بدلاً من subscription_type_id
+        subscription_plan_id = data.get("subscription_plan_id")
         payment_id = data.get("payment_id")
         username = data.get("username", None)
         full_name = data.get("full_name", None)
 
-        logging.info(f"📥 Received subscription request: telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={payment_id}")
+        logging.info(
+            f"📥 Received subscription request: telegram_id={telegram_id}, subscription_plan_id={subscription_plan_id}, payment_id={payment_id}"
+        )
 
         # ✅ التحقق من صحة البيانات
-        if not isinstance(telegram_id, int) or not isinstance(subscription_type_id, int) or not isinstance(payment_id,
+        if not isinstance(telegram_id, int) or not isinstance(subscription_plan_id, int) or not isinstance(payment_id,
                                                                                                            str):
             logging.error(
-                f"❌ Invalid data format: telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={payment_id}")
+                f"❌ Invalid data format: telegram_id={telegram_id}, subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
             return jsonify({"error": "Invalid data format"}), 400
 
         logging.info(
-            f"✅ استلام طلب اشتراك: telegram_id={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={payment_id}")
+            f"✅ استلام طلب اشتراك: telegram_id={telegram_id}, subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
 
         # ✅ التأكد من اتصال قاعدة البيانات
         db_pool = getattr(current_app, "db_pool", None)
@@ -60,18 +63,17 @@ async def subscribe():
 
         async with db_pool.acquire() as connection:
             # ✅ التحقق من `payment_id` لمنع التكرار
-            existing_payment = await connection.fetchrow("SELECT * FROM payments WHERE payment_id = $1", payment_id)
+            existing_payment = await connection.fetchrow(
+                "SELECT * FROM payments WHERE payment_id = $1", payment_id
+            )
 
-            # ✅ إذا كان الدفع موجودًا، نتحقق مما إذا كان الاشتراك بحاجة إلى تحديث
             if existing_payment:
                 logging.warning(f"⚠️ الدفع مسجل مسبقًا: {payment_id}")
-
                 # التحقق مما إذا كان الاشتراك لهذا المستخدم والخطة محدثًا أم لا
                 existing_subscription = await connection.fetchrow(
                     "SELECT * FROM subscriptions WHERE telegram_id = $1 AND subscription_type_id = $2 AND payment_id = $3",
-                    telegram_id, subscription_type_id, payment_id
+                    telegram_id, existing_payment.get("subscription_type_id"), payment_id
                 )
-
                 if existing_subscription:
                     logging.info(f"✅ الاشتراك محدث بالفعل لـ {telegram_id}, لا حاجة للتحديث.")
                     return jsonify({"message": "Subscription already updated"}), 200
@@ -84,26 +86,37 @@ async def subscribe():
                     logging.error(f"❌ Failed to add user {telegram_id}")
                     return jsonify({"error": "Failed to register user"}), 500
 
-            # ✅ جلب تفاصيل نوع الاشتراك
+            # ✅ جلب تفاصيل خطة الاشتراك من جدول subscription_plans
+            subscription_plan = await connection.fetchrow(
+                "SELECT id, subscription_type_id, name, duration_days FROM subscription_plans WHERE id = $1",
+                subscription_plan_id
+            )
+            if not subscription_plan:
+                logging.error(f"❌ Invalid subscription_plan_id: {subscription_plan_id}")
+                return jsonify({"error": "Invalid subscription plan."}), 400
+
+            # استخرج مدة الاشتراك من خطة الاشتراك
+            duration_days = subscription_plan["duration_days"]
+
+            # جلب subscription_type للحصول على channel_id باستخدام subscription_type_id من خطة الاشتراك
             subscription_type = await connection.fetchrow(
-                "SELECT id, name, channel_id, duration_days FROM subscription_types WHERE id = $1",
-                subscription_type_id
+                "SELECT id, name, channel_id FROM subscription_types WHERE id = $1",
+                subscription_plan["subscription_type_id"]
             )
             if not subscription_type:
-                logging.error(f"❌ Invalid subscription_type_id: {subscription_type_id}")
+                logging.error(f"❌ Invalid subscription type for plan {subscription_plan_id}")
                 return jsonify({"error": "Invalid subscription type."}), 400
 
             subscription_name = subscription_type["name"]
             channel_id = int(subscription_type["channel_id"])
 
-            # ✅ تحديد مدة الاشتراك بناءً على البيئة (اختبارية أو فعلية)
-            duration_days = 0 if IS_DEVELOPMENT else subscription_type["duration_days"]
+            # ✅ تحديد مدة الاشتراك بناءً على البيئة
             duration_minutes = 120 if IS_DEVELOPMENT else 0
 
             # ✅ الحصول على الوقت الحالي UTC
             current_time = datetime.now(timezone.utc)
 
-            # ✅ البحث عن اشتراك المستخدم
+            # ✅ البحث عن اشتراك المستخدم باستخدام channel_id
             subscription = await connection.fetchrow(
                 "SELECT * FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2",
                 telegram_id,
@@ -120,16 +133,16 @@ async def subscribe():
                     start_date = current_time
                     new_expiry = start_date + timedelta(minutes=duration_minutes, days=duration_days)
 
+                # استخدام subscription_type_id المستخرج من خطة الاشتراك
                 success = await update_subscription(
                     connection,
                     telegram_id,
                     channel_id,
-                    subscription_type_id,
+                    subscription_plan["subscription_type_id"],
                     new_expiry,
                     start_date,
                     True,
                     payment_id
-
                 )
                 if not success:
                     logging.error(f"❌ Failed to update subscription for {telegram_id}")
@@ -145,7 +158,7 @@ async def subscribe():
                     connection,
                     telegram_id,
                     channel_id,
-                    subscription_type_id,
+                    subscription_plan["subscription_type_id"],
                     start_date,
                     new_expiry,
                     True,
@@ -158,14 +171,14 @@ async def subscribe():
                 logging.info(f"✅ New subscription created for {telegram_id} until {new_expiry}")
 
             # ✅ إضافة المستخدم إلى القناة
-            user_added = await add_user_to_channel(telegram_id, subscription_type_id, db_pool)
+            user_added = await add_user_to_channel(telegram_id, subscription_plan["subscription_type_id"], db_pool)
             if not user_added:
                 logging.error(f"❌ Failed to add user {telegram_id} to channel {channel_id}")
 
             # ✅ جدولة التذكيرات
             reminders = [
                 ("first_reminder", new_expiry - timedelta(minutes=30 if IS_DEVELOPMENT else 1440)),  # 24 ساعة
-                ("second_reminder", new_expiry - timedelta(minutes=15 if IS_DEVELOPMENT else 60)),   # 1 ساعة
+                ("second_reminder", new_expiry - timedelta(minutes=15 if IS_DEVELOPMENT else 60)),  # 1 ساعة
                 ("remove_user", new_expiry),
             ]
 

@@ -218,7 +218,7 @@ async def periodic_check_payments():
                 except AttributeError as e:
                     logging.warning(f"⚠️ أثناء إغلاق provider: {e}")
         logging.info("✅ انتهاء دورة parse_transactions الدورية. سيتم إعادة التشغيل بعد 60 ثانية.")
-        await asyncio.sleep(30)
+        await asyncio.sleep(20)
 
 @payment_confirmation_bp.before_app_serving
 async def startup():
