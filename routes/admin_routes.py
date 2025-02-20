@@ -10,11 +10,7 @@ import json
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
-    return await asyncpg.create_pool(
-        **DATABASE_CONFIG,
-        command_timeout=60,  # تأكيد عدم انتهاء المهلة بسرعة
-        statement_cache_size=0  # تعطيل التخزين المؤقت للاستعلامات
-    )
+    return await asyncpg.create_pool(**DATABASE_CONFIG)
 # إنشاء Blueprint مع بادئة URL
 admin_routes = Blueprint("admin_routes", __name__, url_prefix="/api/admin")
 
