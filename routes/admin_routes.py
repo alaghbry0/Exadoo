@@ -4,7 +4,7 @@ import logging
 from quart import Blueprint, request, jsonify, current_app
 from config import DATABASE_CONFIG
 import json
-
+from datetime import datetime
 
 
 
@@ -321,4 +321,223 @@ async def get_subscription_plan(plan_id: int):
             return jsonify({"error": "Subscription plan not found"}), 404
     except Exception as e:
         logging.error("Error fetching subscription plan: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@admin_routes.route("/subscriptions", methods=["GET"])
+async def get_subscriptions():
+    if not is_admin():
+        return jsonify({"error": "Unauthorized"}), 403
+    try:
+        # الحصول على المتغيرات من استعلام URL
+        user_id     = request.args.get("user_id")
+        channel_id  = request.args.get("channel_id")
+        status      = request.args.get("status")  # متوقع: active أو inactive
+        start_date  = request.args.get("start_date")  # تنسيق (مثلاً: YYYY-MM-DD)
+        end_date    = request.args.get("end_date")
+        page        = int(request.args.get("page", 1))
+        page_size   = int(request.args.get("page_size", 20))
+        offset      = (page - 1) * page_size
+
+        query = "SELECT * FROM subscriptions WHERE 1=1"
+        params = []
+
+        if user_id:
+            query += f" AND user_id = ${len(params)+1}"
+            params.append(user_id)
+        if channel_id:
+            query += f" AND channel_id = ${len(params)+1}"
+            params.append(channel_id)
+        if status:
+            if status.lower() == "active":
+                query += " AND is_active = true"
+            elif status.lower() == "inactive":
+                query += " AND is_active = false"
+        if start_date:
+            query += f" AND expiry_date >= ${len(params)+1}"
+            params.append(start_date)
+        if end_date:
+            query += f" AND expiry_date <= ${len(params)+1}"
+            params.append(end_date)
+        # إضافة ترتيب وتجزئة النتائج
+        query += f" ORDER BY expiry_date DESC LIMIT ${len(params)+1} OFFSET ${len(params)+2}"
+        params.append(page_size)
+        params.append(offset)
+
+        async with current_app.db_pool.acquire() as connection:
+            rows = await connection.fetch(query, *params)
+
+        return jsonify([dict(row) for row in rows])
+    except Exception as e:
+        logging.error("Error fetching subscriptions: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+# =====================================
+# 2. API لجلب بيانات الدفعات مع دعم الفلاتر والتجزئة والتقارير المالية
+# =====================================
+@admin_routes.route("/payments", methods=["GET"])
+async def get_payments():
+    if not is_admin():
+        return jsonify({"error": "Unauthorized"}), 403
+    try:
+        status     = request.args.get("status")
+        user_id    = request.args.get("user_id")
+        start_date = request.args.get("start_date")
+        end_date   = request.args.get("end_date")
+        page       = int(request.args.get("page", 1))
+        page_size  = int(request.args.get("page_size", 20))
+        offset     = (page - 1) * page_size
+
+        query = "SELECT * FROM payments WHERE 1=1"
+        params = []
+
+        if status:
+            query += f" AND status = ${len(params)+1}"
+            params.append(status)
+        if user_id:
+            query += f" AND user_id = ${len(params)+1}"
+            params.append(user_id)
+        if start_date:
+            query += f" AND payment_date >= ${len(params)+1}"
+            params.append(start_date)
+        if end_date:
+            query += f" AND payment_date <= ${len(params)+1}"
+            params.append(end_date)
+
+        query += f" ORDER BY payment_date DESC LIMIT ${len(params)+1} OFFSET ${len(params)+2}"
+        params.append(page_size)
+        params.append(offset)
+
+        async with current_app.db_pool.acquire() as connection:
+            rows = await connection.fetch(query, *params)
+
+        # تقارير مالية: إذا طلب الأدمن إجمالي الإيرادات عبر استخدام معامل report=total_revenue
+        total_revenue = 0
+        if request.args.get("report") == "total_revenue":
+            rev_query = "SELECT SUM(amount) as total FROM payments WHERE 1=1"
+            rev_params = []
+            if status:
+                rev_query += f" AND status = ${len(rev_params)+1}"
+                rev_params.append(status)
+            if user_id:
+                rev_query += f" AND user_id = ${len(rev_params)+1}"
+                rev_params.append(user_id)
+            if start_date:
+                rev_query += f" AND payment_date >= ${len(rev_params)+1}"
+                rev_params.append(start_date)
+            if end_date:
+                rev_query += f" AND payment_date <= ${len(rev_params)+1}"
+                rev_params.append(end_date)
+            async with current_app.db_pool.acquire() as connection:
+                rev_row = await connection.fetchrow(rev_query, *rev_params)
+            total_revenue = rev_row["total"] if rev_row["total"] is not None else 0
+
+        response = {
+            "data": [dict(row) for row in rows],
+            "total_revenue": total_revenue
+        }
+        return jsonify(response)
+    except Exception as e:
+        logging.error("Error fetching payments: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+# =====================================
+# 3. API لتعديل اشتراك مستخدم
+# =====================================
+@admin_routes.route("/subscriptions/<int:subscription_id>", methods=["PUT"])
+async def update_subscription(subscription_id):
+    if not is_admin():
+        return jsonify({"error": "Unauthorized"}), 403
+    try:
+        data = await request.get_json()
+        # الحقول الممكن تحديثها: expiry_date, is_active, subscription_plan_id، ويمكن إضافة حقول أخرى حسب الحاجة
+        expiry_date          = data.get("expiry_date")
+        is_active            = data.get("is_active")
+        subscription_plan_id = data.get("subscription_plan_id")
+        source               = data.get("source")  # مثال على مصدر الاشتراك: تلقائي أو يدوي
+
+        if expiry_date is None and is_active is None and subscription_plan_id is None and source is None:
+            return jsonify({"error": "No fields provided for update"}), 400
+
+        update_fields = []
+        params = []
+        idx = 1
+
+        if expiry_date:
+            update_fields.append(f"expiry_date = ${idx}")
+            params.append(expiry_date)
+            idx += 1
+        if is_active is not None:
+            update_fields.append(f"is_active = ${idx}")
+            params.append(is_active)
+            idx += 1
+        if subscription_plan_id:
+            update_fields.append(f"subscription_plan_id = ${idx}")
+            params.append(subscription_plan_id)
+            idx += 1
+        if source:
+            update_fields.append(f"source = ${idx}")
+            params.append(source)
+            idx += 1
+
+        # تحديث حقل updated_at تلقائياً
+        update_fields.append("updated_at = now()")
+
+        query = f"UPDATE subscriptions SET {', '.join(update_fields)} WHERE id = ${idx} RETURNING *;"
+        params.append(subscription_id)
+
+        async with current_app.db_pool.acquire() as connection:
+            row = await connection.fetchrow(query, *params)
+        if not row:
+            return jsonify({"error": "Subscription not found"}), 404
+        return jsonify(dict(row))
+    except Exception as e:
+        logging.error("Error updating subscription: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+# =====================================
+# 4. API لإضافة اشتراك جديد
+# =====================================
+@admin_routes.route("/subscriptions", methods=["POST"])
+async def add_subscription():
+    if not is_admin():
+        return jsonify({"error": "Unauthorized"}), 403
+    try:
+        data = await request.get_json()
+        # الحقول المطلوبة: channel_id, telegram_id, expiry_date, subscription_type_id, subscription_plan_id
+        channel_id           = data.get("channel_id")
+        telegram_id          = data.get("telegram_id")
+        expiry_date          = data.get("expiry_date")
+        subscription_type_id = data.get("subscription_type_id")
+        subscription_plan_id = data.get("subscription_plan_id")
+        user_id              = data.get("user_id")
+        payment_id           = data.get("payment_id", None)  # إن وُجدت الدفعة المرتبطة
+        is_active            = data.get("is_active", True)
+        source               = data.get("source", "manual")  # مثلاً: يدوي أو تلقائي
+
+        if not all([channel_id, telegram_id, expiry_date, subscription_type_id, subscription_plan_id]):
+            return jsonify({"error": "Missing required fields"}), 400
+
+        query = """
+            INSERT INTO subscriptions 
+            (user_id, expiry_date, is_active, channel_id, subscription_type_id, telegram_id, subscription_plan_id, payment_id, source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING *;
+        """
+        async with current_app.db_pool.acquire() as connection:
+            row = await connection.fetchrow(
+                query,
+                user_id,
+                expiry_date,
+                is_active,
+                channel_id,
+                subscription_type_id,
+                telegram_id,
+                subscription_plan_id,
+                payment_id,
+                source
+            )
+        return jsonify(dict(row)), 201
+    except Exception as e:
+        logging.error("Error adding subscription: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
