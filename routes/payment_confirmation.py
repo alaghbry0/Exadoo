@@ -257,14 +257,7 @@ async def confirm_payment():
         )
 
         try:
-            plan_id = int(plan_id_str)
-            if plan_id == 1:
-                subscription_plan_id = 1  # Basic plan
-            elif plan_id == 2:
-                subscription_plan_id = 2  # Premium plan
-            else:
-                subscription_plan_id = 1
-                logging.warning(f"⚠️ planId غير صالح: {plan_id_str}. تم استخدام الخطة الأساسية افتراضيًا.")
+            subscription_plan_id = int(plan_id_str)
         except ValueError:
             subscription_plan_id = 1
             logging.warning(f"⚠️ planId ليس عددًا صحيحًا: {plan_id_str}. تم استخدام الخطة الأساسية افتراضيًا.")
