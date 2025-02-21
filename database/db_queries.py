@@ -294,15 +294,15 @@ async def get_user_subscriptions(connection, telegram_id: int):
 
 
 # db_queries.py - record_payment function signature
-async def record_payment(conn, telegram_id, user_wallet_address, amount, subscription_type_id, username=None, full_name=None, order_id=None): # ✅ إضافة order_id كمعامل
+async def record_payment(conn, telegram_id, user_wallet_address, amount, subscription_plan_id, username=None, full_name=None, order_id=None): # ✅ إضافة order_id كمعامل
     """تسجيل بيانات الدفع والمستخدم في قاعدة البيانات كدفعة معلقة."""
     try:
         sql = """
-            INSERT INTO payments (user_id, subscription_type_id, amount, payment_date, telegram_id, username, full_name, user_wallet_address, status, order_id) -- ✅ إضافة عمود order_id
+            INSERT INTO payments (user_id, subscription_plan_id, amount, payment_date, telegram_id, username, full_name, user_wallet_address, status, order_id) -- ✅ إضافة عمود order_id
             VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, 'pending', $8) -- ✅ إضافة $8 (order_id) إلى قائمة القيم
             RETURNING payment_id, payment_date;
         """
-        result = await conn.fetchrow(sql, telegram_id, subscription_type_id, amount, telegram_id, username, full_name, user_wallet_address, order_id) # ✅ تمرير order_id إلى الاستعلام
+        result = await conn.fetchrow(sql, telegram_id, subscription_plan_id, amount, telegram_id, username, full_name, user_wallet_address, order_id) # ✅ تمرير order_id إلى الاستعلام
         if result:
             payment_id, payment_date = result['payment_id'], result['payment_date']
             logging.info(f"✅ تم تسجيل دفعة معلقة جديدة بنجاح في قاعدة البيانات. معرف الدفع: {payment_id}, تاريخ الدفع: {payment_date}, order_id: {order_id}") # ✅ تسجيل order_id في السجل
@@ -329,7 +329,7 @@ async def update_payment_with_txhash(conn, payment_id: str, tx_hash: str) -> Opt
                 status = 'completed',
                 payment_date = NOW()
             WHERE payment_id = $2
-            RETURNING telegram_id, subscription_type_id, username, full_name, user_wallet_address, order_id; -- ✅ إرجاع user_wallet_address و order_id
+            RETURNING telegram_id, subscription_plan_id, username, full_name, user_wallet_address, order_id; -- ✅ إرجاع user_wallet_address و order_id
             """,
             tx_hash, payment_id
         )
@@ -351,7 +351,7 @@ async def fetch_pending_payment_by_orderid(conn, order_id: str) -> Optional[dict
     """
     try:
         sql = """
-            SELECT payment_id, telegram_id, subscription_type_id, username, full_name, user_wallet_address, order_id, amount
+            SELECT payment_id, telegram_id, subscription_plan_id, username, full_name, user_wallet_address, order_id, amount
             FROM payments
             WHERE TRIM(order_id) = TRIM($1)
               AND status = 'pending'
