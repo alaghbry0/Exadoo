@@ -84,7 +84,7 @@ async def send_payment_to_subscribe_api(telegram_id: int, plan_id: int, payment_
 
     payload = {
         "telegram_id": telegram_id,
-        "subscription_type_id": plan_id,
+        "subscription_plan_id": plan_id,
         "payment_id": payment_id
     }
 

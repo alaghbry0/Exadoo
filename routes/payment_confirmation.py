@@ -176,7 +176,7 @@ async def parse_transactions(provider: LiteBalancer):
                         }
                         subscription_payload = {
                             "telegram_id": pending_payment['telegram_id'],
-                            "subscription_type_id": pending_payment['subscription_type_id'],
+                            "subscription_plan_id": pending_payment['subscription_plan_id'],
                             "payment_id": tx_hash,  # استخدام tx_hash كـ payment_id
                             "username": pending_payment['username'],
                             "full_name": pending_payment['full_name'],
@@ -259,14 +259,14 @@ async def confirm_payment():
         try:
             plan_id = int(plan_id_str)
             if plan_id == 1:
-                subscription_type_id = 1  # Basic plan
+                subscription_plan_id = 1  # Basic plan
             elif plan_id == 2:
-                subscription_type_id = 2  # Premium plan
+                subscription_plan_id = 2  # Premium plan
             else:
-                subscription_type_id = 1
+                subscription_plan_id = 1
                 logging.warning(f"⚠️ planId غير صالح: {plan_id_str}. تم استخدام الخطة الأساسية افتراضيًا.")
         except ValueError:
-            subscription_type_id = 1
+            subscription_plan_id = 1
             logging.warning(f"⚠️ planId ليس عددًا صحيحًا: {plan_id_str}. تم استخدام الخطة الأساسية افتراضيًا.")
 
         try:
@@ -282,7 +282,7 @@ async def confirm_payment():
                 telegram_id,
                 user_wallet_address,
                 amount,
-                subscription_type_id,
+                subscription_plan_id,
                 username=telegram_username,
                 full_name=full_name,
                 order_id=order_id
@@ -294,7 +294,7 @@ async def confirm_payment():
             logging.info(f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_id={payment_id_db}, orderId={order_id}")
             logging.info(
                 f"💾 تم تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, orderId={order_id}, "
-                f"planId={plan_id_str}, telegramId={telegram_id}, subscription_type_id={subscription_type_id}, payment_id={payment_id_db}, "
+                f"planId={plan_id_str}, telegramId={telegram_id}, subscription_plan_id={subscription_plan_id}, payment_id={payment_id_db}, "
                 f"username={telegram_username}, full_name={full_name}, amount={amount}"
             )
             return jsonify({"message": "Payment confirmation recorded successfully. Waiting for payment processing."}), 200
