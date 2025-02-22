@@ -468,7 +468,7 @@ async def update_subscription(subscription_id):
         data = await request.get_json()
         expiry_date          = data.get("expiry_date")
         subscription_plan_id = data.get("subscription_plan_id")
-        source               = data.get("source")  # مثال على مصدر الاشتراك: تلقائي أو يدوي
+        source               = data.get("source")  # مثال: تلقائي أو يدوي
 
         if expiry_date is None and subscription_plan_id is None and source is None:
             return jsonify({"error": "No fields provided for update"}), 400
@@ -490,10 +490,15 @@ async def update_subscription(subscription_id):
             params.append(source)
             idx += 1
 
-        # إعادة حساب is_active بناءً على expiry_date إذا تم تحديثه
+        # إعادة حساب is_active بناءً على expiry_date باستخدام timezone-aware objects
         if expiry_date:
             from datetime import datetime
-            is_active = datetime.fromisoformat(expiry_date.replace("Z", "")) > datetime.utcnow()
+            import pytz
+            local_tz = pytz.timezone("Asia/Riyadh")
+            # تحويل expiry_date (يأتي بصيغة ISO مع حرف Z) إلى كائن datetime مزود بمنطقة زمنية UTC، ثم تحويله إلى التوقيت المحلي
+            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(LOCAL_TZ)
+            now_local = datetime.now(local_tz)
+            is_active = dt_expiry > now_local
             update_fields.append(f"is_active = ${idx}")
             params.append(is_active)
             idx += 1
@@ -521,11 +526,11 @@ async def add_subscription():
     try:
         data = await request.get_json()
         # البيانات الأساسية من الـ Modal
-        telegram_id = data.get("telegram_id")
-        expiry_date = data.get("expiry_date")
+        telegram_id          = data.get("telegram_id")
+        expiry_date          = data.get("expiry_date")
         subscription_type_id = data.get("subscription_type_id")
-        full_name = data.get("full_name")
-        username = data.get("username")
+        full_name            = data.get("full_name")
+        username             = data.get("username")
 
         # التحقق من وجود الحقول الأساسية
         if not all([telegram_id, expiry_date, subscription_type_id, full_name, username]):
@@ -556,13 +561,16 @@ async def add_subscription():
                 )
                 user_id = user_insert["id"]
 
-            # تعيين subscription_plan_id افتراضيًا إذا لم يُرسل
+            # تعيين subscription_plan_id افتراضيًا إذا لم يُرسل (مثلاً قيمة 1)
             subscription_plan_id = data.get("subscription_plan_id") or 1
 
-            # ضبط الحقل is_active تلقائيًا بناءً على expiry_date (يمكن حسابه من وقت الطلب)
-            # إذا كان expiry_date في المستقبل => active، وإلا inactive
+            # ضبط الحقل is_active تلقائيًا بناءً على expiry_date باستخدام timezone-aware objects
             from datetime import datetime
-            is_active = datetime.fromisoformat(expiry_date.replace("Z", "")) > datetime.utcnow()
+            import pytz
+            local_tz = pytz.timezone("Asia/Riyadh")
+            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(LOCAL_TZ)
+            now_local = datetime.now(local_tz)
+            is_active = dt_expiry > now_local
 
             # تعيين source افتراضيًا
             source = data.get("source") or "manual"
