@@ -466,13 +466,11 @@ async def update_subscription(subscription_id):
         return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
-        # الحقول الممكن تحديثها: expiry_date, is_active, subscription_plan_id، ويمكن إضافة حقول أخرى حسب الحاجة
         expiry_date          = data.get("expiry_date")
-        is_active            = data.get("is_active")
         subscription_plan_id = data.get("subscription_plan_id")
         source               = data.get("source")  # مثال على مصدر الاشتراك: تلقائي أو يدوي
 
-        if expiry_date is None and is_active is None and subscription_plan_id is None and source is None:
+        if expiry_date is None and subscription_plan_id is None and source is None:
             return jsonify({"error": "No fields provided for update"}), 400
 
         update_fields = []
@@ -483,10 +481,6 @@ async def update_subscription(subscription_id):
             update_fields.append(f"expiry_date = ${idx}")
             params.append(expiry_date)
             idx += 1
-        if is_active is not None:
-            update_fields.append(f"is_active = ${idx}")
-            params.append(is_active)
-            idx += 1
         if subscription_plan_id:
             update_fields.append(f"subscription_plan_id = ${idx}")
             params.append(subscription_plan_id)
@@ -496,9 +490,15 @@ async def update_subscription(subscription_id):
             params.append(source)
             idx += 1
 
-        # تحديث حقل updated_at تلقائياً
-        update_fields.append("updated_at = now()")
+        # إعادة حساب is_active بناءً على expiry_date إذا تم تحديثه
+        if expiry_date:
+            from datetime import datetime
+            is_active = datetime.fromisoformat(expiry_date.replace("Z", "")) > datetime.utcnow()
+            update_fields.append(f"is_active = ${idx}")
+            params.append(is_active)
+            idx += 1
 
+        update_fields.append("updated_at = now()")
         query = f"UPDATE subscriptions SET {', '.join(update_fields)} WHERE id = ${idx} RETURNING *;"
         params.append(subscription_id)
 
@@ -520,27 +520,62 @@ async def add_subscription():
         return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
-        # الحقول المطلوبة: channel_id, telegram_id, expiry_date, subscription_type_id, subscription_plan_id
-        channel_id           = data.get("channel_id")
-        telegram_id          = data.get("telegram_id")
-        expiry_date          = data.get("expiry_date")
+        # البيانات الأساسية من الـ Modal
+        telegram_id = data.get("telegram_id")
+        expiry_date = data.get("expiry_date")
         subscription_type_id = data.get("subscription_type_id")
-        subscription_plan_id = data.get("subscription_plan_id")
-        user_id              = data.get("user_id")
-        payment_id           = data.get("payment_id", None)  # إن وُجدت الدفعة المرتبطة
-        is_active            = data.get("is_active", True)
-        source               = data.get("source", "manual")  # مثلاً: يدوي أو تلقائي
+        full_name = data.get("full_name")
+        username = data.get("username")
 
-        if not all([channel_id, telegram_id, expiry_date, subscription_type_id, subscription_plan_id]):
+        # التحقق من وجود الحقول الأساسية
+        if not all([telegram_id, expiry_date, subscription_type_id, full_name, username]):
             return jsonify({"error": "Missing required fields"}), 400
 
-        query = """
-            INSERT INTO subscriptions 
-            (user_id, expiry_date, is_active, channel_id, subscription_type_id, telegram_id, subscription_plan_id, payment_id, source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING *;
-        """
         async with current_app.db_pool.acquire() as connection:
+            # استنتاج channel_id من subscription_type_id
+            channel_row = await connection.fetchrow(
+                "SELECT channel_id FROM subscription_types WHERE id = $1",
+                subscription_type_id
+            )
+            if not channel_row:
+                return jsonify({"error": "Invalid subscription_type_id"}), 400
+            channel_id = channel_row["channel_id"]
+
+            # التعامل مع user_id: البحث عن المستخدم باستخدام telegram_id
+            user_row = await connection.fetchrow(
+                "SELECT id FROM users WHERE telegram_id = $1",
+                telegram_id
+            )
+            if user_row:
+                user_id = user_row["id"]
+            else:
+                # إنشاء سجل مستخدم جديد إذا لم يكن موجوداً
+                user_insert = await connection.fetchrow(
+                    "INSERT INTO users (telegram_id, username, full_name) VALUES ($1, $2, $3) RETURNING id",
+                    telegram_id, username, full_name
+                )
+                user_id = user_insert["id"]
+
+            # تعيين subscription_plan_id افتراضيًا إذا لم يُرسل
+            subscription_plan_id = data.get("subscription_plan_id") or 1
+
+            # ضبط الحقل is_active تلقائيًا بناءً على expiry_date (يمكن حسابه من وقت الطلب)
+            # إذا كان expiry_date في المستقبل => active، وإلا inactive
+            from datetime import datetime
+            is_active = datetime.fromisoformat(expiry_date.replace("Z", "")) > datetime.utcnow()
+
+            # تعيين source افتراضيًا
+            source = data.get("source") or "manual"
+
+            # payment_id يمكن أن تبقى None إذا لم تُرسل
+            payment_id = data.get("payment_id")
+
+            query = """
+                INSERT INTO subscriptions 
+                (user_id, expiry_date, is_active, channel_id, subscription_type_id, telegram_id, subscription_plan_id, payment_id, source)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING *;
+            """
             row = await connection.fetchrow(
                 query,
                 user_id,
