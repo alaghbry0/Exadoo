@@ -5,6 +5,7 @@ from quart import Blueprint, request, jsonify, current_app
 from config import DATABASE_CONFIG
 import json
 from datetime import datetime
+import pytz
 
 
 
@@ -481,8 +482,8 @@ async def update_subscription(subscription_id):
         local_tz = pytz.timezone("Asia/Riyadh")
 
         if expiry_date:
-            # تحويل expiry_date إلى datetime timezone-aware
-            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(LOCAL_TZ)
+            # تحويل expiry_date إلى datetime timezone-aware باستخدام local_tz
+            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(local_tz)
             update_fields.append(f"expiry_date = ${idx}")
             params.append(dt_expiry)
             idx += 1
@@ -546,7 +547,7 @@ async def add_subscription():
         from datetime import datetime
         import pytz
         local_tz = pytz.timezone("Asia/Riyadh")
-        # تحويل expiry_date إلى datetime timezone-aware
+        # تحويل expiry_date إلى datetime timezone-aware باستخدام local_tz
         dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(local_tz)
 
         async with current_app.db_pool.acquire() as connection:
@@ -578,7 +579,7 @@ async def add_subscription():
             subscription_plan_id = data.get("subscription_plan_id") or 1
 
             # ضبط is_active بناءً على expiry_date
-            is_active = dt_expiry > datetime.now(LOCAL_TZ)
+            is_active = dt_expiry > datetime.now(local_tz)
 
             # تعيين source افتراضيًا
             source = data.get("source") or "manual"
