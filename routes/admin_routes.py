@@ -478,7 +478,7 @@ async def update_subscription(subscription_id):
         idx = 1
         from datetime import datetime
         import pytz
-        LOCAL_TZ = pytz.timezone("Asia/Riyadh")
+        local_tz = pytz.timezone("Asia/Riyadh")
 
         if expiry_date:
             # تحويل expiry_date إلى datetime timezone-aware
@@ -488,7 +488,7 @@ async def update_subscription(subscription_id):
             idx += 1
 
             # إعادة حساب is_active بناءً على expiry_date
-            is_active = dt_expiry > datetime.now(LOCAL_TZ)
+            is_active = dt_expiry > datetime.now(local_tz)
             update_fields.append(f"is_active = ${idx}")
             params.append(is_active)
             idx += 1
@@ -545,9 +545,9 @@ async def add_subscription():
 
         from datetime import datetime
         import pytz
-        LOCAL_TZ = pytz.timezone("Asia/Riyadh")
+        local_tz = pytz.timezone("Asia/Riyadh")
         # تحويل expiry_date إلى datetime timezone-aware
-        dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(LOCAL_TZ)
+        dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(local_tz)
 
         async with current_app.db_pool.acquire() as connection:
             # استنتاج channel_id من subscription_type_id
