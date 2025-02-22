@@ -331,14 +331,14 @@ async def get_subscriptions():
         return jsonify({"error": "Unauthorized"}), 403
     try:
         # الحصول على المتغيرات من استعلام URL
-        user_id     = request.args.get("user_id")
-        channel_id  = request.args.get("channel_id")
-        status      = request.args.get("status")  # متوقع: active أو inactive
-        start_date  = request.args.get("start_date")  # تنسيق (مثلاً: YYYY-MM-DD)
-        end_date    = request.args.get("end_date")
-        page        = int(request.args.get("page", 1))
-        page_size   = int(request.args.get("page_size", 20))
-        offset      = (page - 1) * page_size
+        user_id = request.args.get("user_id")
+        channel_id = request.args.get("channel_id")
+        status = request.args.get("status")  # متوقع: active أو inactive
+        start_date = request.args.get("start_date")  # مثلاً: "2025-02-23"
+        end_date = request.args.get("end_date")
+        page = int(request.args.get("page", 1))
+        page_size = int(request.args.get("page_size", 20))
+        offset = (page - 1) * page_size
 
         # استعلام SQL للحصول على الاشتراكات مع بيانات المستخدم والخطط والأنواع
         query = """
@@ -356,7 +356,6 @@ async def get_subscriptions():
         """
         params = []
 
-        # إضافة شروط التصفية إذا توفرت
         if user_id:
             query += f" AND s.user_id = ${len(params)+1}"
             params.append(user_id)
@@ -369,13 +368,14 @@ async def get_subscriptions():
             elif status.lower() == "inactive":
                 query += " AND s.is_active = false"
         if start_date:
-            query += f" AND s.expiry_date >= ${len(params)+1}"
+            # تحويل start_date إلى timestamptz باستخدام cast في SQL
+            query += f" AND s.expiry_date >= ${len(params)+1}::timestamptz"
             params.append(start_date)
         if end_date:
-            query += f" AND s.expiry_date <= ${len(params)+1}"
+            query += f" AND s.expiry_date <= ${len(params)+1}::timestamptz"
             params.append(end_date)
 
-        # إضافة الترتيب والتجزئة
+        # إضافة ترتيب وتجزئة
         query += f" ORDER BY s.expiry_date DESC LIMIT ${len(params)+1} OFFSET ${len(params)+2}"
         params.append(page_size)
         params.append(offset)
@@ -384,7 +384,6 @@ async def get_subscriptions():
             rows = await connection.fetch(query, *params)
 
         return jsonify([dict(row) for row in rows])
-
     except Exception as e:
         logging.error("Error fetching subscriptions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
