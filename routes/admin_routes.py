@@ -466,9 +466,9 @@ async def update_subscription(subscription_id):
         return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
-        expiry_date          = data.get("expiry_date")
+        expiry_date = data.get("expiry_date")
         subscription_plan_id = data.get("subscription_plan_id")
-        source               = data.get("source")  # مثال: تلقائي أو يدوي
+        source = data.get("source")  # مثال: "manual" أو "auto"
 
         if expiry_date is None and subscription_plan_id is None and source is None:
             return jsonify({"error": "No fields provided for update"}), 400
@@ -476,31 +476,31 @@ async def update_subscription(subscription_id):
         update_fields = []
         params = []
         idx = 1
+        from datetime import datetime
+        import pytz
+        LOCAL_TZ = pytz.timezone("Asia/Riyadh")
 
         if expiry_date:
+            # تحويل expiry_date إلى datetime timezone-aware
+            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(LOCAL_TZ)
             update_fields.append(f"expiry_date = ${idx}")
-            params.append(expiry_date)
+            params.append(dt_expiry)
             idx += 1
+
+            # إعادة حساب is_active بناءً على expiry_date
+            is_active = dt_expiry > datetime.now(LOCAL_TZ)
+            update_fields.append(f"is_active = ${idx}")
+            params.append(is_active)
+            idx += 1
+
         if subscription_plan_id:
             update_fields.append(f"subscription_plan_id = ${idx}")
             params.append(subscription_plan_id)
             idx += 1
+
         if source:
             update_fields.append(f"source = ${idx}")
             params.append(source)
-            idx += 1
-
-        # إعادة حساب is_active بناءً على expiry_date باستخدام timezone-aware objects
-        if expiry_date:
-            from datetime import datetime
-            import pytz
-            local_tz = pytz.timezone("Asia/Riyadh")
-            # تحويل expiry_date (يأتي بصيغة ISO مع حرف Z) إلى كائن datetime مزود بمنطقة زمنية UTC، ثم تحويله إلى التوقيت المحلي
-            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(LOCAL_TZ)
-            now_local = datetime.now(local_tz)
-            is_active = dt_expiry > now_local
-            update_fields.append(f"is_active = ${idx}")
-            params.append(is_active)
             idx += 1
 
         update_fields.append("updated_at = now()")
@@ -516,6 +516,7 @@ async def update_subscription(subscription_id):
         logging.error("Error updating subscription: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # =====================================
 # 4. API لإضافة اشتراك جديد
 # =====================================
@@ -525,16 +526,28 @@ async def add_subscription():
         return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
-        # البيانات الأساسية من الـ Modal
-        telegram_id          = data.get("telegram_id")
-        expiry_date          = data.get("expiry_date")
+        # استلام البيانات الأساسية من الـ Modal
+        telegram_id = data.get("telegram_id")
+        expiry_date = data.get("expiry_date")
         subscription_type_id = data.get("subscription_type_id")
-        full_name            = data.get("full_name")
-        username             = data.get("username")
+        full_name = data.get("full_name")
+        username = data.get("username")
 
         # التحقق من وجود الحقول الأساسية
         if not all([telegram_id, expiry_date, subscription_type_id, full_name, username]):
             return jsonify({"error": "Missing required fields"}), 400
+
+        # تحويل telegram_id إلى رقم (int)
+        try:
+            telegram_id = int(telegram_id)
+        except ValueError:
+            return jsonify({"error": "Invalid telegram_id format"}), 400
+
+        from datetime import datetime
+        import pytz
+        LOCAL_TZ = pytz.timezone("Asia/Riyadh")
+        # تحويل expiry_date إلى datetime timezone-aware
+        dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(LOCAL_TZ)
 
         async with current_app.db_pool.acquire() as connection:
             # استنتاج channel_id من subscription_type_id
@@ -561,21 +574,16 @@ async def add_subscription():
                 )
                 user_id = user_insert["id"]
 
-            # تعيين subscription_plan_id افتراضيًا إذا لم يُرسل (مثلاً قيمة 1)
+            # تعيين subscription_plan_id افتراضيًا إذا لم يُرسل
             subscription_plan_id = data.get("subscription_plan_id") or 1
 
-            # ضبط الحقل is_active تلقائيًا بناءً على expiry_date باستخدام timezone-aware objects
-            from datetime import datetime
-            import pytz
-            local_tz = pytz.timezone("Asia/Riyadh")
-            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(LOCAL_TZ)
-            now_local = datetime.now(local_tz)
-            is_active = dt_expiry > now_local
+            # ضبط is_active بناءً على expiry_date
+            is_active = dt_expiry > datetime.now(LOCAL_TZ)
 
             # تعيين source افتراضيًا
             source = data.get("source") or "manual"
 
-            # payment_id يمكن أن تبقى None إذا لم تُرسل
+            # payment_id يبقى None إذا لم يُرسل
             payment_id = data.get("payment_id")
 
             query = """
@@ -587,7 +595,7 @@ async def add_subscription():
             row = await connection.fetchrow(
                 query,
                 user_id,
-                expiry_date,
+                dt_expiry,
                 is_active,
                 channel_id,
                 subscription_type_id,
