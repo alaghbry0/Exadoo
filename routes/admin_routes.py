@@ -619,31 +619,25 @@ async def export_subscriptions():
     if not is_admin():
         return jsonify({"error": "Unauthorized"}), 403
     try:
-        # قراءة الفلاتر من استعلام URL
-        channel_id = request.args.get("channel_id")
         subscription_type_id = request.args.get("subscription_type_id")
         start_date = request.args.get("start_date")
         end_date = request.args.get("end_date")
+        active = request.args.get("active")  # يُتوقع "all" أو "true" أو "false"
 
-        # استعلام SQL لجلب كافة الاشتراكات مع البيانات الغنية
-        query = """
-            SELECT 
-                s.id,
-                s.user_id,
-                s.expiry_date,
-                s.is_active,
-                s.channel_id,
-                s.subscription_type_id,
-                s.telegram_id,
-                s.start_date,
-                s.payment_id,
-                s.subscription_plan_id,
-                s.source,
-                u.full_name,
-                u.username,
-                u.wallet_address,
-                sp.name AS subscription_plan_name,
-                st.name AS subscription_type_name
+        # استخدام مجموعة الحقول الافتراضية
+        allowed_fields = {
+            "full_name": "u.full_name",
+            "username": "u.username",
+            "telegram_id": "s.telegram_id",
+            "wallet_address": "u.wallet_address",
+            "expiry_date": "s.expiry_date",
+            "is_active": "s.is_active"
+        }
+        default_fields = ["full_name", "username", "telegram_id", "wallet_address", "expiry_date", "is_active"]
+        select_clause = ", ".join([allowed_fields[f] for f in default_fields])
+
+        query = f"""
+            SELECT {select_clause}
             FROM subscriptions s
             LEFT JOIN users u ON s.user_id = u.id
             LEFT JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
@@ -652,20 +646,21 @@ async def export_subscriptions():
         """
         params = []
 
-        if channel_id:
-            query += f" AND s.channel_id = ${len(params) + 1}"
-            params.append(channel_id)
         if subscription_type_id:
-            query += f" AND s.subscription_type_id = ${len(params) + 1}"
+            query += f" AND s.subscription_type_id = ${len(params)+1}"
             params.append(subscription_type_id)
         if start_date:
-            query += f" AND s.start_date >= ${len(params) + 1}"
+            query += f" AND s.start_date >= ${len(params)+1}"
             params.append(start_date)
         if end_date:
-            query += f" AND s.start_date <= ${len(params) + 1}"
+            query += f" AND s.start_date <= ${len(params)+1}"
             params.append(end_date)
+        if active and active.lower() != "all":
+            if active.lower() == "true":
+                query += " AND s.is_active = true"
+            elif active.lower() == "false":
+                query += " AND s.is_active = false"
 
-        # لا نضيف LIMIT و OFFSET لنرجع كافة السجلات المطابقة
         async with current_app.db_pool.acquire() as connection:
             rows = await connection.fetch(query, *params)
         data = [dict(row) for row in rows]
