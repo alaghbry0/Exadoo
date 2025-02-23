@@ -8,7 +8,6 @@ from datetime import datetime
 import pytz
 
 
-
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
     return await asyncpg.create_pool(**DATABASE_CONFIG)
@@ -647,6 +646,11 @@ async def export_subscriptions():
         params = []
 
         if subscription_type_id:
+            # تحويل subscription_type_id إلى int قبل الإضافة
+            try:
+                subscription_type_id = int(subscription_type_id)
+            except ValueError:
+                return jsonify({"error": "Invalid subscription_type_id format"}), 400
             query += f" AND s.subscription_type_id = ${len(params)+1}"
             params.append(subscription_type_id)
         if start_date:
