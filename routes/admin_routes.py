@@ -357,10 +357,10 @@ async def get_subscriptions():
         params = []
 
         if user_id:
-            query += f" AND s.user_id = ${len(params)+1}"
+            query += f" AND s.user_id = ${len(params) + 1}"
             params.append(user_id)
         if channel_id:
-            query += f" AND s.channel_id = ${len(params)+1}"
+            query += f" AND s.channel_id = ${len(params) + 1}"
             params.append(channel_id)
         if status:
             if status.lower() == "active":
@@ -368,25 +368,29 @@ async def get_subscriptions():
             elif status.lower() == "inactive":
                 query += " AND s.is_active = false"
         if start_date:
-            # تحويل start_date إلى timestamptz باستخدام cast في SQL
-            query += f" AND s.expiry_date >= ${len(params)+1}::timestamptz"
+            query += f" AND s.expiry_date >= ${len(params) + 1}::timestamptz"
             params.append(start_date)
         if end_date:
-            query += f" AND s.expiry_date <= ${len(params)+1}::timestamptz"
+            query += f" AND s.expiry_date <= ${len(params) + 1}::timestamptz"
             params.append(end_date)
 
         # إضافة ترتيب وتجزئة
-        query += f" ORDER BY s.expiry_date DESC LIMIT ${len(params)+1} OFFSET ${len(params)+2}"
+        query += f" ORDER BY s.expiry_date DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
         params.append(page_size)
         params.append(offset)
 
         async with current_app.db_pool.acquire() as connection:
+            # حل مشكلة InvalidCachedStatementError
+            await connection.execute("DEALLOCATE ALL")
+
             rows = await connection.fetch(query, *params)
 
         return jsonify([dict(row) for row in rows])
+
     except Exception as e:
         logging.error("Error fetching subscriptions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
 
 # =====================================
 # 2. API لجلب بيانات الدفعات مع دعم الفلاتر والتجزئة والتقارير المالية
@@ -607,4 +611,65 @@ async def add_subscription():
         return jsonify(dict(row)), 201
     except Exception as e:
         logging.error("Error adding subscription: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@admin_routes.route("/subscriptions/export", methods=["GET"])
+async def export_subscriptions():
+    if not is_admin():
+        return jsonify({"error": "Unauthorized"}), 403
+    try:
+        # قراءة الفلاتر من استعلام URL
+        channel_id = request.args.get("channel_id")
+        subscription_type_id = request.args.get("subscription_type_id")
+        start_date = request.args.get("start_date")
+        end_date = request.args.get("end_date")
+
+        # استعلام SQL لجلب كافة الاشتراكات مع البيانات الغنية
+        query = """
+            SELECT 
+                s.id,
+                s.user_id,
+                s.expiry_date,
+                s.is_active,
+                s.channel_id,
+                s.subscription_type_id,
+                s.telegram_id,
+                s.start_date,
+                s.payment_id,
+                s.subscription_plan_id,
+                s.source,
+                u.full_name,
+                u.username,
+                u.wallet_address,
+                sp.name AS subscription_plan_name,
+                st.name AS subscription_type_name
+            FROM subscriptions s
+            LEFT JOIN users u ON s.user_id = u.id
+            LEFT JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
+            LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
+            WHERE 1=1
+        """
+        params = []
+
+        if channel_id:
+            query += f" AND s.channel_id = ${len(params) + 1}"
+            params.append(channel_id)
+        if subscription_type_id:
+            query += f" AND s.subscription_type_id = ${len(params) + 1}"
+            params.append(subscription_type_id)
+        if start_date:
+            query += f" AND s.start_date >= ${len(params) + 1}"
+            params.append(start_date)
+        if end_date:
+            query += f" AND s.start_date <= ${len(params) + 1}"
+            params.append(end_date)
+
+        # لا نضيف LIMIT و OFFSET لنرجع كافة السجلات المطابقة
+        async with current_app.db_pool.acquire() as connection:
+            rows = await connection.fetch(query, *params)
+        data = [dict(row) for row in rows]
+        return jsonify(data)
+    except Exception as e:
+        logging.error("Error exporting subscriptions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
