@@ -1,20 +1,29 @@
 import os
 import json
 import logging
-from quart import Blueprint, request, jsonify, current_app
-from config import DATABASE_CONFIG
+from quart import Blueprint, request, jsonify, abort, current_app
+from config import DATABASE_CONFIG, SECRET_KEY
 import json
+from auth import get_current_user
 from datetime import datetime
 import pytz
-
+from functools import wraps
+import jwt
+import asyncpg
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
-    return await asyncpg.create_pool(**DATABASE_CONFIG)
+    return await asyncpg.create_pool(
+        user=DATABASE_CONFIG['user'],
+        password=DATABASE_CONFIG['password'],
+        database=DATABASE_CONFIG['database'],
+        host=DATABASE_CONFIG['host'],
+        port=DATABASE_CONFIG['port'],
+        ssl="require",               
+        statement_cache_size=0      
+    )
 # إنشاء Blueprint مع بادئة URL
 admin_routes = Blueprint("admin_routes", __name__, url_prefix="/api/admin")
-
-
 
 # دالة تحقق بسيطة للتأكد من صلاحية المستخدم (admin)
 def is_admin():
@@ -24,6 +33,124 @@ def is_admin():
         token = auth_header.split(" ")[1]
         return token == admin_token
     return False
+
+def role_required(required_role):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            auth_header = request.headers.get("Authorization")
+            if not auth_header:
+                return jsonify({"error": "Authorization header missing"}), 401
+            try:
+                token = auth_header.split(" ")[1]  # Bearer <token>
+                payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+                user_role = payload.get("role")
+                # يمكنك السماح للمالك أيضًا بالقيام بإجراءات الأدمن إذا رغبت
+                if required_role == "admin" and user_role not in ["admin", "owner"]:
+                    return jsonify({"error": "Admin privileges required"}), 403
+                elif required_role == "owner" and user_role != "owner":
+                    return jsonify({"error": "Owner privileges required"}), 403
+            except jwt.ExpiredSignatureError:
+                return jsonify({"error": "Token expired"}), 401
+            except jwt.InvalidTokenError:
+                return jsonify({"error": "Invalid token"}), 401
+
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@admin_routes.route("/users", methods=["GET"])
+@role_required("owner")
+async def get_users():
+    """جلب قائمة المستخدمين من جدول panel_users"""
+    async with current_app.db_pool.acquire() as connection:
+        users = await connection.fetch("SELECT email, display_name, role FROM panel_users")
+        users_list = [dict(user) for user in users]
+    return jsonify({"users": users_list}), 200
+
+
+
+@admin_routes.route("/add_owner", methods=["POST"])
+@role_required("owner")
+async def add_owner():
+    """إضافة مالك جديد (Owner)"""
+    data = await request.get_json()
+    email = data.get("email")
+    display_name = data.get("display_name", "")
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    async with current_app.db_pool.acquire() as connection:
+        # استخدام نفس الجدول panel_users
+        existing_user = await connection.fetchrow("SELECT * FROM panel_users WHERE email = $1", email)
+
+        if existing_user:
+            return jsonify({"error": "User already exists"}), 400
+
+        await connection.execute(
+            "INSERT INTO panel_users (email, display_name, role) VALUES ($1, $2, 'owner')",
+            email, display_name
+        )
+
+    return jsonify({"message": "Owner added successfully"}), 201
+
+
+@admin_routes.route("/add_admin", methods=["POST"])
+@role_required("owner")
+async def add_admin():
+    """إضافة مسؤول جديد (Admin)"""
+    data = await request.get_json()
+    email = data.get("email")
+    display_name = data.get("display_name", "")
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    async with current_app.db_pool.acquire() as connection:
+        # استخدام نفس الجدول panel_users
+        existing_user = await connection.fetchrow("SELECT * FROM panel_users WHERE email = $1", email)
+
+        if existing_user:
+            return jsonify({"error": "User already exists"}), 400
+
+        await connection.execute(
+            "INSERT INTO panel_users (email, display_name, role) VALUES ($1, $2, 'admin')",
+            email, display_name
+        )
+
+    return jsonify({"message": "Admin added successfully"}), 201
+
+
+@admin_routes.route("/remove_user", methods=["DELETE"])
+@role_required("owner")
+async def remove_user():
+    """حذف حساب موجود (Owner أو Admin)"""
+    data = await request.get_json()
+    email = data.get("email")
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    async with current_app.db_pool.acquire() as connection:
+        # التحقق مما إذا كان المستخدم موجودًا
+        existing_user = await connection.fetchrow("SELECT * FROM panel_users WHERE email = $1", email)
+
+        if not existing_user:
+            return jsonify({"error": "User not found"}), 404
+
+        # التأكد من عدم حذف آخر Owner في النظام
+        if existing_user["role"] == "owner":
+            owners_count = await connection.fetchval("SELECT COUNT(*) FROM panel_users WHERE role = 'owner'")
+            if owners_count <= 1:
+                return jsonify({"error": "Cannot delete the last owner"}), 403
+
+        # تنفيذ الحذف
+        await connection.execute("DELETE FROM panel_users WHERE email = $1", email)
+
+    return jsonify({"message": f"User {email} removed successfully"}), 200
+
+
 
 #######################################
 # نقاط API لإدارة أنواع الاشتراكات (subscription_types)
@@ -672,3 +799,5 @@ async def export_subscriptions():
     except Exception as e:
         logging.error("Error exporting subscriptions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
+

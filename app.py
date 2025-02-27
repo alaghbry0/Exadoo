@@ -16,7 +16,7 @@ from routes.admin_routes import admin_routes
 from routes.subscriptions_routs import public_routes
 from routes.payment_confirmation import payment_confirmation_bp
 #from routes.webhook import payments_bp
-#from routes.webhook import webhook_bp
+from routes.auth_routes import auth_routes
 from telegram_bot import start_bot, bot, telegram_bot_bp  # ✅ استخدام `telegram_bot_bp`
 from chatbot.chatbot import chatbot_bp
 from utils.scheduler import start_scheduler
@@ -42,9 +42,12 @@ app.aiohttp_session = None
 #app = cors(app, allow_origin=ALLOWED_ORIGINS)
 app = cors(app, allow_origin=["*"])
 
+
+
 # 🔹 تسجيل نقاط API
 app.register_blueprint(public_routes)
 app.register_blueprint(admin_routes)
+app.register_blueprint(auth_routes)
 app.register_blueprint(subscriptions_bp)
 app.register_blueprint(user_bp)
 app.register_blueprint(shop)
@@ -54,6 +57,17 @@ app.register_blueprint(telegram_bot_bp)  # ✅ تغيير الاسم إلى `tel
 # تسجيل Blueprint البوت الخاص بالدردشة مع URL prefix
 app.register_blueprint(chatbot_bp, url_prefix="/bot")
 
+# بعد إنشاء التطبيق، قبل تسجيل نقاط النهاية الأخرى أو قبل start_serving
+@app.after_request
+async def add_security_headers(response):
+    response.headers['Cross-Origin-Opener-Policy'] = 'same-origin-allow-popups'
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://accounts.google.com; "
+        "frame-src 'self' https://accounts.google.com; "
+        "connect-src 'self' https://accounts.google.com https://api.github.com https://api.nepcha.com http://localhost:5000;"
+    )
+    return response
 
 
 # 🔹 تشغيل Webhook للبوت عند بدء التطبيق
