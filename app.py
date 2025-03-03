@@ -40,8 +40,8 @@ app.aiohttp_session = None
 # 🔹 ضبط CORS للسماح بمصادر محددة فقط
 #ALLOWED_ORIGINS = ["https://exadooo-git-main-mohammeds-projects-3d2877c6.vercel.app", "https://exadoo.onrender.com", "https://telegram.org"]
 #app = cors(app, allow_origin=ALLOWED_ORIGINS)
-ALLOWED_ORIGINS = ["http://localhost:5000", "http://192.168.0.96:5000"]
-cors(app, allow_origin=ALLOWED_ORIGINS, allow_credentials=True)
+ALLOWED_ORIGINS = ["*"]
+CORS(app, allow_origin=ALLOWED_ORIGINS, allow_credentials=True)
 
 
 # 🔹 تسجيل نقاط API
