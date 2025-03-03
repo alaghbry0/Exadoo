@@ -26,7 +26,7 @@ from Crypto.PublicKey import RSA
 from Crypto.Hash import SHA256
 
 # ✅ التحقق من متغيرات البيئة الأساسية قبل تشغيل التطبيق
-REQUIRED_ENV_VARS = ["PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET", "PORT", "WEBHOOK_URL"]
+REQUIRED_ENV_VARS = ["PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET", "PORT"]
 for var in REQUIRED_ENV_VARS:
     if not os.environ.get(var):
         raise ValueError(f"❌ متغير البيئة {var} غير مضبوط. الرجاء التأكد من الإعدادات.")
@@ -118,7 +118,7 @@ async def home():
 
 # 🔹 تشغيل التطبيق باستخدام Hypercorn
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5001))  # Heroku يحدد المنفذ تلقائيًا
+    port = int(os.getenv("PORT", 5000))  # Heroku يحدد المنفذ تلقائيًا
     logging.info(f"🚀 تشغيل Exadoo API على المنفذ {port}...")
 
     config = hypercorn.Config()
