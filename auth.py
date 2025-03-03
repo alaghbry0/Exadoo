@@ -27,7 +27,7 @@ def create_jwt(email, role):
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
 async def get_current_user():
-    """استخراج بيانات المستخدم من توكن الـ JWT"""
+    """استخراج بيانات المستخدم من توكن الـ JWT وإرجاع بيانات المستخدم مع الدور""" # تم التعديل في الوصف
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         abort(401, description="Authorization header missing")
@@ -35,10 +35,30 @@ async def get_current_user():
     try:
         token = auth_header.split(" ")[1]  # Bearer <token>
         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        return payload
+        return {"email": payload["email"], "role": payload["role"]} # تم التعديل: إرجاع role المستخدم
     except IndexError:
         abort(401, description="Invalid Authorization header format")
     except jwt.ExpiredSignatureError:
         abort(401, description="Token expired")
     except jwt.InvalidTokenError:
         abort(401, description="Invalid token")
+
+def admin_required(func):
+    """Decorator للتحقق من صلاحية المستخدم (admin أو owner)"""
+    async def wrapper(*args, **kwargs):
+        user = await get_current_user()
+        if user and user["role"] in ["admin", "owner"]: # تم التعديل: التحقق من أن الدور هو admin أو owner
+            return await func(*args, **kwargs)
+        else:
+            abort(403, description="Admin or Owner role required") # تم التعديل في رسالة الخطأ
+    return wrapper
+
+def owner_required(func):
+    """Decorator للتحقق من صلاحية المستخدم (owner فقط)"""
+    async def wrapper(*args, **kwargs):
+        user = await get_current_user()
+        if user and user["role"] == "owner": # تم التعديل: التحقق من أن الدور هو owner فقط
+            return await func(*args, **kwargs)
+        else:
+            abort(403, description="Owner role required") # تم التعديل في رسالة الخطأ
+    return wrapper

@@ -11,7 +11,7 @@ from pytoniq import LiteBalancer, begin_cell, Address
 # تحميل المتغيرات البيئية
 WEBHOOK_SECRET_BACKEND = os.getenv("WEBHOOK_SECRET")
 subscribe_api_url = os.getenv("SUBSCRIBE_API_URL")
-BOT_WALLET_ADDRESS = os.getenv("BOT_WALLET_ADDRESS")  # عنوان محفظة البوت (Non‑bounceable)
+#BOT_WALLET_ADDRESS = os.getenv("BOT_WALLET_ADDRESS")  # عنوان محفظة البوت (Non‑bounceable)
 TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY")      # مفتاح Toncenter
 
 payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
@@ -29,18 +29,19 @@ def normalize_address(addr_str: str) -> str:
 
 async def parse_transactions(provider: LiteBalancer):
     """
-    تقوم هذه الدالة بجلب آخر المعاملات من محفظة البوت،
-    وتحليل payload تحويل Jetton وفقًا لمعيار TEP‑74 واستخراج orderId،
-    ثم مقارنة بيانات الدفع مع الدفعات المعلقة في قاعدة البيانات باستخدام orderId فقط.
+    تقوم هذه الدالة بجلب آخر المعاملات من محفظة البوت وتحليلها.
     """
     logging.info("🔄 بدء parse_transactions...")
-    my_wallet_address = BOT_WALLET_ADDRESS
+    
+    # الحصول على عنوان المحفظة من قاعدة البيانات عبر الدالة الجديدة
+    my_wallet_address = await get_bot_wallet_address()
     if not my_wallet_address:
-        logging.error("❌ لم يتم تعريف BOT_WALLET_ADDRESS في متغيرات البيئة!")
+        logging.error("❌ لم يتم تعريف عنوان محفظة البوت في قاعدة البيانات!")
         return
 
     normalized_bot_address = normalize_address(my_wallet_address)
     logging.info(f"🔍 جلب آخر المعاملات من محفظة البوت: {normalized_bot_address}")
+    
     try:
         transactions = await provider.get_transactions(address=my_wallet_address, count=10)
         logging.info(f"✅ تم جلب {len(transactions)} معاملة.")
@@ -298,3 +299,30 @@ async def confirm_payment():
     except Exception as e:
         logging.error(f"❌ خطأ في /api/confirm_payment: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+    
+
+    # إعداد متغيرات للتخزين المؤقت لعناوين المحفظة
+_wallet_cache = {
+    "address": None,
+    "timestamp": 0
+}
+WALLET_CACHE_TTL = 60  # زمن التخزين المؤقت بالثواني (مثلاً 60 ثانية)
+
+async def get_bot_wallet_address():
+    """
+    تسترجع عنوان محفظة البوت من جدول wallet في قاعدة البيانات.
+    تستخدم التخزين المؤقت لتقليل عدد الاستعلامات.
+    """
+    global _wallet_cache
+    now = asyncio.get_event_loop().time()
+    # إذا لم يكن العنوان مخزن أو انتهت صلاحيته
+    if _wallet_cache["address"] is None or now - _wallet_cache["timestamp"] > WALLET_CACHE_TTL:
+        async with current_app.db_pool.acquire() as connection:
+            wallet = await connection.fetchrow("SELECT wallet_address FROM wallet ORDER BY id DESC LIMIT 1")
+        if wallet:
+            _wallet_cache["address"] = wallet["wallet_address"]
+        else:
+            _wallet_cache["address"] = None
+        _wallet_cache["timestamp"] = now
+    return _wallet_cache["address"]
+

@@ -40,8 +40,8 @@ app.aiohttp_session = None
 # 🔹 ضبط CORS للسماح بمصادر محددة فقط
 #ALLOWED_ORIGINS = ["https://exadooo-git-main-mohammeds-projects-3d2877c6.vercel.app", "https://exadoo.onrender.com", "https://telegram.org"]
 #app = cors(app, allow_origin=ALLOWED_ORIGINS)
-app = cors(app, allow_origin=["*"])
-
+ALLOWED_ORIGINS = ["http://localhost:5000", "http://192.168.0.96:5000"]
+cors(app, allow_origin=ALLOWED_ORIGINS, allow_credentials=True)
 
 
 # 🔹 تسجيل نقاط API
@@ -118,7 +118,7 @@ async def home():
 
 # 🔹 تشغيل التطبيق باستخدام Hypercorn
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))  # Heroku يحدد المنفذ تلقائيًا
+    port = int(os.getenv("PORT", 5001))  # Heroku يحدد المنفذ تلقائيًا
     logging.info(f"🚀 تشغيل Exadoo API على المنفذ {port}...")
 
     config = hypercorn.Config()

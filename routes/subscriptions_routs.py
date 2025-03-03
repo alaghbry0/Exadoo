@@ -2,8 +2,9 @@ import json
 import logging
 from quart import Blueprint, request, jsonify, current_app
 from config import DATABASE_CONFIG
+import asyncpg
 
-
+# وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
     return await asyncpg.create_pool(**DATABASE_CONFIG)
 
@@ -73,3 +74,18 @@ async def get_public_subscription_plans():
     except Exception as e:
         logging.error("Error fetching public subscription plans: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+    
+
+@public_routes.route("/wallet", methods=["GET"])
+async def get_public_wallet():
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            wallet = await connection.fetchrow("SELECT wallet_address FROM wallet ORDER BY id DESC LIMIT 1")
+        if wallet:
+            return jsonify({"wallet_address": wallet["wallet_address"]}), 200
+        else:
+            return jsonify({"wallet_address": ""}), 200
+    except Exception as e:
+        logging.error("❌ Error fetching public wallet address: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+

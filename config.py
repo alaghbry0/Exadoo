@@ -33,3 +33,5 @@ GOOGLE_CLIENT_ID=os.getenv("GOOGLE_CLIENT_ID")
 SECRET_KEY=os.getenv("SECRET_KEY")
 
 REFRESH_SECRET_KEY =os.getenv("refresh_secret_key") # تأكد من تغييره إلى قيمة آمنة
+
+REFRESH_COOKIE_NAME = "my_app_refresh_token"  

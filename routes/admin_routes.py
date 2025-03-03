@@ -13,26 +13,13 @@ import asyncpg
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
-    return await asyncpg.create_pool(
-        user=DATABASE_CONFIG['user'],
-        password=DATABASE_CONFIG['password'],
-        database=DATABASE_CONFIG['database'],
-        host=DATABASE_CONFIG['host'],
-        port=DATABASE_CONFIG['port'],
-        ssl="require",               
-        statement_cache_size=0      
-    )
+    return await asyncpg.create_pool(**DATABASE_CONFIG)
+
+
 # إنشاء Blueprint مع بادئة URL
 admin_routes = Blueprint("admin_routes", __name__, url_prefix="/api/admin")
 
-# دالة تحقق بسيطة للتأكد من صلاحية المستخدم (admin)
-def is_admin():
-    auth_header = request.headers.get("Authorization")
-    admin_token = os.getenv("ADMIN_TOKEN")
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
-        return token == admin_token
-    return False
+
 
 def role_required(required_role):
     def decorator(func):
@@ -56,8 +43,11 @@ def role_required(required_role):
                 return jsonify({"error": "Invalid token"}), 401
 
             return await func(*args, **kwargs)
+
         return wrapper
+
     return decorator
+
 
 @admin_routes.route("/users", methods=["GET"])
 @role_required("owner")
@@ -67,7 +57,6 @@ async def get_users():
         users = await connection.fetch("SELECT email, display_name, role FROM panel_users")
         users_list = [dict(user) for user in users]
     return jsonify({"users": users_list}), 200
-
 
 
 @admin_routes.route("/add_owner", methods=["POST"])
@@ -151,16 +140,14 @@ async def remove_user():
     return jsonify({"message": f"User {email} removed successfully"}), 200
 
 
-
 #######################################
 # نقاط API لإدارة أنواع الاشتراكات (subscription_types)
 #######################################
 
 # إضافة نوع اشتراك جديد
 @admin_routes.route("/subscription-types", methods=["POST"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def create_subscription_type():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
         name = data.get("name")
@@ -176,7 +163,7 @@ async def create_subscription_type():
 
         async with current_app.db_pool.acquire() as connection:
             query = """
-                INSERT INTO subscription_types 
+                INSERT INTO subscription_types
                 (name, channel_id, description, image_url, features, usp, is_active)
                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
                 RETURNING id, name, channel_id, description, image_url, features, usp, is_active, created_at;
@@ -196,11 +183,11 @@ async def create_subscription_type():
         logging.error("Error creating subscription type: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # تعديل بيانات نوع اشتراك موجود
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["PUT"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def update_subscription_type(type_id: int):
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
         name = data.get("name")
@@ -225,7 +212,8 @@ async def update_subscription_type(type_id: int):
                 RETURNING id, name, channel_id, description, image_url, features, usp, is_active, created_at;
             """
             features_json = json.dumps(features) if features is not None else None
-            result = await connection.fetchrow(query, name, channel_id, description, image_url, features_json, usp, is_active, type_id)
+            result = await connection.fetchrow(query, name, channel_id, description, image_url, features_json, usp,
+                                               is_active, type_id)
         if result:
             return jsonify(dict(result)), 200
         else:
@@ -234,11 +222,11 @@ async def update_subscription_type(type_id: int):
         logging.error("Error updating subscription type: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # حذف نوع اشتراك
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["DELETE"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def delete_subscription_type(type_id: int):
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         async with current_app.db_pool.acquire() as connection:
             query = "DELETE FROM subscription_types WHERE id = $1"
@@ -248,12 +236,11 @@ async def delete_subscription_type(type_id: int):
         logging.error("Error deleting subscription type: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # جلب قائمة أنواع الاشتراكات
 @admin_routes.route("/subscription-types", methods=["GET"])
+@role_required("owner")  # ✅ استخدام @role_required("admin")
 async def get_subscription_types():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
-
     try:
         async with current_app.db_pool.acquire() as connection:
             query = """
@@ -263,27 +250,23 @@ async def get_subscription_types():
             """
             results = await connection.fetch(query)
 
-        # تحويل النتائج إلى JSON مع التأكد من الترميز
         types = []
         for row in results:
             row_dict = dict(row)
-
-            # تأكد من أن `features` مخزن كـ JSON وليس كنص
             row_dict["features"] = json.loads(row_dict["features"]) if row_dict["features"] else []
-
             types.append(row_dict)
 
-        # إرجاع البيانات مع تحديد `Content-Type`
         return jsonify(types), 200, {"Content-Type": "application/json; charset=utf-8"}
 
     except Exception as e:
         logging.error("Error fetching subscription types: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
+
 # جلب تفاصيل نوع اشتراك معين
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["GET"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def get_subscription_type(type_id: int):
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         async with current_app.db_pool.acquire() as connection:
             query = """
@@ -300,15 +283,15 @@ async def get_subscription_type(type_id: int):
         logging.error("Error fetching subscription type: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 #######################################
 # نقاط API لإدارة خطط الاشتراك (subscription_plans)
 #######################################
 
 # إضافة خطة اشتراك جديدة لنوع معين
 @admin_routes.route("/subscription-plans", methods=["POST"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def create_subscription_plan():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
         subscription_type_id = data.get("subscription_type_id")
@@ -342,11 +325,11 @@ async def create_subscription_plan():
         logging.error("Error creating subscription plan: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # تعديل بيانات خطة اشتراك
 @admin_routes.route("/subscription-plans/<int:plan_id>", methods=["PUT"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def update_subscription_plan(plan_id: int):
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
         subscription_type_id = data.get("subscription_type_id")
@@ -386,11 +369,11 @@ async def update_subscription_plan(plan_id: int):
         logging.error("Error updating subscription plan: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # حذف خطة اشتراك
 @admin_routes.route("/subscription-plans/<int:plan_id>", methods=["DELETE"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def delete_subscription_plan(plan_id: int):
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         async with current_app.db_pool.acquire() as connection:
             query = "DELETE FROM subscription_plans WHERE id = $1"
@@ -400,11 +383,11 @@ async def delete_subscription_plan(plan_id: int):
         logging.error("Error deleting subscription plan: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # جلب جميع خطط الاشتراك، مع إمكانية التصفية حسب subscription_type_id
 @admin_routes.route("/subscription-plans", methods=["GET"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def get_subscription_plans():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         subscription_type_id = request.args.get("subscription_type_id")
         async with current_app.db_pool.acquire() as connection:
@@ -429,11 +412,11 @@ async def get_subscription_plans():
         logging.error("Error fetching subscription plans: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # جلب تفاصيل خطة اشتراك معينة
 @admin_routes.route("/subscription-plans/<int:plan_id>", methods=["GET"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def get_subscription_plan(plan_id: int):
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         async with current_app.db_pool.acquire() as connection:
             query = """
@@ -452,9 +435,8 @@ async def get_subscription_plan(plan_id: int):
 
 
 @admin_routes.route("/subscriptions", methods=["GET"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def get_subscriptions():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         # الحصول على المتغيرات من استعلام URL
         user_id = request.args.get("user_id")
@@ -465,10 +447,11 @@ async def get_subscriptions():
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
+        search_term = request.args.get("search", "")  # ✅ استلام search term
 
         # استعلام SQL للحصول على الاشتراكات مع بيانات المستخدم والخطط والأنواع
         query = """
-            SELECT 
+            SELECT
                 s.*,
                 u.full_name,
                 u.username,
@@ -499,6 +482,9 @@ async def get_subscriptions():
         if end_date:
             query += f" AND s.expiry_date <= ${len(params) + 1}::timestamptz"
             params.append(end_date)
+        if search_term:  # ✅ إضافة شرط البحث
+            query += f" AND (u.full_name ILIKE ${len(params) + 1} OR u.username ILIKE ${len(params) + 1} OR s.telegram_id::TEXT ILIKE ${len(params) + 1})"
+            params.append(f"%{search_term}%")
 
         # إضافة ترتيب وتجزئة
         query += f" ORDER BY s.expiry_date DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
@@ -522,35 +508,38 @@ async def get_subscriptions():
 # 2. API لجلب بيانات الدفعات مع دعم الفلاتر والتجزئة والتقارير المالية
 # =====================================
 @admin_routes.route("/payments", methods=["GET"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def get_payments():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
-        status     = request.args.get("status")
-        user_id    = request.args.get("user_id")
+        status = request.args.get("status")
+        user_id = request.args.get("user_id")
         start_date = request.args.get("start_date")
-        end_date   = request.args.get("end_date")
-        page       = int(request.args.get("page", 1))
-        page_size  = int(request.args.get("page_size", 20))
-        offset     = (page - 1) * page_size
+        end_date = request.args.get("end_date")
+        page = int(request.args.get("page", 1))
+        page_size = int(request.args.get("page_size", 20))
+        offset = (page - 1) * page_size
+        search_term = request.args.get("search", "")  # ✅ استلام search term
 
         query = "SELECT * FROM payments WHERE 1=1"
         params = []
 
         if status:
-            query += f" AND status = ${len(params)+1}"
+            query += f" AND status = ${len(params) + 1}"
             params.append(status)
         if user_id:
-            query += f" AND user_id = ${len(params)+1}"
+            query += f" AND user_id = ${len(params) + 1}"
             params.append(user_id)
         if start_date:
-            query += f" AND payment_date >= ${len(params)+1}"
+            query += f" AND payment_date >= ${len(params) + 1}"
             params.append(start_date)
         if end_date:
-            query += f" AND payment_date <= ${len(params)+1}"
+            query += f" AND payment_date <= ${len(params) + 1}"
             params.append(end_date)
+        if search_term:  # ✅ إضافة شرط البحث
+            query += f" AND (payment_id::TEXT ILIKE ${len(params) + 1} OR user_id::TEXT ILIKE ${len(params) + 1})"  # البحث في payment_id و user_id كمثال
+            params.append(f"%{search_term}%")
 
-        query += f" ORDER BY payment_date DESC LIMIT ${len(params)+1} OFFSET ${len(params)+2}"
+        query += f" ORDER BY payment_date DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
         params.append(page_size)
         params.append(offset)
 
@@ -563,16 +552,16 @@ async def get_payments():
             rev_query = "SELECT SUM(amount) as total FROM payments WHERE 1=1"
             rev_params = []
             if status:
-                rev_query += f" AND status = ${len(rev_params)+1}"
+                rev_query += f" AND status = ${len(rev_params) + 1}"
                 rev_params.append(status)
             if user_id:
-                rev_query += f" AND user_id = ${len(rev_params)+1}"
+                rev_query += f" AND user_id = ${len(rev_params) + 1}"
                 rev_params.append(user_id)
             if start_date:
-                rev_query += f" AND payment_date >= ${len(rev_params)+1}"
+                rev_query += f" AND payment_date >= ${len(rev_params) + 1}"
                 rev_params.append(start_date)
             if end_date:
-                rev_query += f" AND payment_date <= ${len(rev_params)+1}"
+                rev_query += f" AND payment_date <= ${len(rev_params) + 1}"
                 rev_params.append(end_date)
             async with current_app.db_pool.acquire() as connection:
                 rev_row = await connection.fetchrow(rev_query, *rev_params)
@@ -587,13 +576,13 @@ async def get_payments():
         logging.error("Error fetching payments: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # =====================================
 # 3. API لتعديل اشتراك مستخدم
 # =====================================
 @admin_routes.route("/subscriptions/<int:subscription_id>", methods=["PUT"])
+@role_required("admin")  # ✅ استخدام @role_required("admin")
 async def update_subscription(subscription_id):
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
         expiry_date = data.get("expiry_date")
@@ -606,13 +595,12 @@ async def update_subscription(subscription_id):
         update_fields = []
         params = []
         idx = 1
-        from datetime import datetime
-        import pytz
         local_tz = pytz.timezone("Asia/Riyadh")
 
         if expiry_date:
             # تحويل expiry_date إلى datetime timezone-aware باستخدام local_tz
-            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(local_tz)
+            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(
+                local_tz)
             update_fields.append(f"expiry_date = ${idx}")
             params.append(dt_expiry)
             idx += 1
@@ -778,13 +766,13 @@ async def export_subscriptions():
                 subscription_type_id = int(subscription_type_id)
             except ValueError:
                 return jsonify({"error": "Invalid subscription_type_id format"}), 400
-            query += f" AND s.subscription_type_id = ${len(params)+1}"
+            query += f" AND s.subscription_type_id = ${len(params) + 1}"
             params.append(subscription_type_id)
         if start_date:
-            query += f" AND s.start_date >= ${len(params)+1}"
+            query += f" AND s.start_date >= ${len(params) + 1}"
             params.append(start_date)
         if end_date:
-            query += f" AND s.start_date <= ${len(params)+1}"
+            query += f" AND s.start_date <= ${len(params) + 1}"
             params.append(end_date)
         if active and active.lower() != "all":
             if active.lower() == "true":
@@ -800,4 +788,41 @@ async def export_subscriptions():
         logging.error("Error exporting subscriptions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
+@admin_routes.route("/wallet", methods=["GET"])
+@role_required("owner")
+async def get_wallet_address():
+    async with current_app.db_pool.acquire() as connection:
+        wallet = await connection.fetchrow("SELECT wallet_address FROM wallet ORDER BY id DESC LIMIT 1")
+    if wallet:
+        return jsonify({"wallet_address": wallet["wallet_address"]}), 200
+    else:
+        # إذا لم يكن هناك سجل، يمكن إرجاع قيمة فارغة أو رسالة مناسبة
+        return jsonify({"wallet_address": ""}), 200
+
+
+
+@admin_routes.route("/wallet", methods=["POST"])
+@role_required("owner")
+async def update_wallet_address():
+    data = await request.get_json()
+    wallet_address = data.get("wallet_address")
+    
+    if not wallet_address:
+        return jsonify({"error": "Wallet address is required"}), 400
+
+    async with current_app.db_pool.acquire() as connection:
+        # نفترض أنه يوجد سجل واحد فقط لتخزين عنوان المحفظة
+        wallet = await connection.fetchrow("SELECT id FROM wallet LIMIT 1")
+        if wallet:
+            await connection.execute(
+                "UPDATE wallet SET wallet_address = $1 WHERE id = $2", 
+                wallet_address, wallet["id"]
+            )
+        else:
+            await connection.execute(
+                "INSERT INTO wallet (wallet_address) VALUES ($1)", 
+                wallet_address
+            )
+    return jsonify({"message": "Wallet address updated successfully"}), 200
 
