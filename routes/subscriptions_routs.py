@@ -19,7 +19,16 @@ async def get_public_subscription_types():
     try:
         async with current_app.db_pool.acquire() as connection:
             query = """
-                SELECT id, name, channel_id, description, image_url, features, usp, is_active, created_at
+                SELECT id, 
+                    name, 
+                    channel_id, 
+                    description, 
+                    image_url, 
+                    features, 
+                    usp, 
+                    is_active,
+                    is_recommended, -- أضف هذا الحقل الجديد
+                    created_at
                 FROM subscription_types
                 WHERE is_active = true
                 ORDER BY created_at DESC

@@ -42,7 +42,7 @@ app.aiohttp_session = None
 #app = cors(app, allow_origin=ALLOWED_ORIGINS)
 
 
-ALLOWED_ORIGINS = ["https://exadooo-git-main-mohammeds-projects-3d2877c6.vercel.app", "https://telegram.org", "https://exaadoooo-p-git-main-mohammeds-projects-3d2877c6.vercel.app/dashboard"]
+ALLOWED_ORIGINS = ["https://exadooo-git-main-mohammeds-projects-3d2877c6.vercel.app", "https://telegram.org", "https://exaadoooo-p.vercel.app"]
 app = cors(app, allow_origin=ALLOWED_ORIGINS, allow_credentials=True)
 
 
