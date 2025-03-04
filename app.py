@@ -44,7 +44,7 @@ app.aiohttp_session = None
 
 ALLOWED_ORIGINS = [
   "https://exadooo-git-main-mohammeds-projects-3d2877c6.vercel.app",
-  "https://exaadoooo-p.vercel.app",
+  "https://exaado-panel.vercel.app",
   "https://exadoo-rxr9.onrender.com",
 "https://telegram.org"
 ]
@@ -74,7 +74,7 @@ async def add_security_headers(response):
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline' https://accounts.google.com; "
         "frame-src 'self' https://accounts.google.com; "
-        "connect-src 'self' https://accounts.google.com https://api.github.com https://api.nepcha.com http://localhost:5000; https://exaadoooo-p.vercel.app/"
+        "connect-src 'self' https://accounts.google.com https://api.github.com https://api.nepcha.com http://localhost:5000; https://exaado-panel.vercel.app"
     )
     return response
 
