@@ -1,29 +1,36 @@
 import jwt
 import datetime
 import os  # لإدارة متغيرات البيئة
-from quart import Blueprint, request, jsonify, abort, current_app, make_response
+from quart import Blueprint, request, jsonify, abort, current_app
 from auth import verify_google_token
 
 SECRET_KEY = os.getenv("SECRET_KEY", "your_default_secret_key")
 REFRESH_SECRET_KEY = os.getenv("REFRESH_SECRET_KEY", "your_refresh_secret_key")  # مفتاح خاص بالتجديد
-REFRESH_COOKIE_NAME = os.getenv("REFRESH_COOKIE_NAME", "refresh_token") # اسم ملف تعريف الارتباط للتجديد
+REFRESH_COOKIE_NAME = os.getenv("REFRESH_COOKIE_NAME", "refresh_token")  # اسم ملف تعريف الارتباط للتجديد
+
 
 def generate_tokens(email, role):
-    """إنشاء Access Token و Refresh Token"""
-    access_token = jwt.encode({
+    """إنشاء Access Token و Refresh Token باستخدام توقيت UTC مع وعي بالمنطقة الزمنية."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    access_payload = {
         "email": email,
         "role": role,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=30)  # توكن مؤقت (30 دقيقة)
-    }, SECRET_KEY, algorithm="HS256")
-
-    refresh_token = jwt.encode({
+        "exp": now + datetime.timedelta(minutes=30)  # توكن مؤقت (30 دقيقة)
+    }
+    refresh_payload = {
         "email": email,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)  # توكن صالح لسبعة أيام
-    }, REFRESH_SECRET_KEY, algorithm="HS256")
+        "exp": now + datetime.timedelta(days=7)  # توكن صالح لسبعة أيام
+    }
+
+    access_token = jwt.encode(access_payload, SECRET_KEY, algorithm="HS256")
+    refresh_token = jwt.encode(refresh_payload, REFRESH_SECRET_KEY, algorithm="HS256")
 
     return access_token, refresh_token
 
+
 auth_routes = Blueprint("auth_routes", __name__, url_prefix="/api/auth")
+
 
 @auth_routes.route("/login", methods=["POST"])
 async def login():
@@ -48,7 +55,7 @@ async def login():
 
         access_token, refresh_token = generate_tokens(email, user["role"])
 
-        response = jsonify({ # لا نرسل refresh_token في JSON بعد الآن
+        response = jsonify({  # لا نرسل refresh_token في JSON بعد الآن
             "access_token": access_token,
             "role": user["role"]
         })
@@ -58,19 +65,20 @@ async def login():
             REFRESH_COOKIE_NAME,
             refresh_token,
             httponly=True,
-            secure=True,  # تأكد من استخدام HTTPS في الإنتاج
+            secure=True,  # تأكد من استخدام HTTPS في الإنتاج؛ في بيئة التطوير يمكنك تغييره إلى False
             samesite='Strict',
             max_age=7 * 24 * 3600  # 7 أيام (نفس مدة صلاحية التوكن)
         )
         return response
 
+
 @auth_routes.route("/refresh", methods=["POST"])
 async def refresh():
     """تجديد Access Token باستخدام Refresh Token من HTTP-only Cookie"""
-    refresh_token = request.cookies.get(REFRESH_COOKIE_NAME) # استخراج refresh_token من ملف تعريف الارتباط
+    refresh_token = request.cookies.get(REFRESH_COOKIE_NAME)  # استخراج refresh_token من ملف تعريف الارتباط
 
     if not refresh_token:
-        abort(400, description="Missing Refresh Token Cookie") # تم التعديل في رسالة الخطأ
+        abort(400, description="Missing Refresh Token Cookie")
 
     try:
         payload = jwt.decode(refresh_token, REFRESH_SECRET_KEY, algorithms=["HS256"])
@@ -85,7 +93,7 @@ async def refresh():
         if not user:
             abort(403, description="User not found")
 
-        access_token, new_refresh_token = generate_tokens(email, user["role"]) # توليد refresh_token جديد
+        access_token, new_refresh_token = generate_tokens(email, user["role"])  # توليد refresh_token جديد
 
         response = jsonify({"access_token": access_token})
 
@@ -96,6 +104,6 @@ async def refresh():
             httponly=True,
             secure=True,  # تأكد من استخدام HTTPS في الإنتاج
             samesite='Strict',
-            max_age=7 * 24 * 3600  # 7 أيام (نفس مدة صلاحية التوكن)
+            max_age=7 * 24 * 3600
         )
         return response
