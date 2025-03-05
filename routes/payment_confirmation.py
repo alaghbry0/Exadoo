@@ -21,13 +21,15 @@ payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 # دالة مساعدة لتوحيد تنسيق العناوين (لأغراض التسجيل فقط)
 def normalize_address(addr_str: str) -> str:
     try:
+        # إذا كان العنوان يبدأ بـ "0:" فقم بإزالة البادئة
         if addr_str.startswith("0:"):
             addr_str = addr_str[2:]
         addr = Address(addr_str)
-        return addr.to_str(is_user_friendly=True, is_bounceable=False, is_url_safe=True).lower().strip()
+        # عدم تحويل العنوان إلى أحرف صغيرة للحفاظ على حساسيته
+        return addr.to_str(is_user_friendly=True, is_bounceable=False, is_url_safe=True).strip()
     except Exception as e:
         logging.warning(f"❌ فشل تطبيع العنوان {addr_str}: {str(e)}")
-        return addr_str.lower().strip()
+        return addr_str.strip()
 
 
 async def parse_transactions(provider: LiteBalancer):
