@@ -9,6 +9,8 @@ from database.db_queries import record_payment, update_payment_with_txhash, fetc
 from pytoniq import LiteBalancer, begin_cell, Address
 from pytoniq.liteclient.client import LiteServerError
 from typing import Optional  # لإضافة تلميحات النوع
+from utils.websocket_manager import init_websocket_manager
+from quart import websocket as quart_websocket
 
 # تحميل المتغيرات البيئية
 WEBHOOK_SECRET_BACKEND = os.getenv("WEBHOOK_SECRET")
@@ -211,12 +213,29 @@ async def parse_transactions(provider: LiteBalancer):
                         try:
                             async with session.post(subscribe_api_url, json=subscription_payload,
                                                     headers=headers) as response:
-                                subscribe_response = await response.json()
                                 if response.status == 200:
-                                    logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_response}")
+                                    subscribe_data = await response.json()
+                                    logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_data}")
+
+                                    # إرسال إشعار WebSocket هنا
+                                    try:
+                                        await current_app.ws_manager.send_to_user(
+                                            telegram_id=pending_payment['telegram_id'],
+                                            message={
+                                                "type": "subscription_success",
+                                                "data": {
+                                                    "invite_link": subscribe_data.get("invite_link"),
+                                                    "message": subscribe_data.get("formatted_message"),
+                                                    "telegram_id": pending_payment['telegram_id']
+                                                }
+                                            }
+                                        )
+                                    except Exception as e:
+                                        logging.error(f"❌ فشل إرسال إشعار WebSocket: {e}")
                                 else:
+                                    error_details = await response.text()
                                     logging.error(
-                                        f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {subscribe_response}")
+                                        f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {error_details}")
                         except Exception as e:
                             logging.error(f"❌ استثناء أثناء استدعاء /api/subscribe: {str(e)}")
                 else:
@@ -253,9 +272,9 @@ async def periodic_check_payments():
 
 @payment_confirmation_bp.before_app_serving
 async def startup():
+    init_websocket_manager(current_app)
     logging.info("🚀 بدء مهمة الفحص الدوري للمعاملات في الخلفية...")
     asyncio.create_task(periodic_check_payments())
-    logging.info("✅ تم بدء مهمة الفحص الدوري للمعاملات في الخلفية.")
 
 
 @payment_confirmation_bp.route("/api/confirm_payment", methods=["POST"])

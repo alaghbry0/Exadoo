@@ -181,8 +181,10 @@ async def subscribe():
                 "message": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
                 "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
                 "start_date": start_date_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
-                "invite_link": invite_link
+                "invite_link": invite_link,
+                "formatted_message": f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
             }
+
             return jsonify(response_data), 200
 
     except Exception as e:
@@ -190,45 +192,92 @@ async def subscribe():
         return jsonify({"error": "Internal server error"}), 500
 
 
-
 @subscriptions_bp.websocket('/ws/subscription_status')
 async def subscription_status_ws():
     """
-    تنتظر هذه النقطة رسالة من العميل تحتوي على telegram_id،
-    ثم تستعلم عن حالة الاشتراك للمستخدم وتعيد عبر WebSocket ردًا يتضمن:
-      - الحالة (active/inactive)
-      - رابط الدعوة (إن وجد)
-      - رسالة توضيحية
+    تتعامل مع اتصالات WebSocket لإدارة حالة الاشتراك والإشعارات
     """
-    import json  # تأكد من استيراد json هنا
+    telegram_id = None  # 1. التهيئة المسبقة بقيمة None
+
     try:
-        raw_data = await websocket.receive()
-        data = json.loads(raw_data)
-        telegram_id = data.get("telegram_id")
-        if not telegram_id:
-            await websocket.send(json.dumps({"error": "Missing telegram_id"}))
-            return
+        await quart_websocket.accept()
 
-        db_pool = getattr(current_app, "db_pool", None)
-        if not db_pool:
-            await websocket.send(json.dumps({"error": "Database connection is missing"}))
-            return
+        while True:
+            raw_data = await quart_websocket.receive()
+            data = json.loads(raw_data)
 
-        async with db_pool.acquire() as connection:
-            subscription = await connection.fetchrow("SELECT * FROM subscriptions WHERE telegram_id = $1", telegram_id)
-            if subscription:
-                subscription_type_id = subscription.get("subscription_type_id")
-                channel_result = await add_user_to_channel(telegram_id, subscription_type_id, db_pool)
-                response = {
-                    "status": "active",
-                    "invite_link": channel_result.get("invite_link"),
-                    "message": channel_result.get("message", "Subscription active")
-                }
-                await websocket.send(json.dumps(response))
+            # 2. معالجة إجراء 'register' أولاً
+            if data.get("action") == "register":
+                telegram_id = int(data.get("telegram_id"))  # 3. تعيين القيمة هنا
+                current_app.ws_manager.connections[telegram_id] = quart_websocket
+                await quart_websocket.send(json.dumps({"status": "registered"}))
+
+            # 4. التحقق من وجود telegram_id قبل استخدامه
+            elif data.get("action") == "get_status":
+                if not telegram_id:
+                    await quart_websocket.send(json.dumps({"error": "يجب التسجيل أولاً"}))
+                    continue
+
+                # التحقق من وجود اتصال بقاعدة البيانات
+                db_pool = getattr(current_app, "db_pool", None)
+                if not db_pool:
+                    await quart_websocket.send(json.dumps({
+                        "error": "Database connection is missing",
+                        "message": "خطأ في الخادم الداخلي"
+                    }))
+                    continue
+
+                # استعلام قاعدة البيانات
+                async with db_pool.acquire() as connection:
+                    subscription = await connection.fetchrow(
+                        "SELECT * FROM subscriptions WHERE telegram_id = $1",
+                        telegram_id
+                    )
+
+                    if subscription:
+                        # إنشاء رابط الدعوة
+                        subscription_type_id = subscription.get("subscription_type_id")
+                        channel_result = await add_user_to_channel(
+                            telegram_id,
+                            subscription_type_id,
+                            db_pool
+                        )
+
+                        # إرسال الرد
+                        response = {
+                            "type": "subscription_status",
+                            "status": "active",
+                            "invite_link": channel_result.get("invite_link"),
+                            "message": channel_result.get("message", "اشتراك نشط")
+                        }
+                        await quart_websocket.send(json.dumps(response))
+
+                    else:
+                        await quart_websocket.send(json.dumps({
+                            "type": "subscription_status",
+                            "status": "inactive",
+                            "message": "لم يتم العثور على اشتراك. يرجى التأكد من إتمام عملية الدفع."
+                        }))
+
+            # معالجة الإجراءات غير المعروفة
             else:
-                await websocket.send(json.dumps({
-                    "status": "inactive",
-                    "message": "لم يتم العثور على اشتراك. يرجى التأكد من إتمام عملية الدفع."
+                await quart_websocket.send(json.dumps({
+                    "error": "Invalid action",
+                    "message": "الإجراء المطلوب غير مدعوم"
                 }))
+
     except Exception as e:
-        await websocket.send(json.dumps({"error": str(e)}))
+        logging.error(f"WebSocket error: {str(e)}", exc_info=True)
+        await quart_websocket.send(json.dumps({
+            "error": "internal_error",
+            "message": "حدث خطأ داخلي"
+        }))
+
+
+    finally:
+
+        # 5. التحقق من أن telegram_id ليس None قبل الحذف
+
+        if telegram_id is not None and telegram_id in current_app.ws_manager.connections:
+            del current_app.ws_manager.connections[telegram_id]
+            logging.info(f"🗑️ تم إزالة اتصال المستخدم {telegram_id}")
