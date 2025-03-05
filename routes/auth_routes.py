@@ -16,7 +16,7 @@ def generate_tokens(email, role):
     access_payload = {
         "email": email,
         "role": role,
-        "exp": now + datetime.timedelta(minutes=30)  # توكن مؤقت (30 دقيقة)
+        "exp": now + datetime.timedelta(days=1)  # توكن مؤقت (30 دقيقة)
     }
     refresh_payload = {
         "email": email,

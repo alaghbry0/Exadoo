@@ -7,6 +7,8 @@ from database.db_queries import (
     get_user, add_user, add_subscription, update_subscription, add_scheduled_task
 )
 from utils.db_utils import add_user_to_channel
+import json
+
 
 # إنشاء Blueprint لنقاط API الخاصة بالاشتراكات
 subscriptions_bp = Blueprint("subscriptions", __name__)
@@ -225,6 +227,7 @@ async def subscription_status_ws():
       - رابط الدعوة (إن وجد)
       - رسالة توضيحية
     """
+    import json  # تأكد من استيراد json هنا
     try:
         raw_data = await websocket.receive()
         data = json.loads(raw_data)
