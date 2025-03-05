@@ -7,14 +7,16 @@ import os
 import aiohttp
 from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_orderid
 from pytoniq import LiteBalancer, begin_cell, Address
+from pytoniq.liteclient.client import LiteServerError
+from typing import Optional  # لإضافة تلميحات النوع
 
 # تحميل المتغيرات البيئية
 WEBHOOK_SECRET_BACKEND = os.getenv("WEBHOOK_SECRET")
 subscribe_api_url = os.getenv("SUBSCRIBE_API_URL")
-#BOT_WALLET_ADDRESS = os.getenv("BOT_WALLET_ADDRESS")  # عنوان محفظة البوت (Non‑bounceable)
-TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY")      # مفتاح Toncenter
+TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY")  # مفتاح Toncenter
 
 payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
+
 
 # دالة مساعدة لتوحيد تنسيق العناوين (لأغراض التسجيل فقط)
 def normalize_address(addr_str: str) -> str:
@@ -27,23 +29,33 @@ def normalize_address(addr_str: str) -> str:
         logging.warning(f"❌ فشل تطبيع العنوان {addr_str}: {str(e)}")
         return addr_str.lower().strip()
 
+
 async def parse_transactions(provider: LiteBalancer):
     """
     تقوم هذه الدالة بجلب آخر المعاملات من محفظة البوت وتحليلها.
     """
     logging.info("🔄 بدء parse_transactions...")
-    
+
     # الحصول على عنوان المحفظة من قاعدة البيانات عبر الدالة الجديدة
-    my_wallet_address = await get_bot_wallet_address()
+    my_wallet_address: Optional[str] = await get_bot_wallet_address()
     if not my_wallet_address:
         logging.error("❌ لم يتم تعريف عنوان محفظة البوت في قاعدة البيانات!")
         return
 
+    # استخدام العنوان المُطَبعة عند استعلام المعاملات
     normalized_bot_address = normalize_address(my_wallet_address)
     logging.info(f"🔍 جلب آخر المعاملات من محفظة البوت: {normalized_bot_address}")
-    
+
     try:
-        transactions = await provider.get_transactions(address=my_wallet_address, count=10)
+        try:
+            transactions = await provider.get_transactions(address=normalized_bot_address, count=10)
+        except LiteServerError as e:
+            if e.code == -400:
+                logging.warning("تحذير: Liteserver لم يعثر على المعاملة بالوقت المنطقي المحدد. قد يكون خطأ مؤقتاً.")
+                return
+            else:
+                raise e
+
         logging.info(f"✅ تم جلب {len(transactions)} معاملة.")
 
         for transaction in transactions:
@@ -56,10 +68,11 @@ async def parse_transactions(provider: LiteBalancer):
 
             dest_address = normalize_address(transaction.in_msg.info.dest.to_str(1, 1, 1))
             if dest_address != normalized_bot_address:
-                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
+                logging.info(
+                    f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
                 continue
 
-            # نستخرج عنوان المُرسل لأغراض التسجيل فقط
+            # استخراج عنوان المُرسل لأغراض التسجيل فقط
             sender_wallet_address = transaction.in_msg.info.src.to_str(1, 1, 1)
             normalized_sender = normalize_address(sender_wallet_address)
             value = transaction.in_msg.info.value_coins
@@ -75,7 +88,8 @@ async def parse_transactions(provider: LiteBalancer):
             op_code = body_slice.load_uint(32)
             logging.info(f"📌 OP Code الأساسي: {hex(op_code)}")
             if op_code not in (0xf8a7ea5, 0x7362d09c):
-                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
+                logging.info(
+                    f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
                 continue
 
             body_slice.load_bits(64)  # تخطي query_id
@@ -113,7 +127,8 @@ async def parse_transactions(provider: LiteBalancer):
                 expected_jetton_wallet = normalized_jetton_sender
 
             normalized_expected = normalize_address(expected_jetton_wallet)
-            logging.info(f"🔍 (للتسجيل) مقارنة العناوين: payload={normalized_jetton_sender} vs expected={normalized_expected}")
+            logging.info(
+                f"🔍 (للتسجيل) مقارنة العناوين: payload={normalized_jetton_sender} vs expected={normalized_expected}")
             logging.info("✅ سيتم استخدام orderId للمطابقة مع قاعدة البيانات.")
 
             # استخراج forward payload للتعليق (orderId)
@@ -137,7 +152,8 @@ async def parse_transactions(provider: LiteBalancer):
                         logging.warning(f"⚠️ التعليق في tx_hash: {tx_hash_hex} لا يبدأ بـ 'orderId:' - تجاهل المعاملة.")
                         continue
                 else:
-                    logging.warning(f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
+                    logging.warning(
+                        f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
                     continue
 
             if not order_id_from_payload:
@@ -159,17 +175,20 @@ async def parse_transactions(provider: LiteBalancer):
                 logging.info(f"🔍 الدفعة المعلقة الموجودة: order_id: '{db_order_id}', amount: {db_amount}")
                 logging.info(f"🔍 مقارنة: payload orderId: '{order_id_from_payload}' vs DB orderId: '{db_order_id}'")
                 if db_order_id != order_id_from_payload:
-                    logging.warning(f"⚠️ عدم تطابق orderId: DB '{db_order_id}' vs payload '{order_id_from_payload}' - تجاهل tx_hash: {tx_hash_hex}")
+                    logging.warning(
+                        f"⚠️ عدم تطابق orderId: DB '{db_order_id}' vs payload '{order_id_from_payload}' - تجاهل tx_hash: {tx_hash_hex}")
                     continue
                 if abs(db_amount - jetton_amount) > 1e-9:
-                    logging.warning(f"⚠️ عدم تطابق مبلغ الدفع: DB amount {db_amount} vs jetton_amount {jetton_amount} في tx_hash: {tx_hash_hex} - تجاهل المعاملة.")
+                    logging.warning(
+                        f"⚠️ عدم تطابق مبلغ الدفع: DB amount {db_amount} vs jetton_amount {jetton_amount} في tx_hash: {tx_hash_hex} - تجاهل المعاملة.")
                     continue
 
                 logging.info(f"✅ تطابق بيانات الدفع. متابعة التحديث لـ payment_id: {pending_payment['payment_id']}")
                 tx_hash = tx_hash_hex
                 updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_id'], tx_hash)
                 if updated_payment_data:
-                    logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {pending_payment['payment_id']}، tx_hash: {tx_hash}")
+                    logging.info(
+                        f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {pending_payment['payment_id']}، tx_hash: {tx_hash}")
                     async with aiohttp.ClientSession() as session:
                         headers = {
                             "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
@@ -182,24 +201,29 @@ async def parse_transactions(provider: LiteBalancer):
                             "username": pending_payment['username'],
                             "full_name": pending_payment['full_name'],
                         }
-                        logging.info(f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
+                        logging.info(
+                            f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
                         try:
-                            async with session.post(subscribe_api_url, json=subscription_payload, headers=headers) as response:
+                            async with session.post(subscribe_api_url, json=subscription_payload,
+                                                    headers=headers) as response:
                                 subscribe_response = await response.json()
                                 if response.status == 200:
                                     logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_response}")
                                 else:
-                                    logging.error(f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {subscribe_response}")
+                                    logging.error(
+                                        f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {subscribe_response}")
                         except Exception as e:
                             logging.error(f"❌ استثناء أثناء استدعاء /api/subscribe: {str(e)}")
                 else:
-                    logging.error(f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ payment_id: {pending_payment['payment_id']}")
+                    logging.error(
+                        f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ payment_id: {pending_payment['payment_id']}")
             logging.info(f"📝 Transaction processed: tx_hash: {tx_hash_hex}, lt: {transaction.lt}")
 
     except Exception as e:
         logging.error(f"❌ خطأ أثناء معالجة المعاملات الدورية: {str(e)}", exc_info=True)
     finally:
         logging.info("✅ انتهاء parse_transactions.")
+
 
 async def periodic_check_payments():
     logging.info("⏰ بدء دورة التحقق الدورية من المدفوعات...")
@@ -221,11 +245,13 @@ async def periodic_check_payments():
         logging.info("✅ انتهاء دورة parse_transactions الدورية. سيتم إعادة التشغيل بعد 60 ثانية.")
         await asyncio.sleep(20)
 
+
 @payment_confirmation_bp.before_app_serving
 async def startup():
     logging.info("🚀 بدء مهمة الفحص الدوري للمعاملات في الخلفية...")
     asyncio.create_task(periodic_check_payments())
     logging.info("✅ تم بدء مهمة الفحص الدوري للمعاملات في الخلفية.")
+
 
 @payment_confirmation_bp.route("/api/confirm_payment", methods=["POST"])
 async def confirm_payment():
@@ -285,13 +311,15 @@ async def confirm_payment():
         if result:
             payment_id_db_row = result
             payment_id_db = payment_id_db_row['payment_id']
-            logging.info(f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_id={payment_id_db}, orderId={order_id}")
+            logging.info(
+                f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_id={payment_id_db}, orderId={order_id}")
             logging.info(
                 f"💾 تم تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, orderId={order_id}, "
                 f"planId={plan_id_str}, telegramId={telegram_id}, subscription_plan_id={subscription_plan_id}, payment_id={payment_id_db}, "
                 f"username={telegram_username}, full_name={full_name}, amount={amount}"
             )
-            return jsonify({"message": "Payment confirmation recorded successfully. Waiting for payment processing."}), 200
+            return jsonify(
+                {"message": "Payment confirmation recorded successfully. Waiting for payment processing."}), 200
         else:
             logging.error("❌ فشل تسجيل الدفعة في قاعدة البيانات.")
             return jsonify({"error": "Failed to record payment"}), 500
@@ -299,16 +327,17 @@ async def confirm_payment():
     except Exception as e:
         logging.error(f"❌ خطأ في /api/confirm_payment: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-    
 
-    # إعداد متغيرات للتخزين المؤقت لعناوين المحفظة
+
+# تغيير قيمة timestamp إلى float لتفادي تحذيرات النوع
 _wallet_cache = {
     "address": None,
-    "timestamp": 0
+    "timestamp": 0.0
 }
 WALLET_CACHE_TTL = 60  # زمن التخزين المؤقت بالثواني (مثلاً 60 ثانية)
 
-async def get_bot_wallet_address():
+
+async def get_bot_wallet_address() -> Optional[str]:
     """
     تسترجع عنوان محفظة البوت من جدول wallet في قاعدة البيانات.
     تستخدم التخزين المؤقت لتقليل عدد الاستعلامات.
@@ -325,4 +354,3 @@ async def get_bot_wallet_address():
             _wallet_cache["address"] = None
         _wallet_cache["timestamp"] = now
     return _wallet_cache["address"]
-
