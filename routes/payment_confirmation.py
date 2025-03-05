@@ -196,10 +196,13 @@ async def parse_transactions(provider: LiteBalancer):
                             "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
                             "Content-Type": "application/json"
                         }
+
+                        tx_hash_str = tx_hash.hex()
+
                         subscription_payload = {
                             "telegram_id": pending_payment['telegram_id'],
                             "subscription_plan_id": pending_payment['subscription_plan_id'],
-                            "payment_id": str(tx_hash),  # استخدام tx_hash كـ payment_id
+                            "payment_id": tx_hash_str, # استخدام tx_hash كـ payment_id
                             "username": pending_payment['username'],
                             "full_name": pending_payment['full_name'],
                         }
