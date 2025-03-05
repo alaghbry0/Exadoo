@@ -22,7 +22,6 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
     """
     try:
         async with db_pool.acquire() as connection:
-            # جلب تفاصيل الاشتراك من جدول subscription_types
             subscription_type = await connection.fetchrow(
                 "SELECT channel_id, name FROM subscription_types WHERE id = $1", subscription_type_id
             )
@@ -34,7 +33,6 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
         channel_id = int(subscription_type['channel_id'])
         channel_name = subscription_type['name']
 
-        # التحقق مما إذا كان المستخدم موجودًا بالفعل في القناة
         try:
             member = await telegram_bot.get_chat_member(chat_id=channel_id, user_id=telegram_id)
             if member.status in ['member', 'administrator', 'creator']:
@@ -48,26 +46,25 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
         except TelegramAPIError:
             logging.warning(f"⚠️ المستخدم {telegram_id} غير موجود في القناة {channel_id}.")
 
-        # إزالة الحظر إن وجد
         try:
             await telegram_bot.unban_chat_member(chat_id=channel_id, user_id=telegram_id)
         except TelegramAPIError:
             logging.warning(f"⚠️ لم يتمكن من إزالة الحظر عن المستخدم {telegram_id}.")
 
-        # إنشاء رابط دعوة مع تحديد member_limit=1
         invite_link_obj = await telegram_bot.create_chat_invite_link(
             chat_id=channel_id, member_limit=1
         )
         invite_link = invite_link_obj.invite_link
         logging.info(f"✅ تم إنشاء رابط الدعوة للمستخدم {telegram_id}: {invite_link}")
 
-        # يمكن هنا تحديث سجل الاشتراك في قاعدة البيانات لتخزين invite_link
-        async with db_pool.acquire() as connection:
-            await connection.execute(
-                "UPDATE subscriptions SET invite_link = $1 WHERE telegram_id = $2 AND channel_id = $3",
-                invite_link, telegram_id, channel_id
-            )
+        # التأكد من أن invite_link نصي
+        if invite_link is None:
+            invite_link = ""
+        elif not isinstance(invite_link, str):
+            invite_link = str(invite_link)
+        logging.info(f"Type of invite_link: {type(invite_link)} - Value: {invite_link}")
 
+        # لن نقوم بتحديث قاعدة البيانات بتخزين رابط الدعوة (سيتم إرجاعه فقط)
         return {
             "success": True,
             "already_joined": False,
