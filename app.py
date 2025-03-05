@@ -43,7 +43,7 @@ app.aiohttp_session = None
 
 
 ALLOWED_ORIGINS = [
-  "https://exadooo-git-main-mohammeds-projects-3d2877c6.vercel.app",
+  "https://exadooo-plum.vercel.app/",
   "https://exaado-panel.vercel.app",
   "https://exadoo-rxr9.onrender.com",
 "https://telegram.org"
