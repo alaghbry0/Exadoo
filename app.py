@@ -43,10 +43,10 @@ app.aiohttp_session = None
 
 
 ALLOWED_ORIGINS = [
-  "https://exadooo-plum.vercel.app/",
+  "https://exadooo-plum.vercel.app",
   "https://exaado-panel.vercel.app",
   "https://exadoo-rxr9.onrender.com",
-"https://telegram.org"
+  "https://telegram.org"
 ]
 app = cors(app, allow_origin=ALLOWED_ORIGINS, allow_credentials=True)
 
