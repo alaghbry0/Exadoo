@@ -81,7 +81,7 @@ async def get_user_info():
                 subscription_list.append({
                     "id": sub['subscription_type_id'],
                     "name": sub['subscription_name'],
-                    "price": f"{sub['price']:.2f} دولار/شهر",
+
                     "expiry": expiry_msg,
                     "progress": progress,
                     "status": status,
