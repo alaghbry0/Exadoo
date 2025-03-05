@@ -14,7 +14,7 @@ telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_pool):
     """
     إضافة المستخدم إلى القناة أو توليد رابط دعوة إذا لم يكن موجودًا.
-    تعيد الدالة قاموسًا يحتوي على:
+    تُعيد الدالة قاموسًا يحتوي على:
       - success: حالة العملية (True/False)
       - already_joined: إذا كان المستخدم موجود مسبقاً في القناة
       - invite_link: رابط الدعوة (إن تم توليده)
@@ -57,14 +57,14 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
         invite_link = invite_link_obj.invite_link
         logging.info(f"✅ تم إنشاء رابط الدعوة للمستخدم {telegram_id}: {invite_link}")
 
-        # التأكد من أن invite_link نصي
+        # التأكد من أن invite_link نصي؛ إذا كان None، نعيد سلسلة فارغة
         if invite_link is None:
             invite_link = ""
         elif not isinstance(invite_link, str):
             invite_link = str(invite_link)
         logging.info(f"Type of invite_link: {type(invite_link)} - Value: {invite_link}")
 
-        # لن نقوم بتحديث قاعدة البيانات بتخزين رابط الدعوة (سيتم إرجاعه فقط)
+        # لن نقوم بتحديث قاعدة البيانات لتخزين invite_link
         return {
             "success": True,
             "already_joined": False,
@@ -78,7 +78,6 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
     except Exception as e:
         logging.error(f"❌ خطأ غير متوقع أثناء إضافة المستخدم {telegram_id}: {e}")
         return {"success": False, "error": str(e)}
-
 
 # ----------------- 🔹 إزالة المستخدم من القناة ----------------- #
 
