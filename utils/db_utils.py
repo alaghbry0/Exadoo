@@ -13,20 +13,25 @@ telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_pool):
     """
-    إضافة المستخدم إلى القناة أو إرسال رابط دعوة في حال لم يكن موجودًا.
+    إضافة المستخدم إلى القناة أو توليد رابط دعوة إذا لم يكن موجودًا.
+    تعيد الدالة قاموسًا يحتوي على:
+      - success: حالة العملية (True/False)
+      - already_joined: إذا كان المستخدم موجود مسبقاً في القناة
+      - invite_link: رابط الدعوة (إن تم توليده)
+      - message: رسالة توضيحية
     """
     try:
         async with db_pool.acquire() as connection:
-            # جلب تفاصيل الاشتراك
+            # جلب تفاصيل الاشتراك من جدول subscription_types
             subscription_type = await connection.fetchrow(
                 "SELECT channel_id, name FROM subscription_types WHERE id = $1", subscription_type_id
             )
 
         if not subscription_type:
             logging.error(f"❌ نوع الاشتراك {subscription_type_id} غير موجود.")
-            return False
+            return {"success": False, "error": "Invalid subscription type."}
 
-        channel_id = int(subscription_type['channel_id'])  # تأكد من تحويل channel_id إلى int
+        channel_id = int(subscription_type['channel_id'])
         channel_name = subscription_type['name']
 
         # التحقق مما إذا كان المستخدم موجودًا بالفعل في القناة
@@ -34,8 +39,12 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
             member = await telegram_bot.get_chat_member(chat_id=channel_id, user_id=telegram_id)
             if member.status in ['member', 'administrator', 'creator']:
                 logging.info(f"✅ المستخدم {telegram_id} موجود بالفعل في القناة {channel_id}.")
-                await send_message(telegram_id, f"تم تجديد اشتراكك في قناة {channel_name} بنجاح! 🎉")
-                return True
+                return {
+                    "success": True,
+                    "already_joined": True,
+                    "invite_link": None,
+                    "message": f"تم تجديد اشتراكك في قناة {channel_name} بنجاح!"
+                }
         except TelegramAPIError:
             logging.warning(f"⚠️ المستخدم {telegram_id} غير موجود في القناة {channel_id}.")
 
@@ -45,24 +54,34 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
         except TelegramAPIError:
             logging.warning(f"⚠️ لم يتمكن من إزالة الحظر عن المستخدم {telegram_id}.")
 
-        # إنشاء رابط دعوة
-        invite_link = await telegram_bot.create_chat_invite_link(
+        # إنشاء رابط دعوة مع تحديد member_limit=1
+        invite_link_obj = await telegram_bot.create_chat_invite_link(
             chat_id=channel_id, member_limit=1
         )
+        invite_link = invite_link_obj.invite_link
+        logging.info(f"✅ تم إنشاء رابط الدعوة للمستخدم {telegram_id}: {invite_link}")
 
-        # إرسال رابط الدعوة
-        success = await send_message(
-            telegram_id,
-            f"✅ تم تفعيل اشتراكك بنجاح! يمكنك الانضمام إلى قناة {channel_name} عبر هذا الرابط:\n{invite_link.invite_link}"
-        )
-        return success
+        # يمكن هنا تحديث سجل الاشتراك في قاعدة البيانات لتخزين invite_link
+        async with db_pool.acquire() as connection:
+            await connection.execute(
+                "UPDATE subscriptions SET invite_link = $1 WHERE telegram_id = $2 AND channel_id = $3",
+                invite_link, telegram_id, channel_id
+            )
+
+        return {
+            "success": True,
+            "already_joined": False,
+            "invite_link": invite_link,
+            "message": f"تم تفعيل اشتراكك بنجاح! يمكنك الانضمام إلى قناة {channel_name} عبر الرابط المقدم."
+        }
 
     except TelegramAPIError as e:
-        logging.error(f"❌ خطأ أثناء إرسال رابط الدعوة للمستخدم {telegram_id}: {e}")
-        return False
+        logging.error(f"❌ خطأ أثناء إنشاء رابط الدعوة للمستخدم {telegram_id}: {e}")
+        return {"success": False, "error": str(e)}
     except Exception as e:
         logging.error(f"❌ خطأ غير متوقع أثناء إضافة المستخدم {telegram_id}: {e}")
-        return False
+        return {"success": False, "error": str(e)}
+
 
 # ----------------- 🔹 إزالة المستخدم من القناة ----------------- #
 

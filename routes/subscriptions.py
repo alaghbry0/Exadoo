@@ -171,41 +171,88 @@ async def subscribe():
                 logging.info(f"✅ New subscription created for {telegram_id} until {new_expiry}")
 
             # ✅ إضافة المستخدم إلى القناة
-            user_added = await add_user_to_channel(telegram_id, subscription_plan["subscription_type_id"], db_pool)
-            if not user_added:
-                logging.error(f"❌ Failed to add user {telegram_id} to channel {channel_id}")
+                # توليد رابط الدعوة وتحديث سجل الاشتراك في قاعدة البيانات
+                channel_result = await add_user_to_channel(telegram_id, subscription_plan["subscription_type_id"],
+                                                           db_pool)
+                invite_link = channel_result.get("invite_link")
 
-            # ✅ جدولة التذكيرات
-            reminders = [
-                ("first_reminder", new_expiry - timedelta(minutes=30 if IS_DEVELOPMENT else 1440)),  # 24 ساعة
-                ("second_reminder", new_expiry - timedelta(minutes=15 if IS_DEVELOPMENT else 60)),  # 1 ساعة
-                ("remove_user", new_expiry),
-            ]
+                # جدولة التذكيرات (مثال، يمكن تعديلها حسب الحاجة)
+                reminders = [
+                    ("first_reminder", new_expiry - timedelta(minutes=30 if IS_DEVELOPMENT else 1440)),
+                    # 24 ساعة قبل انتهاء الاشتراك
+                    ("second_reminder", new_expiry - timedelta(minutes=15 if IS_DEVELOPMENT else 60)),
+                    # 1 ساعة قبل انتهاء الاشتراك
+                    ("remove_user", new_expiry),
+                ]
+                for task_type, execute_time in reminders:
+                    if execute_time.tzinfo is None:
+                        execute_time = execute_time.replace(tzinfo=timezone.utc)
+                    execute_time_local = execute_time.astimezone(LOCAL_TZ)
+                    await add_scheduled_task(
+                        connection,
+                        task_type,
+                        telegram_id,
+                        channel_id,
+                        execute_time
+                    )
+                    logging.info(f"📅 Scheduled '{task_type}' at {execute_time_local}")
 
-            for task_type, execute_time in reminders:
-                if execute_time.tzinfo is None:
-                    execute_time = execute_time.replace(tzinfo=timezone.utc)
-                execute_time_local = execute_time.astimezone(LOCAL_TZ)
+                # تحويل تواريخ البداية والانتهاء إلى التوقيت المحلي (UTC+3)
+                start_date_local = start_date.astimezone(LOCAL_TZ)
+                new_expiry_local = new_expiry.astimezone(LOCAL_TZ)
 
-                await add_scheduled_task(
-                    connection,
-                    task_type,
-                    telegram_id,
-                    channel_id,
-                    execute_time
-                )
-                logging.info(f"📅 Scheduled '{task_type}' at {execute_time_local}")
-
-            # ✅ تحويل `start_date` و `new_expiry` إلى التوقيت المحلي (UTC+3)
-            start_date_local = start_date.astimezone(LOCAL_TZ)
-            new_expiry_local = new_expiry.astimezone(LOCAL_TZ)
-
-            return jsonify({
-                "message": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
-                "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
-                "start_date": start_date_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')
-            }), 200
+                # إعداد الرد النهائي بصيغة JSON، بما في ذلك رابط الدعوة
+                response_data = {
+                    "message": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
+                    "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
+                    "start_date": start_date_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
+                    "invite_link": invite_link
+                }
+                return jsonify(response_data), 200
 
     except Exception as e:
         logging.error(f"❌ Critical error in /api/subscribe: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
+
+
+@subscriptions_bp.websocket('/ws/subscription_status')
+async def subscription_status_ws():
+    """
+    تنتظر هذه النقطة رسالة من العميل تحتوي على telegram_id،
+    ثم تستعلم عن حالة الاشتراك للمستخدم وتعيد عبر WebSocket ردًا يتضمن:
+      - الحالة (active/inactive)
+      - رابط الدعوة (إن وجد)
+      - رسالة توضيحية
+    """
+    try:
+        raw_data = await websocket.receive()
+        data = json.loads(raw_data)
+        telegram_id = data.get("telegram_id")
+        if not telegram_id:
+            await websocket.send(json.dumps({"error": "Missing telegram_id"}))
+            return
+
+        db_pool = getattr(current_app, "db_pool", None)
+        if not db_pool:
+            await websocket.send(json.dumps({"error": "Database connection is missing"}))
+            return
+
+        async with db_pool.acquire() as connection:
+            subscription = await connection.fetchrow("SELECT * FROM subscriptions WHERE telegram_id = $1", telegram_id)
+            if subscription:
+                subscription_type_id = subscription.get("subscription_type_id")
+                channel_result = await add_user_to_channel(telegram_id, subscription_type_id, db_pool)
+                response = {
+                    "status": "active",
+                    "invite_link": channel_result.get("invite_link"),
+                    "message": channel_result.get("message", "Subscription active")
+                }
+                await websocket.send(json.dumps(response))
+            else:
+                await websocket.send(json.dumps({
+                    "status": "inactive",
+                    "message": "لم يتم العثور على اشتراك. يرجى التأكد من إتمام عملية الدفع."
+                }))
+    except Exception as e:
+        await websocket.send(json.dumps({"error": str(e)}))
