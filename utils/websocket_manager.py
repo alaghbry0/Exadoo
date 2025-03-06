@@ -1,15 +1,14 @@
 import json
 import logging
 from typing import Dict, Any
-from quart.websocket import WebSocket
+from quart import websocket  # التعديل هنا
 
 
 class WebSocketManager:
     def __init__(self):
-        self.connections: Dict[str, WebSocket] = {}  # تغيير النوع إلى str
+        self.connections: Dict[str, websocket.WebSocket] = {}  # استخدام websocket.WebSocket
 
     async def send_to_user(self, telegram_id: int, message: dict):
-        # تحويل الـ telegram_id إلى سلسلة لتتناسب مع مفتاح القاموس
         str_id = str(telegram_id)
         connection = self.connections.get(str_id)
 
