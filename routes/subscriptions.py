@@ -1,13 +1,14 @@
 import logging
 import pytz
 import os
-from quart import Blueprint, request, jsonify, current_app, websocket
+from quart import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta, timezone
 from database.db_queries import (
     get_user, add_user, add_subscription, update_subscription, add_scheduled_task
 )
 from utils.db_utils import add_user_to_channel
 import json
+from quart import websocket as quart_websocket
 
 
 # إنشاء Blueprint لنقاط API الخاصة بالاشتراكات
@@ -195,9 +196,9 @@ async def subscribe():
 @subscriptions_bp.websocket('/ws/subscription_status')
 async def subscription_status_ws():
     """
-    تتعامل مع اتصالات WebSocket لإدارة حالة الاشتراك والإشعارات
+    تتعامل مع اتصالات WebSocket لإدارة حالة الاشتراك والإشعارات.
     """
-    telegram_id = None  # 1. التهيئة المسبقة بقيمة None
+    telegram_id = None  # تهيئة المتغير إلى None
 
     try:
         await quart_websocket.accept()
@@ -205,20 +206,19 @@ async def subscription_status_ws():
         while True:
             raw_data = await quart_websocket.receive()
             data = json.loads(raw_data)
+            action = data.get("action")
 
-            # 2. معالجة إجراء 'register' أولاً
-            if data.get("action") == "register":
-                telegram_id = int(data.get("telegram_id"))  # 3. تعيين القيمة هنا
+            if action == "register":
+                # عند تسجيل العميل، نحصل على telegram_id ونربط الاتصال مع مدير WebSocket
+                telegram_id = int(data.get("telegram_id"))
                 current_app.ws_manager.connections[telegram_id] = quart_websocket
                 await quart_websocket.send(json.dumps({"status": "registered"}))
 
-            # 4. التحقق من وجود telegram_id قبل استخدامه
-            elif data.get("action") == "get_status":
-                if not telegram_id:
+            elif action == "get_status":
+                if telegram_id is None:
                     await quart_websocket.send(json.dumps({"error": "يجب التسجيل أولاً"}))
                     continue
 
-                # التحقق من وجود اتصال بقاعدة البيانات
                 db_pool = getattr(current_app, "db_pool", None)
                 if not db_pool:
                     await quart_websocket.send(json.dumps({
@@ -227,23 +227,14 @@ async def subscription_status_ws():
                     }))
                     continue
 
-                # استعلام قاعدة البيانات
                 async with db_pool.acquire() as connection:
                     subscription = await connection.fetchrow(
-                        "SELECT * FROM subscriptions WHERE telegram_id = $1",
-                        telegram_id
+                        "SELECT * FROM subscriptions WHERE telegram_id = $1", telegram_id
                     )
 
                     if subscription:
-                        # إنشاء رابط الدعوة
                         subscription_type_id = subscription.get("subscription_type_id")
-                        channel_result = await add_user_to_channel(
-                            telegram_id,
-                            subscription_type_id,
-                            db_pool
-                        )
-
-                        # إرسال الرد
+                        channel_result = await add_user_to_channel(telegram_id, subscription_type_id, db_pool)
                         response = {
                             "type": "subscription_status",
                             "status": "active",
@@ -251,15 +242,12 @@ async def subscription_status_ws():
                             "message": channel_result.get("message", "اشتراك نشط")
                         }
                         await quart_websocket.send(json.dumps(response))
-
                     else:
                         await quart_websocket.send(json.dumps({
                             "type": "subscription_status",
                             "status": "inactive",
                             "message": "لم يتم العثور على اشتراك. يرجى التأكد من إتمام عملية الدفع."
                         }))
-
-            # معالجة الإجراءات غير المعروفة
             else:
                 await quart_websocket.send(json.dumps({
                     "error": "Invalid action",
@@ -272,12 +260,7 @@ async def subscription_status_ws():
             "error": "internal_error",
             "message": "حدث خطأ داخلي"
         }))
-
-
     finally:
-
-        # 5. التحقق من أن telegram_id ليس None قبل الحذف
-
         if telegram_id is not None and telegram_id in current_app.ws_manager.connections:
             del current_app.ws_manager.connections[telegram_id]
             logging.info(f"🗑️ تم إزالة اتصال المستخدم {telegram_id}")
