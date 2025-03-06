@@ -199,12 +199,18 @@ async def parse_transactions(provider: LiteBalancer):
                             "Content-Type": "application/json"
                         }
 
-                        tx_hash_str = tx_hash.hex()
+                        tx_hash_hex: str = transaction.cell.hash.hex()
+                        tx_hash: str = tx_hash_hex  # تأكيد النوع
+
+                        # تحقق صارم من النوع (اختياري)
+                        if not isinstance(tx_hash, str):
+                            logging.error(f"نوع tx_hash غير متوقع: {type(tx_hash)}")
+                            continue
 
                         subscription_payload = {
                             "telegram_id": pending_payment['telegram_id'],
                             "subscription_plan_id": pending_payment['subscription_plan_id'],
-                            "payment_id": tx_hash_str, # استخدام tx_hash كـ payment_id
+                            "payment_id": tx_hash, # استخدام tx_hash كـ payment_id
                             "username": pending_payment['username'],
                             "full_name": pending_payment['full_name'],
                         }
