@@ -225,17 +225,19 @@ async def parse_transactions(provider: LiteBalancer):
 
                                     # إرسال إشعار WebSocket هنا
                                     try:
-                                        await current_app.ws_manager.send_to_user(
-                                            telegram_id=pending_payment['telegram_id'],
-                                            message={
-                                                "type": "subscription_success",
-                                                "data": {
-                                                    "invite_link": subscribe_data.get("invite_link"),
-                                                    "message": subscribe_data.get("formatted_message"),
-                                                    "telegram_id": pending_payment['telegram_id']
+
+                                            await current_app.ws_manager.send_to_user(
+                                                telegram_id=pending_payment['telegram_id'],
+                                                message={
+                                                    "type": "subscription_success",
+                                                    "data": {
+                                                        "invite_link": subscribe_data.get("invite_link"),
+                                                        "message": subscribe_data.get("formatted_message"),
+                                                        "telegram_id": str(pending_payment['telegram_id'])
+
                                                 }
                                             }
-                                        )
+                                                )
                                     except Exception as e:
                                         logging.error(f"❌ فشل إرسال إشعار WebSocket: {e}")
                                 else:

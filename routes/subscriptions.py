@@ -209,58 +209,98 @@ async def subscription_status_ws():
             action = data.get("action")
 
             if action == "register":
-                # عند تسجيل العميل، نحصل على telegram_id ونربط الاتصال مع مدير WebSocket
-                telegram_id = int(data.get("telegram_id"))
-                current_app.ws_manager.connections[telegram_id] = quart_websocket
-                await quart_websocket.send(json.dumps({"status": "registered"}))
+                try:
+                    # التحويل إلى سلسلة نصية وربط الاتصال
+                    telegram_id = str(data.get("telegram_id"))  # التعديل هنا
+                    current_app.ws_manager.connections[telegram_id] = quart_websocket
+                    await quart_websocket.send(json.dumps({"status": "registered"}))
+                    logging.info(f"✅ تسجيل مستخدم جديد: {telegram_id}")
+
+                except Exception as e:
+                    error_msg = f"❌ خطأ في تسجيل المستخدم: {str(e)}"
+                    await quart_websocket.send(json.dumps({
+                        "error": "invalid_registration",
+                        "message": "خطأ في تسجيل الهوية"
+                    }))
+                    logging.error(error_msg)
+                    continue
 
             elif action == "get_status":
-                if telegram_id is None:
-                    await quart_websocket.send(json.dumps({"error": "يجب التسجيل أولاً"}))
+                if not telegram_id:
+                    await quart_websocket.send(json.dumps({
+                        "error": "unregistered_user",
+                        "message": "يجب التسجيل أولاً"
+                    }))
                     continue
 
                 db_pool = getattr(current_app, "db_pool", None)
                 if not db_pool:
                     await quart_websocket.send(json.dumps({
-                        "error": "Database connection is missing",
-                        "message": "خطأ في الخادم الداخلي"
+                        "error": "database_error",
+                        "message": "خطأ في الاتصال بقاعدة البيانات"
                     }))
                     continue
 
-                async with db_pool.acquire() as connection:
-                    subscription = await connection.fetchrow(
-                        "SELECT * FROM subscriptions WHERE telegram_id = $1", telegram_id
-                    )
+                try:
+                    async with db_pool.acquire() as connection:
+                        # استخدام الـ telegram_id كسلسلة في الاستعلام
+                        subscription = await connection.fetchrow(
+                            "SELECT * FROM subscriptions WHERE telegram_id = $1",
+                            str(telegram_id)  # التعديل هنا
+                        )
 
-                    if subscription:
-                        subscription_type_id = subscription.get("subscription_type_id")
-                        channel_result = await add_user_to_channel(telegram_id, subscription_type_id, db_pool)
-                        response = {
-                            "type": "subscription_status",
-                            "status": "active",
-                            "invite_link": channel_result.get("invite_link"),
-                            "message": channel_result.get("message", "اشتراك نشط")
-                        }
+                        if subscription:
+                            subscription_type_id = subscription.get("subscription_type_id")
+                            channel_result = await add_user_to_channel(
+                                int(telegram_id),  # تحويل للـ int إذا لزم الأمر
+                                subscription_type_id,
+                                db_pool
+                            )
+                            response = {
+                                "type": "subscription_status",
+                                "status": "active",
+                                "invite_link": channel_result.get("invite_link"),
+                                "message": channel_result.get("message", "اشتراك نشط")
+                            }
+                        else:
+                            response = {
+                                "type": "subscription_status",
+                                "status": "inactive",
+                                "message": "لم يتم العثور على اشتراك"
+                            }
+
                         await quart_websocket.send(json.dumps(response))
-                    else:
-                        await quart_websocket.send(json.dumps({
-                            "type": "subscription_status",
-                            "status": "inactive",
-                            "message": "لم يتم العثور على اشتراك. يرجى التأكد من إتمام عملية الدفع."
-                        }))
+
+                except Exception as e:
+                    error_msg = f"❌ خطأ في استعلام قاعدة البيانات: {str(e)}"
+                    await quart_websocket.send(json.dumps({
+                        "error": "query_failed",
+                        "message": "فشل في استرداد البيانات"
+                    }))
+                    logging.error(error_msg)
+
             else:
                 await quart_websocket.send(json.dumps({
-                    "error": "Invalid action",
+                    "error": "invalid_action",
                     "message": "الإجراء المطلوب غير مدعوم"
                 }))
+
+    except json.JSONDecodeError:
+        error_msg = "❌ تنسيق بيانات غير صحيح"
+        await quart_websocket.send(json.dumps({
+            "error": "invalid_format",
+            "message": "بيانات الطلب غير صالحة"
+        }))
+        logging.error(error_msg)
 
     except Exception as e:
         logging.error(f"WebSocket error: {str(e)}", exc_info=True)
         await quart_websocket.send(json.dumps({
-            "error": "internal_error",
-            "message": "حدث خطأ داخلي"
+            "error": "server_error",
+            "message": "حدث خطأ غير متوقع"
         }))
+
     finally:
-        if telegram_id is not None and telegram_id in current_app.ws_manager.connections:
+        if telegram_id and telegram_id in current_app.ws_manager.connections:
             del current_app.ws_manager.connections[telegram_id]
             logging.info(f"🗑️ تم إزالة اتصال المستخدم {telegram_id}")
