@@ -208,11 +208,11 @@ async def parse_transactions(provider: LiteBalancer):
                             continue
 
                         subscription_payload = {
-                            "telegram_id": pending_payment['telegram_id'],
+                            "telegram_id": int(pending_payment['telegram_id']),
                             "subscription_plan_id": pending_payment['subscription_plan_id'],
                             "payment_id": tx_hash, # استخدام tx_hash كـ payment_id
-                            "username": pending_payment['username'],
-                            "full_name": pending_payment['full_name'],
+                            "username": str(pending_payment['username']),
+                            "full_name": str(pending_payment['full_name']),
                         }
                         logging.info(
                             f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
