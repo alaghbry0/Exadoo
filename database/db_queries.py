@@ -294,24 +294,62 @@ async def get_user_subscriptions(connection, telegram_id: int):
 
 
 # db_queries.py - record_payment function signature
-async def record_payment(conn, telegram_id, user_wallet_address, amount, subscription_plan_id, username=None, full_name=None, order_id=None): # ✅ إضافة order_id كمعامل
-    """تسجيل بيانات الدفع والمستخدم في قاعدة البيانات كدفعة معلقة."""
+async def record_payment(
+        conn,
+        telegram_id,
+        user_wallet_address,
+        amount,
+        subscription_plan_id,
+        username=None,
+        full_name=None,
+        order_id=None,
+        payment_token=None  # إضافة المعامل الجديد
+):
+    """تسجيل بيانات الدفع مع payment_token الفريد"""
     try:
         sql = """
-            INSERT INTO payments (user_id, subscription_plan_id, amount, payment_date, telegram_id, username, full_name, user_wallet_address, status, order_id) -- ✅ إضافة عمود order_id
-            VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, 'pending', $8) -- ✅ إضافة $8 (order_id) إلى قائمة القيم
+            INSERT INTO payments (
+                user_id, 
+                subscription_plan_id, 
+                amount, 
+                payment_date, 
+                telegram_id, 
+                username, 
+                full_name, 
+                user_wallet_address, 
+                status, 
+                order_id,
+                payment_token  -- العموم الجديد
+            )
+            VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, 'pending', $8, $9)
             RETURNING payment_id, payment_date;
         """
-        result = await conn.fetchrow(sql, telegram_id, subscription_plan_id, amount, telegram_id, username, full_name, user_wallet_address, order_id) # ✅ تمرير order_id إلى الاستعلام
+        result = await conn.fetchrow(
+            sql,
+            telegram_id,
+            subscription_plan_id,
+            amount,
+            telegram_id,
+            username,
+            full_name,
+            user_wallet_address,
+            order_id,
+            payment_token  # القيمة الجديدة
+        )
+
         if result:
-            payment_id, payment_date = result['payment_id'], result['payment_date']
-            logging.info(f"✅ تم تسجيل دفعة معلقة جديدة بنجاح في قاعدة البيانات. معرف الدفع: {payment_id}, تاريخ الدفع: {payment_date}, order_id: {order_id}") # ✅ تسجيل order_id في السجل
-            return {"payment_id": payment_id, "payment_date": payment_date}
+            logging.info(f"✅ تم تسجيل الدفعة: {payment_token}")
+            return {
+                "payment_id": result["payment_id"],
+                "payment_token": payment_token,
+                "payment_date": result["payment_date"]
+            }
         else:
-            logging.error("❌ فشل تسجيل دفعة معلقة في قاعدة البيانات.")
+            logging.error("❌ فشل إدخال الدفعة")
             return None
+
     except Exception as e:
-        logging.error(f"❌ خطأ أثناء تسجيل الدفع في قاعدة البيانات: {e}", exc_info=True)
+        logging.error(f"❌ خطأ في record_payment: {str(e)}")
         return None
 
 async def update_payment_with_txhash(conn, payment_id: str, tx_hash: str) -> Optional[dict]:
@@ -369,3 +407,14 @@ async def fetch_pending_payment_by_orderid(conn, order_id: str) -> Optional[dict
         logging.error(f"❌ فشل في جلب سجل الدفع المعلق: {e}", exc_info=True)
         return None
 
+
+async def validate_payment_owner(conn, payment_token: str, telegram_id: int) -> bool:
+    result = await conn.fetchrow(
+        """SELECT 1 FROM payments 
+        WHERE payment_token = $1 
+        AND telegram_id = $2 
+        AND status = 'pending'""",
+        payment_token,
+        telegram_id
+    )
+    return bool(result)

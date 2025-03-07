@@ -8,7 +8,7 @@ from database.db_queries import (
 )
 from utils.db_utils import add_user_to_channel
 import json
-from quart import websocket as quart_websocket
+from server.redis_manager import redis_manager
 
 
 # إنشاء Blueprint لنقاط API الخاصة بالاشتراكات
@@ -39,16 +39,25 @@ async def subscribe():
         telegram_id = data.get("telegram_id")
         subscription_plan_id = data.get("subscription_plan_id")
         payment_id = data.get("payment_id")
+        payment_token = data.get("payment_token")  # قراءة payment_token من البيانات الواردة
         username = data.get("username", None)
         full_name = data.get("full_name", None)
 
-        logging.info(f"📥 Received subscription request: telegram_id={telegram_id}, subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
+        logging.info(f"📥 Received subscription request: telegram_id={telegram_id}, "
+                     f"subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
 
         if not isinstance(telegram_id, int) or not isinstance(subscription_plan_id, int) or not isinstance(payment_id, str):
-            logging.error(f"❌ Invalid data format: telegram_id={telegram_id}, subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
+            logging.error(f"❌ Invalid data format: telegram_id={telegram_id}, "
+                          f"subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
             return jsonify({"error": "Invalid data format"}), 400
 
-        logging.info(f"✅ استلام طلب اشتراك: telegram_id={telegram_id}, subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
+        # التأكد من وجود payment_token
+        if not payment_token:
+            logging.error("❌ Missing payment_token in the request data")
+            return jsonify({"error": "Missing payment_token"}), 400
+
+        logging.info(f"✅ استلام طلب اشتراك: telegram_id={telegram_id}, "
+                     f"subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
 
         db_pool = getattr(current_app, "db_pool", None)
         if not db_pool:
@@ -186,6 +195,16 @@ async def subscribe():
                 "formatted_message": f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
             }
 
+            # نشر الحدث عبر Redis باستخدام payment_token
+            await redis_manager.publish_event(
+                f"payment_{payment_token}",
+                {
+                    'status': 'success',
+                    'invite_link': invite_link,
+                    'message': response_data['message']
+                }
+            )
+
             return jsonify(response_data), 200
 
     except Exception as e:
@@ -193,114 +212,143 @@ async def subscribe():
         return jsonify({"error": "Internal server error"}), 500
 
 
+
 @subscriptions_bp.websocket('/ws/subscription_status')
 async def subscription_status_ws():
     """
     تتعامل مع اتصالات WebSocket لإدارة حالة الاشتراك والإشعارات.
     """
-    telegram_id = None  # تهيئة المتغير إلى None
+    telegram_id = None
+    remote_addr = "unknown"
 
     try:
         await quart_websocket.accept()
+        remote_addr = quart_websocket.remote_addr
+        logging.info(f"🔗 اتصال جديد من {remote_addr}")
 
         while True:
-            raw_data = await quart_websocket.receive()
-            data = json.loads(raw_data)
-            action = data.get("action")
+            try:
+                # انتظار البيانات مع مهلة 5 دقائق
+                raw_data = await asyncio.wait_for(quart_websocket.receive(), timeout=300)
+                data = json.loads(raw_data)
+                action = data.get("action")
 
-            if action == "register":
-                try:
-                    # التحويل إلى سلسلة نصية وربط الاتصال
-                    telegram_id = str(data.get("telegram_id"))  # التعديل هنا
-                    current_app.ws_manager.connections[telegram_id] = quart_websocket
-                    await quart_websocket.send(json.dumps({"status": "registered"}))
-                    logging.info(f"✅ تسجيل مستخدم جديد: {telegram_id}")
-
-                except Exception as e:
-                    error_msg = f"❌ خطأ في تسجيل المستخدم: {str(e)}"
+                if action == "ping":
                     await quart_websocket.send(json.dumps({
-                        "error": "invalid_registration",
-                        "message": "خطأ في تسجيل الهوية"
-                    }))
-                    logging.error(error_msg)
-                    continue
-
-            elif action == "get_status":
-                if not telegram_id:
-                    await quart_websocket.send(json.dumps({
-                        "error": "unregistered_user",
-                        "message": "يجب التسجيل أولاً"
+                        "action": "pong",
+                        "timestamp": datetime.datetime.now().isoformat()
                     }))
                     continue
 
-                db_pool = getattr(current_app, "db_pool", None)
-                if not db_pool:
-                    await quart_websocket.send(json.dumps({
-                        "error": "database_error",
-                        "message": "خطأ في الاتصال بقاعدة البيانات"
-                    }))
-                    continue
+                if action == "register":
+                    try:
+                        telegram_id = str(data.get("telegram_id"))
+                        if not telegram_id.isdigit():
+                            raise ValueError("معرّف تليجرام غير صحيح")
 
-                try:
-                    async with db_pool.acquire() as connection:
-                        # استخدام الـ telegram_id كسلسلة في الاستعلام
-                        subscription = await connection.fetchrow(
-                            "SELECT * FROM subscriptions WHERE telegram_id = $1",
-                            str(telegram_id)  # التعديل هنا
-                        )
+                        current_app.ws_manager.connections[telegram_id] = quart_websocket
+                        await quart_websocket.send(json.dumps({
+                            "status": "registered",
+                            "telegram_id": telegram_id,
+                            "server_time": datetime.datetime.now().isoformat()
+                        }))
+                        logging.info(f"✅ تسجيل ناجح: {telegram_id} من {remote_addr}")
 
-                        if subscription:
-                            subscription_type_id = subscription.get("subscription_type_id")
-                            channel_result = await add_user_to_channel(
-                                int(telegram_id),  # تحويل للـ int إذا لزم الأمر
-                                subscription_type_id,
-                                db_pool
+                    except Exception as e:
+                        error_msg = f"❌ فشل التسجيل: {str(e)}"
+                        await quart_websocket.send(json.dumps({
+                            "error": "invalid_registration",
+                            "message": "فشل في عملية التسجيل",
+                            "details": str(e)
+                        }))
+                        logging.error(f"{error_msg} - {remote_addr}")
+                        continue
+
+                elif action == "get_status":
+                    if not telegram_id:
+                        await quart_websocket.send(json.dumps({
+                            "error": "unregistered_user",
+                            "message": "يجب إتمام عملية التسجيل أولاً"
+                        }))
+                        continue
+
+                    try:
+                        db_pool = current_app.db_pool
+                        if not db_pool:
+                            raise ConnectionError("اتصال قاعدة البيانات غير متاح")
+
+                        async with db_pool.acquire() as conn:
+                            # استعلام آمن مع التحقق من النوع
+                            subscription = await conn.fetchrow(
+                                "SELECT * FROM subscriptions WHERE telegram_id = $1::BIGINT",
+                                int(telegram_id)
                             )
-                            response = {
-                                "type": "subscription_status",
-                                "status": "active",
-                                "invite_link": channel_result.get("invite_link"),
-                                "message": channel_result.get("message", "اشتراك نشط")
-                            }
-                        else:
-                            response = {
-                                "type": "subscription_status",
-                                "status": "inactive",
-                                "message": "لم يتم العثور على اشتراك"
-                            }
 
-                        await quart_websocket.send(json.dumps(response))
+                            if subscription:
+                                subscription_type_id = subscription.get("subscription_type_id")
+                                channel_result = await add_user_to_channel(
+                                    int(telegram_id),
+                                    subscription_type_id,
+                                    db_pool
+                                )
+                                response = {
+                                    "type": "subscription_status",
+                                    "status": "active",
+                                    "invite_link": channel_result.get("invite_link", ""),
+                                    "expiry_date": subscription.get("expiry_date").isoformat(),
+                                    "message": channel_result.get("message", "اشتراك نشط")
+                                }
+                            else:
+                                response = {
+                                    "type": "subscription_status",
+                                    "status": "inactive",
+                                    "message": "لا يوجد اشتراك فعال"
+                                }
 
-                except Exception as e:
-                    error_msg = f"❌ خطأ في استعلام قاعدة البيانات: {str(e)}"
+                            await quart_websocket.send(json.dumps(response, ensure_ascii=False))
+
+                    except Exception as e:
+                        error_msg = f"❌ خطأ في استعلام البيانات: {str(e)}"
+                        await quart_websocket.send(json.dumps({
+                            "error": "database_error",
+                            "message": "خطأ في استرجاع البيانات",
+                            "details": str(e)[:100]
+                        }))
+                        logging.error(f"{error_msg} - {remote_addr}")
+
+                else:
                     await quart_websocket.send(json.dumps({
-                        "error": "query_failed",
-                        "message": "فشل في استرداد البيانات"
+                        "error": "invalid_action",
+                        "message": "الإجراء المطلوب غير مدعوم",
+                        "supported_actions": ["register", "get_status", "ping"]
                     }))
-                    logging.error(error_msg)
 
-            else:
+            except asyncio.TimeoutError:
                 await quart_websocket.send(json.dumps({
-                    "error": "invalid_action",
-                    "message": "الإجراء المطلوب غير مدعوم"
+                    "action": "keepalive",
+                    "timestamp": datetime.datetime.now().isoformat()
                 }))
+                logging.debug(f"⏳ إشعار حيوية مرسل إلى {remote_addr}")
 
-    except json.JSONDecodeError:
-        error_msg = "❌ تنسيق بيانات غير صحيح"
-        await quart_websocket.send(json.dumps({
-            "error": "invalid_format",
-            "message": "بيانات الطلب غير صالحة"
-        }))
-        logging.error(error_msg)
+            except json.JSONDecodeError:
+                error_msg = "تنسيق JSON غير صالح"
+                await quart_websocket.send(json.dumps({
+                    "error": "invalid_format",
+                    "message": "بيانات الطلب غير صحيحة"
+                }))
+                logging.error(f"❌ {error_msg} - {remote_addr}")
 
     except Exception as e:
-        logging.error(f"WebSocket error: {str(e)}", exc_info=True)
+        logging.error(f"🔥 خطأ رئيسي: {str(e)} - {remote_addr}", exc_info=True)
         await quart_websocket.send(json.dumps({
-            "error": "server_error",
+            "error": "critical_error",
             "message": "حدث خطأ غير متوقع"
         }))
 
     finally:
-        if telegram_id and telegram_id in current_app.ws_manager.connections:
-            del current_app.ws_manager.connections[telegram_id]
-            logging.info(f"🗑️ تم إزالة اتصال المستخدم {telegram_id}")
+        if telegram_id:
+            try:
+                del current_app.ws_manager.connections[telegram_id]
+                logging.info(f"🗑️ اتصال مغلق: {telegram_id} - {remote_addr}")
+            except KeyError:
+                pass

@@ -10,21 +10,23 @@ class WebSocketManager:
 
     async def send_to_user(self, telegram_id: int, message: dict):
         str_id = str(telegram_id)
-        connection = self.connections.get(str_id)
-
-        if not connection:
+        if str_id not in self.connections:
             logging.warning(f"⚠️ لا يوجد اتصال نشط للمستخدم {telegram_id}")
             return
 
+        connection = self.connections[str_id]
+
         try:
-            if not connection.closed:
-                await connection.send(json.dumps(message))
-                logging.info(f"✅ تم إرسال إشعار إلى المستخدم {telegram_id}")
-            else:
-                logging.warning(f"⚠️ اتصال WebSocket مغلق للمستخدم {telegram_id}")
+            if connection.closed:
+                logging.warning(f"اتصال مغلق - إزالته من السجلات")
                 del self.connections[str_id]
+                return
+
+            await connection.send(json.dumps(message))
+            logging.info(f"✅ إشعار مرسل بنجاح لـ {telegram_id}")
+
         except Exception as e:
-            logging.error(f"❌ فشل الإرسال للمستخدم {telegram_id}: {e}")
+            logging.error(f"❌ فشل الإرسال: {str(e)}")
             del self.connections[str_id]
 
 

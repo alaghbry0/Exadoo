@@ -1,4 +1,4 @@
-import uuid
+from uuid import uuid4
 import logging
 import asyncio
 from quart import Blueprint, request, jsonify, current_app
@@ -9,8 +9,9 @@ from database.db_queries import record_payment, update_payment_with_txhash, fetc
 from pytoniq import LiteBalancer, begin_cell, Address
 from pytoniq.liteclient.client import LiteServerError
 from typing import Optional  # لإضافة تلميحات النوع
-from utils.websocket_manager import init_websocket_manager
-from quart import websocket as quart_websocket
+from server.redis_manager import redis_manager
+from asyncpg.exceptions import UniqueViolationError
+from config import DATABASE_CONFIG
 
 # تحميل المتغيرات البيئية
 WEBHOOK_SECRET_BACKEND = os.getenv("WEBHOOK_SECRET")
@@ -20,18 +21,44 @@ TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY")  # مفتاح Toncenter
 payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 
 
-# دالة مساعدة لتوحيد تنسيق العناوين (لأغراض التسجيل فقط)
 def normalize_address(addr_str: str) -> str:
+    """
+    دالة مساعدة لتوحيد تنسيق العناوين (لأغراض التسجيل فقط)
+    """
     try:
-        # إذا كان العنوان يبدأ بـ "0:" فقم بإزالة البادئة
         if addr_str.startswith("0:"):
             addr_str = addr_str[2:]
         addr = Address(addr_str)
-        # عدم تحويل العنوان إلى أحرف صغيرة للحفاظ على حساسيته
         return addr.to_str(is_user_friendly=True, is_bounceable=False, is_url_safe=True).strip()
     except Exception as e:
         logging.warning(f"❌ فشل تطبيع العنوان {addr_str}: {str(e)}")
         return addr_str.strip()
+
+
+async def retry_get_transactions(provider: LiteBalancer, address: str, count: int = 10,
+                                 retries: int = 3, initial_delay: int = 5, backoff: int = 2):
+    """
+    تحاول هذه الدالة جلب المعاملات مع إعادة المحاولة عند ظهور أخطاء معينة مثل -400 أو "have no alive peers".
+    """
+    delay = initial_delay
+    for attempt in range(1, retries + 1):
+        try:
+            transactions = await provider.get_transactions(address=address, count=count)
+            return transactions
+        except LiteServerError as e:
+            if e.code == -400:
+                logging.warning("تحذير: Liteserver لم يعثر على المعاملة. محاولة رقم %d/%d بعد %d ثانية...", attempt,
+                                retries, delay)
+            else:
+                raise e
+        except Exception as e:
+            if "have no alive peers" in str(e):
+                logging.warning("تحذير: لا يوجد نظائر حية. محاولة رقم %d/%d بعد %d ثانية...", attempt, retries, delay)
+            else:
+                raise e
+        await asyncio.sleep(delay)
+        delay *= backoff
+    raise Exception("فشل الحصول على المعاملات بعد {} محاولات".format(retries))
 
 
 async def parse_transactions(provider: LiteBalancer):
@@ -210,7 +237,8 @@ async def parse_transactions(provider: LiteBalancer):
                         subscription_payload = {
                             "telegram_id": int(pending_payment['telegram_id']),
                             "subscription_plan_id": pending_payment['subscription_plan_id'],
-                            "payment_id": tx_hash, # استخدام tx_hash كـ payment_id
+                            "payment_id": tx_hash,  # استخدام tx_hash كـ payment_id
+                            "payment_token": pending_payment['payment_token'],  # إضافة حقل payment_token
                             "username": str(pending_payment['username']),
                             "full_name": str(pending_payment['full_name']),
                         }
@@ -222,24 +250,6 @@ async def parse_transactions(provider: LiteBalancer):
                                 if response.status == 200:
                                     subscribe_data = await response.json()
                                     logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_data}")
-
-                                    # إرسال إشعار WebSocket هنا
-                                    try:
-
-                                            await current_app.ws_manager.send_to_user(
-                                                telegram_id=pending_payment['telegram_id'],
-                                                message={
-                                                    "type": "subscription_success",
-                                                    "data": {
-                                                        "invite_link": subscribe_data.get("invite_link"),
-                                                        "message": subscribe_data.get("formatted_message"),
-                                                        "telegram_id": str(pending_payment['telegram_id'])
-
-                                                }
-                                            }
-                                                )
-                                    except Exception as e:
-                                        logging.error(f"❌ فشل إرسال إشعار WebSocket: {e}")
                                 else:
                                     error_details = await response.text()
                                     logging.error(
@@ -258,10 +268,12 @@ async def parse_transactions(provider: LiteBalancer):
 
 
 async def periodic_check_payments():
-    logging.info("⏰ بدء دورة التحقق الدورية من المدفوعات...")
+    """
+    تقوم هذه الدالة بالتحقق الدوري من المعاملات باستخدام LiteBalancer،
+    وتستخدم الاتصال المشترك في دوال تحليل المعاملات.
+    """
     while True:
         provider = None
-        logging.info("🔄 بدء دورة parse_transactions الدورية...")
         try:
             provider = LiteBalancer.from_mainnet_config(1)
             await provider.start_up()
@@ -274,16 +286,53 @@ async def periodic_check_payments():
                     await provider.close_all()
                 except AttributeError as e:
                     logging.warning(f"⚠️ أثناء إغلاق provider: {e}")
-        logging.info("✅ انتهاء دورة parse_transactions الدورية. سيتم إعادة التشغيل بعد 60 ثانية.")
-        await asyncio.sleep(20)
+        logging.info("✅ انتهاء دورة parse_transactions الدورية. سيتم إعادة التشغيل بعد 30 ثانية.")
+        await asyncio.sleep(30)
 
 
 @payment_confirmation_bp.before_app_serving
 async def startup():
-    init_websocket_manager(current_app)
-    logging.info("🚀 بدء مهمة الفحص الدوري للمعاملات في الخلفية...")
+    logging.info("🚀 بدء تهيئة وحدة تأكيد المدفوعات...")
+    timeout = 120  # ⏳ 120 ثانية
+    start_time = asyncio.get_event_loop().time()
+
+    while True:
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if elapsed > timeout:
+            logging.error(f"""
+            ❌ فشل حرج بعد {timeout} ثانية:
+            - db_pool موجود؟ {hasattr(current_app, 'db_pool')}
+            - حالة Redis: {await redis_manager.is_connected()}
+            """)
+            raise RuntimeError("فشل التهيئة")
+
+        if hasattr(current_app, 'db_pool') and current_app.db_pool is not None:
+            try:
+                async with current_app.db_pool.acquire() as conn:
+                    await conn.execute("SELECT 1")
+                logging.info("✅ اتصال قاعدة البيانات فعّال")
+                break
+            except Exception as e:
+                logging.warning(f"⚠️ فشل التحقق من اتصال قاعدة البيانات: {str(e)}")
+                await asyncio.sleep(5)
+        else:
+            logging.info(f"⏳ انتظار db_pool... ({elapsed:.1f}/{timeout} ثانية)")
+            await asyncio.sleep(5)
+
+    logging.info("🚦 بدء المهام الخلفية...")
     asyncio.create_task(periodic_check_payments())
 
+
+
+async def handle_failed_transaction(tx_hash: str, retries: int = 3):
+    for attempt in range(retries):
+        try:
+            # محاولة معالجة المعاملة مرة أخرى (يفترض تعريف process_transaction في مكان آخر)
+            await process_transaction(tx_hash)
+            break
+        except Exception as e:
+            logging.warning(f"⚠️ محاولة {attempt+1} فشلت: {str(e)}")
+            await asyncio.sleep(5 * (attempt + 1))
 
 @payment_confirmation_bp.route("/api/confirm_payment", methods=["POST"])
 async def confirm_payment():
@@ -292,8 +341,10 @@ async def confirm_payment():
         data = await request.get_json()
         logging.info(f"📥 بيانات الطلب المستلمة في /api/confirm_payment: {json.dumps(data, indent=2)}")
 
+        # التحقق من مفتاح الويب هوك المرسل من الواجهة الأمامية
         webhook_secret_frontend = data.get("webhookSecret")
-        if not webhook_secret_frontend or webhook_secret_frontend != WEBHOOK_SECRET_BACKEND:
+        # يمكن استخدام current_app.config للحصول على مفتاح الويب هوك المُهيأ في app.py
+        if not webhook_secret_frontend or webhook_secret_frontend != current_app.config.get("WEBHOOK_SECRET_BACKEND"):
             logging.warning("❌ طلب غير مصرح به إلى /api/confirm_payment: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
             return jsonify({"error": "Unauthorized request"}), 403
 
@@ -317,44 +368,55 @@ async def confirm_payment():
 
         try:
             subscription_plan_id = int(plan_id_str)
-        except ValueError:
+        except (ValueError, TypeError):
             subscription_plan_id = 1
             logging.warning(f"⚠️ planId ليس عددًا صحيحًا: {plan_id_str}. تم استخدام الخطة الأساسية افتراضيًا.")
 
         try:
             telegram_id = int(telegram_id_str)
-        except ValueError:
+        except (ValueError, TypeError):
             logging.error(f"❌ telegramId ليس عددًا صحيحًا: {telegram_id_str}. تعذر تسجيل الدفعة.")
             return jsonify({"error": "Invalid telegramId", "details": "telegramId must be an integer."}), 400
 
-        logging.info("💾 جاري تسجيل الدفعة المعلقة في قاعدة البيانات...")
-        async with current_app.db_pool.acquire() as conn:
-            result = await record_payment(
-                conn,
-                telegram_id,
-                user_wallet_address,
-                amount,
-                subscription_plan_id,
-                username=telegram_username,
-                full_name=full_name,
-                order_id=order_id
-            )
+        # إنشاء payment_token فريد
+        payment_token = str(uuid4())
 
-        if result:
-            payment_id_db_row = result
-            payment_id_db = payment_id_db_row['payment_id']
-            logging.info(
-                f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_id={payment_id_db}, orderId={order_id}")
-            logging.info(
-                f"💾 تم تسجيل بيانات الدفع والمستخدم كدفعة معلقة: userWalletAddress={user_wallet_address}, orderId={order_id}, "
-                f"planId={plan_id_str}, telegramId={telegram_id}, subscription_plan_id={subscription_plan_id}, payment_id={payment_id_db}, "
-                f"username={telegram_username}, full_name={full_name}, amount={amount}"
-            )
-            return jsonify(
-                {"message": "Payment confirmation recorded successfully. Waiting for payment processing."}), 200
-        else:
-            logging.error("❌ فشل تسجيل الدفعة في قاعدة البيانات.")
-            return jsonify({"error": "Failed to record payment"}), 500
+        logging.info("💾 جاري تسجيل الدفعة المعلقة في قاعدة البيانات...")
+        result = None
+        max_attempts = 3  # تحديد الحد الأقصى لمحاولات إعادة التسجيل
+        attempt = 0
+        async with current_app.db_pool.acquire() as conn:
+            while attempt < max_attempts:
+                try:
+                    result = await record_payment(
+                        conn=conn,
+                        telegram_id=telegram_id,
+                        user_wallet_address=user_wallet_address,
+                        amount=amount,
+                        subscription_plan_id=subscription_plan_id,
+                        username=telegram_username,
+                        full_name=full_name,
+                        order_id=order_id,
+                        payment_token=payment_token
+                    )
+                    break  # إذا تم التسجيل بنجاح، نخرج من حلقة المحاولات
+                except UniqueViolationError:
+                    attempt += 1
+                    logging.warning("⚠️ تكرار payment_token، إعادة المحاولة...")
+                    payment_token = str(uuid4())
+
+            if result is None:
+                logging.error("❌ فشل تسجيل الدفعة بعد محاولات متعددة بسبب تضارب payment_token.")
+                return jsonify({"error": "Failed to record payment after retries"}), 500
+
+        logging.info(
+            f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_token={payment_token}, orderId={order_id}"
+        )
+        return jsonify({
+            "success": True,
+            "payment_token": payment_token,
+            "order_id": order_id
+        }), 200
 
     except Exception as e:
         logging.error(f"❌ خطأ في /api/confirm_payment: {str(e)}", exc_info=True)
@@ -370,19 +432,19 @@ WALLET_CACHE_TTL = 60  # زمن التخزين المؤقت بالثواني (م
 
 
 async def get_bot_wallet_address() -> Optional[str]:
-    """
-    تسترجع عنوان محفظة البوت من جدول wallet في قاعدة البيانات.
-    تستخدم التخزين المؤقت لتقليل عدد الاستعلامات.
-    """
     global _wallet_cache
     now = asyncio.get_event_loop().time()
-    # إذا لم يكن العنوان مخزن أو انتهت صلاحيته
+    if not hasattr(current_app, 'db_pool') or current_app.db_pool is None:
+        logging.error("❌ db_pool غير مهيأ!")
+        return None
+
+    # التحقق من صلاحية الكاش أو انتهاء مدة التخزين المؤقت
     if _wallet_cache["address"] is None or now - _wallet_cache["timestamp"] > WALLET_CACHE_TTL:
         async with current_app.db_pool.acquire() as connection:
             wallet = await connection.fetchrow("SELECT wallet_address FROM wallet ORDER BY id DESC LIMIT 1")
-        if wallet:
+            if not wallet:
+                logging.error("❌ لا يوجد عنوان محفظة مسجل في قاعدة البيانات!")
+                return None
             _wallet_cache["address"] = wallet["wallet_address"]
-        else:
-            _wallet_cache["address"] = None
-        _wallet_cache["timestamp"] = now
+            _wallet_cache["timestamp"] = now
     return _wallet_cache["address"]
