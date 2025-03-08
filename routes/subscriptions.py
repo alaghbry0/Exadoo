@@ -4,7 +4,7 @@ import os
 from quart import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta, timezone
 from database.db_queries import (
-    get_user, add_user, add_subscription, update_subscription, add_scheduled_task, update_payment_with_txhash
+    get_user, add_user, add_subscription, update_subscription, add_scheduled_task
 )
 from utils.db_utils import add_user_to_channel
 import json
@@ -64,7 +64,6 @@ async def subscribe():
             logging.critical("❌ Database connection is missing!")
             return jsonify({"error": "Internal Server Error"}), 500
 
-        # التحقق من أن الدفع لم يُسجل مسبقًا
         async with db_pool.acquire() as connection:
             existing_payment = await connection.fetchrow(
                 "SELECT * FROM payments WHERE payment_id = $1", payment_id
@@ -79,9 +78,7 @@ async def subscribe():
                     logging.info(f"✅ الاشتراك محدث بالفعل لـ {telegram_id}, لا حاجة للتحديث.")
                     return jsonify({"message": "Subscription already updated"}), 200
 
-        # معالجة الاشتراك
         async with db_pool.acquire() as connection:
-            # التأكد من وجود المستخدم، وإن لم يكن موجودًا يتم إضافته
             user = await get_user(connection, telegram_id)
             if not user:
                 added = await add_user(connection, telegram_id, username=username, full_name=full_name)
@@ -164,19 +161,11 @@ async def subscribe():
 
                 logging.info(f"✅ New subscription created for {telegram_id} until {new_expiry}")
 
-            # تحديث سجل الدفع إلى "مكتمل" باستخدام update_payment_with_txhash
-            updated_payment_data = await update_payment_with_txhash(connection, payment_id, payment_id)
-            if updated_payment_data:
-                logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {payment_id}")
-            else:
-                logging.error(f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ payment_id: {payment_id}")
-                return jsonify({"error": "Failed to update payment status"}), 500
-
             # استدعاء دالة add_user_to_channel للحصول على رابط الدعوة (دون تخزينه في قاعدة البيانات)
             channel_result = await add_user_to_channel(telegram_id, subscription_plan["subscription_type_id"], db_pool)
             invite_link = channel_result.get("invite_link")
 
-            # جدولة التذكيرات
+            # جدولة التذكيرات (مثال، يمكن تعديله حسب الحاجة)
             reminders = [
                 ("first_reminder", new_expiry - timedelta(minutes=30 if IS_DEVELOPMENT else 1440)),
                 ("second_reminder", new_expiry - timedelta(minutes=15 if IS_DEVELOPMENT else 60)),
