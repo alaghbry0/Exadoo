@@ -1,5 +1,5 @@
 # server/sse_routes.py
-from quart import Blueprint, request, Response, jsonify
+from quart import Blueprint, request, Response, jsonify, current_app
 import logging
 import asyncio
 from server.redis_manager import redis_manager
@@ -55,9 +55,9 @@ async def sse_stream():
         return jsonify({"error": "تنسيق Telegram ID غير صالح"}), 400
 
     # التحقق من ملكية الدفع باستخدام الاتصال بقاعدة البيانات
-    # ملاحظة: تأكد من أن الاتصال بقاعدة البيانات متاح تحت request.app.db أو قم بتعديل الاسم إلى request.app.db_pool
     try:
-        db_connection = request.app.db  # تأكد هنا من الاسم الصحيح (ربما يجب أن يكون request.app.db_pool)
+        # استخدام current_app بدلاً من request.app للحصول على الاتصال بقاعدة البيانات
+        db_connection = current_app.db_pool
         if not db_connection:
             logging.error("❌ لم يتم تهيئة الاتصال بقاعدة البيانات في التطبيق.")
             return jsonify({"error": "خطأ في الاتصال بقاعدة البيانات"}), 500
