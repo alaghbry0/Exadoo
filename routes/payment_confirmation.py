@@ -344,8 +344,8 @@ async def confirm_payment():
 
         # التحقق من مفتاح الويب هوك المرسل من الواجهة الأمامية
         webhook_secret_frontend = data.get("webhookSecret")
-        # يمكن استخدام current_app.config للحصول على مفتاح الويب هوك المُهيأ في app.py
-        if not webhook_secret_frontend or webhook_secret_frontend != current_app.config.get("WEBHOOK_SECRET_BACKEND"):
+        # استخدام os.getenv للحصول على مفتاح الويب هوك من البيئة
+        if not webhook_secret_frontend or webhook_secret_frontend != os.getenv("WEBHOOK_SECRET"):
             logging.warning("❌ طلب غير مصرح به إلى /api/confirm_payment: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
             return jsonify({"error": "Unauthorized request"}), 403
 
