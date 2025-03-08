@@ -215,51 +215,45 @@ async def parse_transactions(provider: LiteBalancer):
                         f"⚠️ عدم تطابق مبلغ الدفع: DB amount {db_amount} vs jetton_amount {jetton_amount} في tx_hash: {tx_hash_hex} - تجاهل المعاملة.")
                     continue
 
-                logging.info(f"✅ تطابق بيانات الدفع. متابعة التحديث لـ payment_id: {pending_payment['payment_id']}")
-                tx_hash = tx_hash_hex
-                updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_id'], tx_hash)
-                if updated_payment_data:
+                # هنا قمنا بتعطيل تحديث سجل الدفع إلى "مكتمل"
+                logging.info(f"✅ تطابق بيانات الدفع. لن نقوم بتحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {pending_payment['payment_id']}")
+                # إذا كان هناك منطق آخر يجب تنفيذه بعد التطابق، يمكنك إضافته هنا.
+                # على سبيل المثال، يمكنك استدعاء subscribe API دون تحديث حالة الدفع.
+                async with aiohttp.ClientSession() as session:
+                    headers = {
+                        "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
+                        "Content-Type": "application/json"
+                    }
+
+                    tx_hash: str = tx_hash_hex  # تأكيد النوع
+
+                    # تحقق صارم من النوع (اختياري)
+                    if not isinstance(tx_hash, str):
+                        logging.error(f"نوع tx_hash غير متوقع: {type(tx_hash)}")
+                        continue
+
+                    subscription_payload = {
+                        "telegram_id": int(pending_payment['telegram_id']),
+                        "subscription_plan_id": pending_payment['subscription_plan_id'],
+                        "payment_id": tx_hash,  # استخدام tx_hash كـ payment_id
+                        "payment_token": pending_payment['payment_token'],  # إضافة حقل payment_token
+                        "username": str(pending_payment['username']),
+                        "full_name": str(pending_payment['full_name']),
+                    }
                     logging.info(
-                        f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {pending_payment['payment_id']}، tx_hash: {tx_hash}")
-                    async with aiohttp.ClientSession() as session:
-                        headers = {
-                            "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
-                            "Content-Type": "application/json"
-                        }
-
-                        tx_hash_hex: str = transaction.cell.hash.hex()
-                        tx_hash: str = tx_hash_hex  # تأكيد النوع
-
-                        # تحقق صارم من النوع (اختياري)
-                        if not isinstance(tx_hash, str):
-                            logging.error(f"نوع tx_hash غير متوقع: {type(tx_hash)}")
-                            continue
-
-                        subscription_payload = {
-                            "telegram_id": int(pending_payment['telegram_id']),
-                            "subscription_plan_id": pending_payment['subscription_plan_id'],
-                            "payment_id": tx_hash,  # استخدام tx_hash كـ payment_id
-                            "payment_token": pending_payment['payment_token'],  # إضافة حقل payment_token
-                            "username": str(pending_payment['username']),
-                            "full_name": str(pending_payment['full_name']),
-                        }
-                        logging.info(
-                            f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
-                        try:
-                            async with session.post(subscribe_api_url, json=subscription_payload,
-                                                    headers=headers) as response:
-                                if response.status == 200:
-                                    subscribe_data = await response.json()
-                                    logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_data}")
-                                else:
-                                    error_details = await response.text()
-                                    logging.error(
-                                        f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {error_details}")
-                        except Exception as e:
-                            logging.error(f"❌ استثناء أثناء استدعاء /api/subscribe: {str(e)}")
-                else:
-                    logging.error(
-                        f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ payment_id: {pending_payment['payment_id']}")
+                        f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
+                    try:
+                        async with session.post(subscribe_api_url, json=subscription_payload,
+                                                headers=headers) as response:
+                            if response.status == 200:
+                                subscribe_data = await response.json()
+                                logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_data}")
+                            else:
+                                error_details = await response.text()
+                                logging.error(
+                                    f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {error_details}")
+                    except Exception as e:
+                        logging.error(f"❌ استثناء أثناء استدعاء /api/subscribe: {str(e)}")
             logging.info(f"📝 Transaction processed: tx_hash: {tx_hash_hex}, lt: {transaction.lt}")
 
     except Exception as e:

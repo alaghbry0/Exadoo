@@ -389,7 +389,7 @@ async def fetch_pending_payment_by_orderid(conn, order_id: str) -> Optional[dict
     """
     try:
         sql = """
-            SELECT payment_id, telegram_id, subscription_plan_id, username, full_name, user_wallet_address, order_id, amount
+            SELECT payment_id, telegram_id, subscription_plan_id, payment_token, username, full_name, user_wallet_address, order_id, amount
             FROM payments
             WHERE TRIM(order_id) = TRIM($1)
               AND status = 'pending'
