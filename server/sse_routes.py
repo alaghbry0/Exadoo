@@ -30,7 +30,8 @@ async def event_generator(payment_token):
 @sse_bp.route('/sse')
 async def sse_stream():
     payment_token = request.args.get('payment_token')
-    telegram_id = request.headers.get('X-Telegram-Id')
+    telegram_id = request.args.get('telegram_id')
+
 
     # التحقق من وجود المعلمات
     if not payment_token or not telegram_id:
