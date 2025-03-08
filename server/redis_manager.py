@@ -5,7 +5,6 @@ import json
 import logging
 from typing import Optional
 
-
 class RedisManager:
     _instance: Optional['RedisManager'] = None
 
@@ -13,7 +12,7 @@ class RedisManager:
         if RedisManager._instance is not None:
             raise RuntimeError("Use get_instance() instead!")
         self.redis: Optional[redis.Redis] = None
-        self.pubsub: Optional[redis.PubSub] = None
+        self.pubsub: Optional[redis.client.PubSub] = None
 
     @classmethod
     def get_instance(cls) -> 'RedisManager':
@@ -26,6 +25,7 @@ class RedisManager:
             self.redis = redis.Redis(
                 host=os.getenv("REDIS_HOST", "localhost"),
                 port=int(os.getenv("REDIS_PORT", 6379)),
+                password=os.getenv("REDIS_PASSWORD"),  # إضافة كلمة المرور
                 db=int(os.getenv("REDIS_DB", 0)),
                 decode_responses=True,
                 ssl=True if os.getenv("REDIS_SSL") else False
@@ -65,7 +65,6 @@ class RedisManager:
         if self.redis:
             await self.redis.close()
             logging.info("✅ تم إغلاق اتصال Redis")
-
 
 # Initialize singleton instance
 redis_manager = RedisManager.get_instance()
