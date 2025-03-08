@@ -14,6 +14,7 @@ from asyncpg.exceptions import UniqueViolationError
 from config import DATABASE_CONFIG
 
 # تحميل المتغيرات البيئية
+app.config["WEBHOOK_SECRET_BACKEND"] = os.getenv("WEBHOOK_SECRET_BACKEND")
 WEBHOOK_SECRET_BACKEND = os.getenv("WEBHOOK_SECRET")
 subscribe_api_url = os.getenv("SUBSCRIBE_API_URL")
 TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY")  # مفتاح Toncenter
