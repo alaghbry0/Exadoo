@@ -72,11 +72,15 @@ async def start_command(message: types.Message):
     await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
 
 
-# 🔹 وظيفة إرسال بيانات الدفع إلى `/api/subscribe`
-async def send_payment_to_subscribe_api(telegram_id: int, plan_id: int, payment_id: str, retries=3):
-    """✅ إرسال بيانات الدفع إلى `/api/subscribe` مع `Retry` في حالة الفشل"""
-    session = aiohttp.ClientSession()  # ✅ إنشاء جلسة `aiohttp`
-
+# 🔹 وظيفة استقبال `successful_payment`
+async def send_payment_to_subscribe_api(
+        telegram_id: int,
+        plan_id: int,
+        payment_id: str,
+        payment_token: str,  # إضافة payment_token كمعامل
+        retries=3
+):
+    """✅ إرسال بيانات الدفع إلى `/api/subscribe` مع إعادة المحاولة"""
     headers = {
         "Authorization": f"Bearer {WEBHOOK_SECRET}",
         "Content-Type": "application/json"
@@ -85,30 +89,37 @@ async def send_payment_to_subscribe_api(telegram_id: int, plan_id: int, payment_
     payload = {
         "telegram_id": telegram_id,
         "subscription_plan_id": plan_id,
-        "payment_id": payment_id
+        "payment_id": payment_id,
+        "payment_token": payment_token  # إضافة payment_token إلى payload
     }
 
-    for attempt in range(1, retries + 1):
-        try:
-            logging.info(f"🚀 إرسال بيانات الاشتراك إلى {SUBSCRIBE_URL} (محاولة {attempt}/{retries})...")
+    async with aiohttp.ClientSession() as session:
+        for attempt in range(1, retries + 1):
+            try:
+                logging.info(f"🚀 إرسال بيانات الاشتراك (محاولة {attempt}/{retries})...")
 
-            async with session.post(SUBSCRIBE_URL, json=payload, headers=headers) as response:
-                response_text = await response.text()
+                async with session.post(
+                        SUBSCRIBE_URL,
+                        json=payload,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
 
-                if response.status == 200:
-                    logging.info(f"✅ تم تحديث الاشتراك بنجاح للمستخدم {telegram_id}.")
-                    return True
-                else:
-                    logging.error(f"❌ فشل تحديث الاشتراك! المحاولة {attempt}/{retries} - {response_text}")
+                    if response.status == 200:
+                        logging.info(f"✅ تم تحديث الاشتراك لـ {telegram_id}")
+                        return True
 
-        except Exception as e:
-            logging.error(f"❌ خطأ أثناء إرسال بيانات الاشتراك (محاولة {attempt}/{retries}): {e}")
+                    response_text = await response.text()
+                    logging.error(f"❌ فشل الاستجابة ({response.status}): {response_text}")
 
-        if attempt < retries:
-            await asyncio.sleep(3)  # ⏳ انتظار 3 ثوانٍ قبل إعادة المحاولة
+            except Exception as e:
+                logging.error(f"❌ خطأ في المحاولة {attempt}/{retries}: {str(e)}")
 
-    logging.critical("🚨 جميع محاولات تحديث الاشتراك فشلت!")
-    return False
+            if attempt < retries:
+                await asyncio.sleep(2 ** attempt)  # زيادة زمنية تدريجية
+
+        logging.critical("🚨 فشل جميع المحاولات!")
+        return False
 
 
 @dp.pre_checkout_query()
@@ -133,33 +144,63 @@ async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
         await bot.answer_pre_checkout_query(pre_checkout.id, ok=False, error_message="حدث خطأ غير متوقع")
 
 
-# 🔹 وظيفة استقبال `successful_payment`
+
+
 @dp.message()
 async def handle_successful_payment(message: types.Message):
-    """✅ استقبال `successful_payment` ومعالجته"""
+    """✅ معالجة الدفع الناجح مع استخراج payment_token"""
     payment = message.successful_payment
     if not payment:
         return
 
     try:
-        logging.info(f"📥 استلام successful_payment من {message.from_user.id}: {payment}")
+        logging.info(f"📥 استلام دفعة ناجحة من {message.from_user.id}")
 
-        # ✅ استخراج البيانات
+        # استخراج البيانات الأساسية
         payload = json.loads(payment.invoice_payload)
         telegram_id = payload.get("userId")
         plan_id = payload.get("planId")
         payment_id = payment.telegram_payment_charge_id
 
-        if not telegram_id or not plan_id or not payment_id:
-            logging.error("❌ بيانات الدفع غير كاملة!")
+        # التحقق من البيانات الأساسية
+        if not all([telegram_id, plan_id, payment_id]):
+            logging.error("❌ بيانات ناقصة في payload")
             return
 
-        # ✅ إرسال البيانات إلى `/api/subscribe`
-        await send_payment_to_subscribe_api(telegram_id, plan_id, payment_id)
+        # استخراج payment_token من قاعدة البيانات
+        async with current_app.db_pool.acquire() as conn:
+            payment_data = await conn.fetchrow('''
+                SELECT payment_token 
+                FROM payments 
+                WHERE 
+                    telegram_id = $1 AND
+                    subscription_plan_id = $2 AND
+                    payment_id = $3
+                ORDER BY created_at DESC 
+                LIMIT 1
+            ''', telegram_id, plan_id, payment_id)
 
+            if not payment_data:
+                logging.error("❌ لم يتم العثور على payment_token")
+                return
+
+            payment_token = payment_data['payment_token']
+
+        # إرسال البيانات مع payment_token
+        success = await send_payment_to_subscribe_api(
+            telegram_id=telegram_id,
+            plan_id=plan_id,
+            payment_id=payment_id,
+            payment_token=payment_token
+        )
+
+        if not success:
+            logging.error("❌ فشل إرسال البيانات إلى خدمة الاشتراك")
+
+    except json.JSONDecodeError:
+        logging.error("❌ تنسيق payload غير صالح")
     except Exception as e:
-        logging.error(f"❌ خطأ أثناء معالجة successful_payment: {e}")
-
+        logging.error(f"❌ خطأ غير متوقع: {str(e)}")
 
 # 🔹 تشغيل Polling بدلاً من Webhook
 is_bot_running = False
