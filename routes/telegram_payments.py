@@ -1,8 +1,9 @@
 from uuid import uuid4
 from asyncpg.exceptions import UniqueViolationError
-from quart import current_app, jsonify, request
+from quart import Blueprint, current_app, jsonify, request
 import logging
 
+payment_bp = Blueprint("payment", __name__)
 
 @payment_bp.route("/api/create-telegram-payment-token", methods=["POST"])
 async def create_telegram_payment_token():
