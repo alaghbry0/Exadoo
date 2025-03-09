@@ -15,25 +15,38 @@ async def create_telegram_payment_token():
 
     try:
         data = await request.get_json()
-        telegram_id = data.get('telegramId')
+        telegram_id_raw = data.get('telegramId')
         plan_id = data.get('planId')
 
         # التحقق من البيانات الأساسية
-        if not all([telegram_id, plan_id]):
+        if not all([telegram_id_raw, plan_id]):
             logging.error("❌ بيانات الطلب ناقصة: telegramId أو planId")
             return jsonify({
                 "error": "البيانات المطلوبة ناقصة",
                 "required_fields": ["telegramId", "planId"]
             }), 400
 
+        try:
+            # تحويل telegramId إلى عدد صحيح إذا كان ذلك مناسبًا
+            telegram_id = int(telegram_id_raw)
+        except ValueError:
+            logging.error("❌ قيمة telegramId غير صالحة: يجب أن تكون رقمًا")
+            return jsonify({
+                "error": "قيمة telegramId غير صالحة: يجب أن تكون رقمًا"
+            }), 400
+
+        # إذا كان من المفترض استخدام telegram_id كـ user_id، يمكن تعيينه كذلك
+        user_id = telegram_id
+
         async with current_app.db_pool.acquire() as conn:
             while attempt < max_attempts:
                 payment_token = str(uuid4())
                 try:
-                    # محاولة الإدراج في قاعدة البيانات
+                    # تعديل الاستعلام لإدخال قيمة user_id
                     result = await conn.execute('''
                         INSERT INTO payments (
                             payment_token,
+                            user_id,
                             telegram_id,
                             subscription_plan_id,
                             payment_method,
@@ -41,12 +54,12 @@ async def create_telegram_payment_token():
                             payment_date,
                             created_at
                         ) VALUES (
-                            $1, $2, $3, $4, 'pending',
+                            $1, $2, $3, $4, $5, 'pending',
                             CURRENT_TIMESTAMP,
                             CURRENT_TIMESTAMP
                         )
                         RETURNING payment_token
-                    ''', payment_token, telegram_id, plan_id, 'telegram_stars')
+                    ''', payment_token, user_id, telegram_id, plan_id, 'telegram_stars')
 
                     if result:
                         logging.info(f"✅ تم إنشاء رمز الدفع: {payment_token}")
