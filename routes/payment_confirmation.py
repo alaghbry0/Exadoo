@@ -344,7 +344,6 @@ async def confirm_payment():
 
         # التحقق من مفتاح الويب هوك المرسل من الواجهة الأمامية
         webhook_secret_frontend = data.get("webhookSecret")
-        # استخدام os.getenv للحصول على مفتاح الويب هوك من البيئة
         if not webhook_secret_frontend or webhook_secret_frontend != os.getenv("WEBHOOK_SECRET"):
             logging.warning("❌ طلب غير مصرح به إلى /api/confirm_payment: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
             return jsonify({"error": "Unauthorized request"}), 403
@@ -386,7 +385,10 @@ async def confirm_payment():
         result = None
         max_attempts = 3  # تحديد الحد الأقصى لمحاولات إعادة التسجيل
         attempt = 0
+
         async with current_app.db_pool.acquire() as conn:
+            # حذف السجلات القديمة من جدول telegram_payments (أكثر من ساعتين)
+
             while attempt < max_attempts:
                 try:
                     result = await record_payment(
@@ -400,7 +402,7 @@ async def confirm_payment():
                         order_id=order_id,
                         payment_token=payment_token
                     )
-                    break  # إذا تم التسجيل بنجاح، نخرج من حلقة المحاولات
+                    break  # تم التسجيل بنجاح في جدول payments، نخرج من حلقة المحاولات
                 except UniqueViolationError:
                     attempt += 1
                     logging.warning("⚠️ تكرار payment_token، إعادة المحاولة...")
@@ -409,6 +411,25 @@ async def confirm_payment():
             if result is None:
                 logging.error("❌ فشل تسجيل الدفعة بعد محاولات متعددة بسبب تضارب payment_token.")
                 return jsonify({"error": "Failed to record payment after retries"}), 500
+
+            # تسجيل نفس البيانات في جدول telegram_payments
+            try:
+                await conn.execute('''
+                    INSERT INTO telegram_payments (
+                        payment_token,
+                        telegram_id,
+                        status,
+                        created_at
+                    ) VALUES (
+                        $1, $2, 'pending', CURRENT_TIMESTAMP
+                    )
+                    RETURNING payment_token
+                ''', payment_token, telegram_id)
+                logging.info(f"✅ تم تسجيل البيانات في جدول telegram_payments: {payment_token}")
+            except UniqueViolationError as uve:
+                logging.warning(f"⚠️ تكرار في telegram_payments لرمز الدفع {payment_token}: {uve}")
+            except Exception as e:
+                logging.error(f"❌ خطأ أثناء تسجيل البيانات في جدول telegram_payments: {str(e)}")
 
         logging.info(
             f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_token={payment_token}, orderId={order_id}"

@@ -8,7 +8,8 @@ payment_bp = Blueprint("payment", __name__)
 @payment_bp.route("/api/create-telegram-payment-token", methods=["POST"])
 async def create_telegram_payment_token():
     """
-    إنشاء رمز دفع فريد لمعاملات Telegram Stars مع إدارة التكرار وإعادة المحاولة
+    إنشاء رمز دفع فريد لمعاملات Telegram Stars وتخزينه مؤقتاً في جدول telegram_payments.
+    يتم حذف البيانات التي مضى عليها أكثر من ساعتين.
     """
     max_attempts = 3
     attempt = 0
@@ -16,18 +17,18 @@ async def create_telegram_payment_token():
     try:
         data = await request.get_json()
         telegram_id_raw = data.get('telegramId')
-        plan_id = data.get('planId')
+        # في حال أردت الاستمرار بتلقي planId مع أن الجدول الجديد لا يخزنه
 
-        # التحقق من البيانات الأساسية
-        if not all([telegram_id_raw, plan_id]):
-            logging.error("❌ بيانات الطلب ناقصة: telegramId أو planId")
+
+        # التحقق من وجود telegramId فقط لأننا نستخدمه فقط في الجدول الجديد
+        if not telegram_id_raw:
+            logging.error("❌ بيانات الطلب ناقصة: telegramId")
             return jsonify({
                 "error": "البيانات المطلوبة ناقصة",
-                "required_fields": ["telegramId", "planId"]
+                "required_fields": ["telegramId"]
             }), 400
 
         try:
-            # تحويل telegramId إلى عدد صحيح إذا كان ذلك مناسبًا
             telegram_id = int(telegram_id_raw)
         except ValueError:
             logging.error("❌ قيمة telegramId غير صالحة: يجب أن تكون رقمًا")
@@ -35,31 +36,28 @@ async def create_telegram_payment_token():
                 "error": "قيمة telegramId غير صالحة: يجب أن تكون رقمًا"
             }), 400
 
-        # إذا كان من المفترض استخدام telegram_id كـ user_id، يمكن تعيينه كذلك
-        user_id = telegram_id
-
         async with current_app.db_pool.acquire() as conn:
+            # حذف السجلات التي مضى عليها أكثر من ساعتين (حذف البيانات المؤقتة)
+            await conn.execute('''
+                DELETE FROM telegram_payments
+                WHERE created_at < NOW() - INTERVAL '2 hours'
+            ''')
+
             while attempt < max_attempts:
                 payment_token = str(uuid4())
                 try:
-                    # تعديل الاستعلام لإدخال قيمة user_id
+                    # إدراج البيانات في جدول telegram_payments فقط
                     result = await conn.execute('''
-                        INSERT INTO payments (
+                        INSERT INTO telegram_payments (
                             payment_token,
-                            user_id,
                             telegram_id,
-                            subscription_plan_id,
-                            payment_method,
                             status,
-                            payment_date,
                             created_at
                         ) VALUES (
-                            $1, $2, $3, $4, $5, 'pending',
-                            CURRENT_TIMESTAMP,
-                            CURRENT_TIMESTAMP
+                            $1, $2, 'pending', CURRENT_TIMESTAMP
                         )
                         RETURNING payment_token
-                    ''', payment_token, user_id, telegram_id, plan_id, 'telegram_stars')
+                    ''', payment_token, telegram_id)
 
                     if result:
                         logging.info(f"✅ تم إنشاء رمز الدفع: {payment_token}")

@@ -3,12 +3,11 @@ from quart import Blueprint, request, Response, jsonify, current_app
 import logging
 import asyncio
 from server.redis_manager import redis_manager
-from database.db_queries import validate_payment_owner
 
 sse_bp = Blueprint('sse', __name__)
 
 async def event_generator(payment_token):
-    pubsub = None  # تعريف مسبق للمتغير
+    pubsub = None
     try:
         logging.info(f"بدء الاشتراك في قناة Redis: payment_{payment_token}")
         pubsub = redis_manager.redis.pubsub()
@@ -42,27 +41,32 @@ async def sse_stream():
 
     logging.info(f"طلب SSE وارد بمعلمات: payment_token={payment_token}, telegram_id={telegram_id}")
 
-    # التحقق من وجود المعلمات
     if not payment_token or not telegram_id:
         logging.warning("❌ معلمات ناقصة في طلب SSE")
         return jsonify({"error": "المعلمات المطلوبة: payment_token و telegram_id"}), 400
 
-    # التحقق من صحة Telegram ID
     try:
         telegram_id = int(telegram_id)
     except ValueError:
         logging.error(f"❌ تنسيق Telegram ID غير صالح: {telegram_id}")
         return jsonify({"error": "تنسيق Telegram ID غير صالح"}), 400
 
-    # التحقق من ملكية الدفع باستخدام الاتصال بقاعدة البيانات
     try:
-        # استخدام current_app بدلاً من request.app للحصول على الاتصال بقاعدة البيانات
         db_connection = current_app.db_pool
         if not db_connection:
             logging.error("❌ لم يتم تهيئة الاتصال بقاعدة البيانات في التطبيق.")
             return jsonify({"error": "خطأ في الاتصال بقاعدة البيانات"}), 500
 
-        is_owner = await validate_payment_owner(db_connection, payment_token, telegram_id)
+        # التحقق من ملكية الدفع باستخدام جدول telegram_payments
+        query = '''
+            SELECT EXISTS(
+                SELECT 1 
+                FROM telegram_payments
+                WHERE payment_token = $1
+                  AND telegram_id = $2
+            )
+        '''
+        is_owner = await db_connection.fetchval(query, payment_token, telegram_id)
         if not is_owner:
             logging.warning(f"❌ وصول غير مصرح به لـ Telegram ID: {telegram_id}")
             return jsonify({"error": "غير مصرح به"}), 403
