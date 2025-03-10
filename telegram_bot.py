@@ -142,7 +142,7 @@ async def handle_successful_payment(message: types.Message):
         payment_id = payment.telegram_payment_charge_id
         payment_token = payload.get("paymentToken")
         full_name = payload.get("fullName")
-        username = payload.get("username")
+        username = payload.get("telegramUsername")
 
         # التحقق من البيانات الأساسية
         required_fields = [
