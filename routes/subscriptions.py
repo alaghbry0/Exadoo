@@ -38,7 +38,7 @@ async def subscribe():
 
         telegram_id = data.get("telegram_id")
         subscription_plan_id = data.get("subscription_plan_id")
-        payment_id = data.get("payment_id", None)
+        payment_id = data.get("payment_id")
         payment_token = data.get("payment_token")  # قراءة payment_token من البيانات الواردة
         username = data.get("username", None)
         full_name = data.get("full_name", None)
