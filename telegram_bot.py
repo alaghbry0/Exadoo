@@ -76,7 +76,7 @@ async def start_command(message: types.Message):
 async def send_payment_to_subscribe_api(
         telegram_id: int,
         plan_id: int,
-        payment_id: str,
+
         payment_token: str,
         full_name: str,  # إضافة الاسم الكامل
         username: str,    # إضافة اسم المستخدم
@@ -91,7 +91,7 @@ async def send_payment_to_subscribe_api(
     payload = {
         "telegram_id": telegram_id,
         "subscription_plan_id": plan_id,
-        "payment_id": payment_id,
+
         "payment_token": payment_token,
         "full_name": full_name,
         "telegram_username": username
@@ -161,7 +161,7 @@ async def handle_successful_payment(message: types.Message):
         success = await send_payment_to_subscribe_api(
             telegram_id=telegram_id,
             plan_id=plan_id,
-            payment_id=payment_id,
+
             payment_token=payment_token,
             full_name=full_name or "غير معروف",
             username=username or "غير معروف"
