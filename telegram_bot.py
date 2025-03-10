@@ -72,15 +72,17 @@ async def start_command(message: types.Message):
     await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
 
 
-# 🔹 وظيفة استقبال `successful_payment`
+# 🔹 وظيفة معدلة لمعالجة الدفع الناجح
 async def send_payment_to_subscribe_api(
         telegram_id: int,
         plan_id: int,
         payment_id: str,
-        payment_token: str,  # إضافة payment_token كمعامل
+        payment_token: str,
+        full_name: str,  # إضافة الاسم الكامل
+        username: str,    # إضافة اسم المستخدم
         retries=3
 ):
-    """✅ إرسال بيانات الدفع إلى `/api/subscribe` مع إعادة المحاولة"""
+    """✅ إرسال بيانات الدفع مع المعلومات الجديدة"""
     headers = {
         "Authorization": f"Bearer {WEBHOOK_SECRET}",
         "Content-Type": "application/json"
@@ -90,19 +92,21 @@ async def send_payment_to_subscribe_api(
         "telegram_id": telegram_id,
         "subscription_plan_id": plan_id,
         "payment_id": payment_id,
-        "payment_token": payment_token  # إضافة payment_token إلى payload
+        "payment_token": payment_token,
+        "full_name": full_name,
+        "telegram_username": username
     }
 
     async with aiohttp.ClientSession() as session:
         for attempt in range(1, retries + 1):
             try:
-                logging.info(f"🚀 إرسال بيانات الاشتراك (محاولة {attempt}/{retries})...")
+                logging.info(f"🚀 إرسال بيانات الاشتراك (المحاولة {attempt}/{retries})...")
 
                 async with session.post(
-                        SUBSCRIBE_URL,
-                        json=payload,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=10)
+                    SUBSCRIBE_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
 
                     if response.status == 200:
@@ -116,11 +120,60 @@ async def send_payment_to_subscribe_api(
                 logging.error(f"❌ خطأ في المحاولة {attempt}/{retries}: {str(e)}")
 
             if attempt < retries:
-                await asyncio.sleep(2 ** attempt)  # زيادة زمنية تدريجية
+                await asyncio.sleep(2 ** attempt)
 
         logging.critical("🚨 فشل جميع المحاولات!")
         return False
 
+@dp.message()
+async def handle_successful_payment(message: types.Message):
+    """✅ معالجة الدفع الناجح باستخدام البيانات المضمنة"""
+    payment = message.successful_payment
+    if not payment:
+        return
+
+    try:
+        logging.info(f"📥 استلام دفعة ناجحة من {message.from_user.id}")
+
+        # استخراج البيانات مباشرة من payload الفاتورة
+        payload = json.loads(payment.invoice_payload)
+        telegram_id = payload.get("userId")
+        plan_id = payload.get("planId")
+        payment_id = payment.telegram_payment_charge_id
+        payment_token = payload.get("paymentToken")
+        full_name = payload.get("fullName")
+        username = payload.get("username")
+
+        # التحقق من البيانات الأساسية
+        required_fields = [
+            (telegram_id, "telegram_id"),
+            (plan_id, "plan_id"),
+            (payment_id, "payment_id"),
+            (payment_token, "payment_token")
+        ]
+
+        missing_fields = [name for value, name in required_fields if not value]
+        if missing_fields:
+            logging.error(f"❌ بيانات ناقصة: {', '.join(missing_fields)}")
+            return
+
+        # إرسال البيانات مباشرة دون التحقق من قاعدة البيانات
+        success = await send_payment_to_subscribe_api(
+            telegram_id=telegram_id,
+            plan_id=plan_id,
+            payment_id=payment_id,
+            payment_token=payment_token,
+            full_name=full_name or "غير معروف",
+            username=username or "غير معروف"
+        )
+
+        if not success:
+            logging.error("❌ فشل إرسال البيانات إلى خدمة الاشتراك")
+
+    except json.JSONDecodeError as e:
+        logging.error(f"❌ خطأ في تنسيق JSON: {str(e)}")
+    except Exception as e:
+        logging.error(f"❌ خطأ غير متوقع: {str(e)}")
 
 @dp.pre_checkout_query()
 async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
@@ -146,61 +199,6 @@ async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
 
 
 
-@dp.message()
-async def handle_successful_payment(message: types.Message):
-    """✅ معالجة الدفع الناجح مع استخراج payment_token"""
-    payment = message.successful_payment
-    if not payment:
-        return
-
-    try:
-        logging.info(f"📥 استلام دفعة ناجحة من {message.from_user.id}")
-
-        # استخراج البيانات الأساسية
-        payload = json.loads(payment.invoice_payload)
-        telegram_id = payload.get("userId")
-        plan_id = payload.get("planId")
-        payment_id = payment.telegram_payment_charge_id
-
-        # التحقق من البيانات الأساسية
-        if not all([telegram_id, plan_id, payment_id]):
-            logging.error("❌ بيانات ناقصة في payload")
-            return
-
-        # استخراج payment_token من قاعدة البيانات
-        async with current_app.db_pool.acquire() as conn:
-            payment_data = await conn.fetchrow('''
-                SELECT payment_token 
-                FROM payments 
-                WHERE 
-                    telegram_id = $1 AND
-                    subscription_plan_id = $2 AND
-                    payment_id = $3
-                ORDER BY created_at DESC 
-                LIMIT 1
-            ''', telegram_id, plan_id, payment_id)
-
-            if not payment_data:
-                logging.error("❌ لم يتم العثور على payment_token")
-                return
-
-            payment_token = payment_data['payment_token']
-
-        # إرسال البيانات مع payment_token
-        success = await send_payment_to_subscribe_api(
-            telegram_id=telegram_id,
-            plan_id=plan_id,
-            payment_id=payment_id,
-            payment_token=payment_token
-        )
-
-        if not success:
-            logging.error("❌ فشل إرسال البيانات إلى خدمة الاشتراك")
-
-    except json.JSONDecodeError:
-        logging.error("❌ تنسيق payload غير صالح")
-    except Exception as e:
-        logging.error(f"❌ خطأ غير متوقع: {str(e)}")
 
 # 🔹 تشغيل Polling بدلاً من Webhook
 is_bot_running = False
