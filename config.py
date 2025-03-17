@@ -35,4 +35,11 @@ SECRET_KEY=os.getenv("SECRET_KEY")
 
 REFRESH_SECRET_KEY =os.getenv("refresh_secret_key") # تأكد من تغييره إلى قيمة آمنة
 
-REFRESH_COOKIE_NAME = "my_app_refresh_token"  
+REFRESH_COOKIE_NAME = "my_app_refresh_token"
+
+
+BSC_NODE_URL = os.getenv("BSC_NODE_URL", "https://data-seed-prebsc-1-s1.binance.org:8545/")
+USDT_CONTRACT_ADDRESS = "0x6a724A1D2622f17a4C1e315cD45372c6d466f1e8"
+PAYMENT_EXPIRY_MINUTES = 30
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "your_encryption_key_here")
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "123")
