@@ -4,6 +4,7 @@ import json
 import io
 import base64
 from uuid import uuid4
+
 from datetime import datetime, timedelta, timezone
 
 import qrcode
@@ -161,6 +162,10 @@ async def verify_payment():
                 logging.error("❌ BSCSCAN_API_KEY غير مُعد")
                 return jsonify({"error": "Internal server configuration error"}), 500
 
+            # إضافة تأخير بسيط للسماح بفهرسة المعاملة لدى BscScan (قد تكون المعاملة حديثة)
+            import asyncio
+            await asyncio.sleep(5)
+
             try:
                 data_api = fetch_bscscan_data(deposit_address)
                 logging.info(f"📄 بيانات BscScan الخام: {json.dumps(data_api, indent=2)}")
@@ -185,18 +190,30 @@ async def verify_payment():
                 logging.debug(f"عينة من المعاملات: {transactions[:2]}")
 
             tx_found = None
+            # استخدام العنوان الصحيح لعقد التوكن؛ تأكد من ضبط المتغير TOKEN_CONTRACT_ADDRESS في بيئتك
+            expected_token_contract = os.getenv(
+                "TOKEN_CONTRACT_ADDRESS",
+                "0x567a9bcbe6706be5c24513784bfe46631e8f7aa3"  # القيمة الصحيحة لعقد التوكن في الاختبار
+            ).lower()
             for tx_item in transactions:
                 if isinstance(tx_item, dict):
-                    # تحسين عملية البحث مع تسجيل تفاصيل أكثر
                     token_symbol = tx_item.get("tokenSymbol", "Unknown")
                     to_address = tx_item.get("to", "").lower()
-                    value = float(tx_item.get("value", 0)) / 1e6
+                    token_contract = tx_item.get("contractAddress", "").lower()
+                    # إذا كان التوكن يستخدم 18 منزلة، نقسم على 1e18
+                    value = float(tx_item.get("value", 0)) / 1e18
 
-                    logging.debug(f"🔍 فحص معاملة: {token_symbol} -> {to_address} بقيمة {value}")
+                    logging.debug(f"🔍 فحص معاملة: {token_symbol} -> {to_address} بقيمة {value} مع عقد التوكن: {token_contract}")
 
-                    if (token_symbol == "USDT" and
-                            to_address == deposit_address.lower() and
-                            value >= payment["amount"]):
+                    # التحقق من أن المعاملة هي تحويل للتوكن الصحيح:
+                    # - يجب أن يكون رمز التوكن "MTK"
+                    # - يجب أن يكون عنوان المستلم هو عنوان المحفظة (deposit_address)
+                    # - يجب أن يكون عنوان عقد التوكن مطابقًا للعنوان المتوقع
+                    # - يجب أن تكون القيمة المحولة مساوية أو أكبر من المبلغ المطلوب
+                    if (token_symbol == "MTK" and
+                        to_address == deposit_address.lower() and
+                        token_contract == expected_token_contract and
+                        value >= payment["amount"]):
                         tx_found = tx_item
                         logging.info("✅ تم العثور على معاملة مطابقة")
                         break
@@ -208,7 +225,9 @@ async def verify_payment():
                 return jsonify({"error": "Payment not received or not yet confirmed"}), 402
 
             tx_hash = tx_found.get("hash")
-            if not is_transaction_confirmed(tx_hash, required_confirmations=12):
+            # استخدام قيمة التأكيدات المطلوبة من البيئة أو القيمة الافتراضية (5 تأكيدات في بيئة الاختبار)
+            required_confirmations = int(os.getenv("REQUIRED_CONFIRMATIONS", 5))
+            if not is_transaction_confirmed(tx_hash, required_confirmations=required_confirmations):
                 logging.info("⏳ المعاملة موجودة لكن لم تصل لعدد التأكيدات المطلوبة بعد")
                 return jsonify({"error": "Payment not confirmed yet"}), 402
 
@@ -228,12 +247,18 @@ async def verify_payment():
             subscribe_url = os.getenv("SUBSCRIBE_URL", "http://localhost:5000")
             headers = {"Authorization": f"Bearer {os.getenv('WEBHOOK_SECRET')}"}
 
-            async with httpx.AsyncClient() as client:
-                subscribe_response = await client.post(
-                    f"{subscribe_url}/api/subscribe",
-                    json=subscribe_payload,
-                    headers=headers
-                )
+            # تحديد timeout مخصص (15 ثانية على سبيل المثال)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                try:
+                    subscribe_response = await client.post(
+                        f"{subscribe_url}",
+                        json=subscribe_payload,
+                        headers=headers
+                    )
+                except httpx.ReadTimeout:
+                    logging.error("❌ انتهاء مهلة طلب الاشتراك. يرجى المحاولة لاحقاً.")
+                    return jsonify({"error": "Subscription renewal request timed out"}), 500
+
             if subscribe_response.status_code != 200:
                 logging.error(f"❌ فشل طلب الاشتراك: {subscribe_response.text}")
                 return jsonify({"error": "Subscription renewal failed"}), 500

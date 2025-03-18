@@ -12,7 +12,7 @@ def fetch_bscscan_data(address: str) -> dict:
     api_key = os.getenv("BSCSCAN_API_KEY")
     if not api_key:
         raise ValueError("BSCSCAN_API_KEY must be set in environment variables.")
-    api_url = f"https://api.bscscan.com/api?module=account&action=tokentx&address={address}&apikey={api_key}"
+    api_url = f"https://api-testnet.bscscan.com/api?module=account&action=tokentx&address={address}&apikey={api_key}"
     response = requests.get(api_url, timeout=10)
     response.raise_for_status()
     return response.json()
