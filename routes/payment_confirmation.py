@@ -174,15 +174,12 @@ async def parse_transactions(provider: LiteBalancer):
                     try:
                         comment = forward_payload.load_snake_string()
                         logging.info(f"📌 التعليق الكامل المستخرج: {comment}")
+                        order_id_from_payload = comment.strip()  # استخراج القيمة مباشرة بدون "orderId:"
+                        logging.info(f"📦 تم استخراج orderId: '{order_id_from_payload}' من tx_hash: {tx_hash_hex}")
                     except Exception as e:
                         logging.error(f"❌ خطأ أثناء قراءة التعليق في tx_hash: {tx_hash_hex}: {str(e)}")
                         continue
-                    if comment.startswith("orderId:"):
-                        order_id_from_payload = comment[len("orderId:"):].strip()
-                        logging.info(f"📦 تم استخراج orderId: '{order_id_from_payload}' من tx_hash: {tx_hash_hex}")
-                    else:
-                        logging.warning(f"⚠️ التعليق في tx_hash: {tx_hash_hex} لا يبدأ بـ 'orderId:' - تجاهل المعاملة.")
-                        continue
+
                 else:
                     logging.warning(
                         f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
@@ -402,7 +399,7 @@ async def confirm_payment():
                         order_id=order_id,
                         payment_token=payment_token
                     )
-                    break  # تم التسجيل بنجاح في جدول payments، نخرج من حلقة المحاولات
+                    break
                 except UniqueViolationError:
                     attempt += 1
                     logging.warning("⚠️ تكرار payment_token، إعادة المحاولة...")
