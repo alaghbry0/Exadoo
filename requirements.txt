@@ -90,8 +90,7 @@ pyaes==1.6.1
 pyasn1==0.6.1
 pyasn1_modules==0.4.1
 pycparser==2.22
-pycryptodome==3.21.0
-pycryptodomex==3.21.0
+
 
 pyparsing==3.2.1
 pyproject_hooks==1.2.0
