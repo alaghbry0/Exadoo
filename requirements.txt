@@ -102,13 +102,13 @@ pytest==8.3.5
 pytest-asyncio==0.23.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
-pytoniq==0.1.40
-pytoniq-core==0.1.41
-pytonlib==0.0.46
+
+
+
 pytvm==0.0.14
 pytz==2024.2
 pyunormalize==16.0.0
-pywin32==309
+
 qrcode==8.0
 Quart==0.20.0
 quart-cors==0.8.0
