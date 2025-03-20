@@ -92,22 +92,19 @@ pyasn1_modules==0.4.1
 pycparser==2.22
 pycryptodome==3.21.0
 pycryptodomex==3.21.0
-pydantic==2.10.5
-pydantic_core==2.27.2
-PyJWT==2.10.1
-PyNaCl==1.5.0
+
 pyparsing==3.2.1
 pyproject_hooks==1.2.0
 pytest==8.3.5
 pytest-asyncio==0.23.0
-python-dateutil==2.9.0.post0
+
 python-dotenv==1.0.1
 
 
 
-pytvm==0.0.14
+
 pytz==2024.2
-pyunormalize==16.0.0
+
 
 qrcode==8.0
 Quart==0.20.0
