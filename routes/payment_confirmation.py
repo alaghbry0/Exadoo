@@ -36,6 +36,16 @@ def normalize_address(addr_str: str) -> str:
         return addr_str.strip()
 
 
+# دالة تحويل القيمة إلى الوحدة المطلوبة
+def convert_amount(raw_value: int, decimals: int = 9) -> float:
+    return raw_value / (10 ** decimals)
+
+# دالة لاسترجاع سعر الاشتراك من جدول subscription_plans
+async def get_subscription_price(conn, subscription_plan_id: int) -> float:
+    query = "SELECT price FROM subscription_plans WHERE id = $1"
+    row = await conn.fetchrow(query, subscription_plan_id)
+    return float(row['price']) if row and row['price'] is not None else 0.0
+
 async def retry_get_transactions(provider: LiteBalancer, address: str, count: int = 10,
                                  retries: int = 3, initial_delay: int = 5, backoff: int = 2):
     """
@@ -48,8 +58,7 @@ async def retry_get_transactions(provider: LiteBalancer, address: str, count: in
             return transactions
         except LiteServerError as e:
             if e.code == -400:
-                logging.warning("تحذير: Liteserver لم يعثر على المعاملة. محاولة رقم %d/%d بعد %d ثانية...", attempt,
-                                retries, delay)
+                logging.warning("تحذير: Liteserver لم يعثر على المعاملة. محاولة رقم %d/%d بعد %d ثانية...", attempt, retries, delay)
             else:
                 raise e
         except Exception as e:
@@ -100,8 +109,7 @@ async def parse_transactions(provider: LiteBalancer):
 
             dest_address = normalize_address(transaction.in_msg.info.dest.to_str(1, 1, 1))
             if dest_address != normalized_bot_address:
-                logging.info(
-                    f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
+                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
                 continue
 
             # استخراج عنوان المُرسل لأغراض التسجيل فقط
@@ -109,7 +117,7 @@ async def parse_transactions(provider: LiteBalancer):
             normalized_sender = normalize_address(sender_wallet_address)
             value = transaction.in_msg.info.value_coins
             if value != 0:
-                value = value / 1e9
+                value = convert_amount(value, 9)
             logging.info(f"💰 معاملة tx_hash: {tx_hash_hex} من {normalized_sender} بقيمة {value} TON.")
 
             if len(transaction.in_msg.body.bits) < 32:
@@ -120,13 +128,13 @@ async def parse_transactions(provider: LiteBalancer):
             op_code = body_slice.load_uint(32)
             logging.info(f"📌 OP Code الأساسي: {hex(op_code)}")
             if op_code not in (0xf8a7ea5, 0x7362d09c):
-                logging.info(
-                    f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
+                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
                 continue
 
             body_slice.load_bits(64)  # تخطي query_id
 
-            jetton_amount = body_slice.load_coins() / 1e9
+            # تحويل قيمة Jetton باستخدام دالة التحويل
+            jetton_amount = convert_amount(body_slice.load_coins(), 9)
             logging.info(f"💸 قيمة Jetton: {jetton_amount}")
             jetton_sender = body_slice.load_address().to_str(1, 1, 1)
             normalized_jetton_sender = normalize_address(jetton_sender)
@@ -159,8 +167,7 @@ async def parse_transactions(provider: LiteBalancer):
                 expected_jetton_wallet = normalized_jetton_sender
 
             normalized_expected = normalize_address(expected_jetton_wallet)
-            logging.info(
-                f"🔍 (للتسجيل) مقارنة العناوين: payload={normalized_jetton_sender} vs expected={normalized_expected}")
+            logging.info(f"🔍 (للتسجيل) مقارنة العناوين: payload={normalized_jetton_sender} vs expected={normalized_expected}")
             logging.info("✅ سيتم استخدام orderId للمطابقة مع قاعدة البيانات.")
 
             # استخراج forward payload للتعليق (orderId)
@@ -181,11 +188,9 @@ async def parse_transactions(provider: LiteBalancer):
                         logging.error(f"❌ خطأ أثناء قراءة التعليق في tx_hash: {tx_hash_hex}: {str(e)}")
                         continue
                 else:
-                    logging.warning(
-                        f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
+                    logging.warning(f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
                     continue
 
-            # تم إزالة الشرط الذي كان يتجاهل المعاملة في حال عدم وجود orderId
             logging.info(f"✅ orderId المستخرج: {order_id_from_payload}")
 
             # المطابقة مع قاعدة البيانات باستخدام orderId فقط
@@ -199,61 +204,79 @@ async def parse_transactions(provider: LiteBalancer):
                 db_order_id = pending_payment['order_id'].strip()
                 db_amount = float(pending_payment.get('amount', 0))
                 logging.info(f"🔍 الدفعة المعلقة الموجودة: order_id: '{db_order_id}', amount: {db_amount}")
-                logging.info(f"🔍 مقارنة: payload orderId: '{order_id_from_payload}' vs DB orderId: '{db_order_id}'")
                 if db_order_id != order_id_from_payload:
-                    logging.warning(
-                        f"⚠️ عدم تطابق orderId: DB '{db_order_id}' vs payload '{order_id_from_payload}' - تجاهل tx_hash: {tx_hash_hex}")
+                    logging.warning(f"⚠️ عدم تطابق orderId: DB '{db_order_id}' vs payload '{order_id_from_payload}' - تجاهل tx_hash: {tx_hash_hex}")
                     continue
-                if abs(db_amount - jetton_amount) > 1e-9:
-                    logging.warning(
-                        f"⚠️ عدم تطابق مبلغ الدفع: DB amount {db_amount} vs jetton_amount {jetton_amount} في tx_hash: {tx_hash_hex} - تجاهل المعاملة.")
+
+                # استرجاع سعر الاشتراك من جدول subscription_plans باستخدام subscription_plan_id
+                subscription_plan_id = pending_payment['subscription_plan_id']
+                expected_subscription_price = await get_subscription_price(conn, subscription_plan_id)
+                tolerance = 0.30  # الفارق المسموح به
+                logging.info(f"🔍 سعر الاشتراك: {expected_subscription_price}, tolerance: {tolerance}")
+
+                # مقارنة مبلغ الدفع مع سعر الاشتراك
+                difference = expected_subscription_price - jetton_amount
+                if difference < 0:
+                    # دفعة زائدة
+                    await redis_manager.publish_event(
+                        f"payment_{pending_payment['payment_token']}",
+                        {
+                            'status': 'success',
+                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك بعد 3 ثواني.'
+                        }
+                    )
+                    await asyncio.sleep(3)
+                elif difference > tolerance:
+                    # دفعة ناقصة خارج الفارق المسموح
+                    await redis_manager.publish_event(
+                        f"payment_{pending_payment['payment_token']}",
+                        {
+                            'status': 'failed',
+                            'message': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
+                        }
+                    )
                     continue
+                else:
+                    # دفعة ناقصة ضمن الفارق المسموح
+                    await redis_manager.publish_event(
+                        f"payment_{pending_payment['payment_token']}",
+                        {
+                            'status': 'success',
+                            'message': 'المبلغ المدفوع أقل من المطلوب، سنقوم بتجديد اشتراكك هذه المرة فقط.'
+                        }
+                    )
 
                 logging.info(f"✅ تطابق بيانات الدفع. متابعة التحديث لـ payment_id: {pending_payment['payment_id']}")
                 tx_hash = tx_hash_hex
                 updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_id'], tx_hash)
                 if updated_payment_data:
-                    logging.info(
-                        f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {pending_payment['payment_id']}، tx_hash: {tx_hash}")
+                    logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {pending_payment['payment_id']}، tx_hash: {tx_hash}")
                     async with aiohttp.ClientSession() as session:
                         headers = {
                             "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
                             "Content-Type": "application/json"
                         }
-
-                        tx_hash_hex: str = transaction.cell.hash.hex()
-                        tx_hash: str = tx_hash_hex  # تأكيد النوع
-
-                        # تحقق صارم من النوع (اختياري)
-                        if not isinstance(tx_hash, str):
-                            logging.error(f"نوع tx_hash غير متوقع: {type(tx_hash)}")
-                            continue
-
                         subscription_payload = {
                             "telegram_id": int(pending_payment['telegram_id']),
                             "subscription_plan_id": pending_payment['subscription_plan_id'],
-                            "payment_id": tx_hash,  # استخدام tx_hash كـ payment_id
-                            "payment_token": pending_payment['payment_token'],  # إضافة حقل payment_token
+                            "payment_id": tx_hash,
+                            "payment_token": pending_payment['payment_token'],
                             "username": str(pending_payment['username']),
                             "full_name": str(pending_payment['full_name']),
                         }
-                        logging.info(
-                            f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
+                        logging.info(f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
                         try:
-                            async with session.post(subscribe_api_url, json=subscription_payload,
-                                                    headers=headers) as response:
+                            async with session.post(subscribe_api_url, json=subscription_payload, headers=headers) as response:
                                 if response.status == 200:
                                     subscribe_data = await response.json()
                                     logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_data}")
                                 else:
                                     error_details = await response.text()
-                                    logging.error(
-                                        f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {error_details}")
+                                    logging.error(f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {error_details}")
                         except Exception as e:
                             logging.error(f"❌ استثناء أثناء استدعاء /api/subscribe: {str(e)}")
                 else:
-                    logging.error(
-                        f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ payment_id: {pending_payment['payment_id']}")
+                    logging.error(f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ payment_id: {pending_payment['payment_id']}")
             logging.info(f"📝 Transaction processed: tx_hash: {tx_hash_hex}, lt: {transaction.lt}")
 
     except Exception as e:
