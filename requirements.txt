@@ -95,7 +95,7 @@ python-dotenv==1.0.1
 
 jwt
 
-
+pytoniq
 pytz==2024.2
 
 
