@@ -174,21 +174,18 @@ async def parse_transactions(provider: LiteBalancer):
                     try:
                         comment = forward_payload.load_snake_string()
                         logging.info(f"📌 التعليق الكامل المستخرج: {comment}")
-                        order_id_from_payload = comment.strip()  # استخراج القيمة مباشرة بدون "orderId:"
+                        # استخراج القيمة مباشرة بدون التحقق من بادئة "orderId:"
+                        order_id_from_payload = comment.strip()
                         logging.info(f"📦 تم استخراج orderId: '{order_id_from_payload}' من tx_hash: {tx_hash_hex}")
                     except Exception as e:
                         logging.error(f"❌ خطأ أثناء قراءة التعليق في tx_hash: {tx_hash_hex}: {str(e)}")
                         continue
-
                 else:
                     logging.warning(
                         f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
                     continue
 
-            if not order_id_from_payload:
-                logging.warning(f"⚠️ لم يتم استخراج orderId من tx_hash: {tx_hash_hex} - تجاهل المعاملة.")
-                continue
-
+            # تم إزالة الشرط الذي كان يتجاهل المعاملة في حال عدم وجود orderId
             logging.info(f"✅ orderId المستخرج: {order_id_from_payload}")
 
             # المطابقة مع قاعدة البيانات باستخدام orderId فقط
