@@ -92,8 +92,8 @@ pytest==8.3.5
 pytest-asyncio==0.23.0
 
 python-dotenv==1.0.1
-
-jwt
+PyJWT==2.8.0
+jwt==24.3.1
 
 pytoniq
 pytz==2024.2
