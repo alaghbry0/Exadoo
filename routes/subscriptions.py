@@ -188,7 +188,7 @@ async def subscribe():
             new_expiry_local = new_expiry.astimezone(LOCAL_TZ)
 
             response_data = {
-                "message": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
+                "fmessage": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
                 "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
                 "start_date": start_date_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
                 "invite_link": invite_link,
@@ -201,7 +201,7 @@ async def subscribe():
                 {
                     'status': 'success',
                     'invite_link': invite_link,
-                    'message': response_data['message']
+                    'fmessage': response_data['fmessage']
                 }
             )
 
