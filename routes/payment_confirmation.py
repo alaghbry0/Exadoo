@@ -216,21 +216,21 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'success',
-                            'fmessage': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق.'
+                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق.'
                         }
                     )
-                    await asyncio.sleep(3)
+
                 elif difference > tolerance:
                     # دفعة ناقصة خارج الفارق المسموح
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'failed',
-                            'fmessage': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
+                            'message': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
                         }
                     )
                     continue
-                else:
+                elif difference >= Decimal('0.15'):
                     # دفعة ناقصة ضمن الفارق المسموح
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
@@ -239,7 +239,7 @@ async def parse_transactions(provider: LiteBalancer):
                             'fmessage': 'يبدو أنه لم يتم احتساب رسوم الشبكة في الدفعة، هذه المرة سنقوم بتجديد اشتراكك، لذا نرجو أن يتم تضمينها في المرة القادمة.'
                         }
                     )
-                await asyncio.sleep(3)
+
                 logging.info(f"✅ تطابق بيانات الدفع. متابعة التحديث لـ payment_id: {pending_payment['payment_id']}")
                 tx_hash = tx_hash_hex
                 updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_id'], tx_hash)
