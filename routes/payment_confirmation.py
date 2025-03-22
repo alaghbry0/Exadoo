@@ -216,7 +216,12 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'success',
-                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق.'
+                            'type': 'overpayment',
+                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق.',
+                            'metadata': {
+                                'paid_amount': jetton_amount,
+                                'expected_amount': expected_subscription_price
+                            }
                         }
                     )
 
@@ -226,6 +231,7 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'failed',
+                            'type': 'overpayment',
                             'message': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
                         }
                     )
@@ -236,6 +242,7 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'success',
+                            'type': 'overpayment',
                             'message': 'يبدو أنه لم يتم احتساب رسوم الشبكة في الدفعة، هذه المرة سنقوم بتجديد اشتراكك، لذا نرجو أن يتم تضمينها في المرة القادمة.'
                         }
                     )

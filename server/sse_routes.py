@@ -83,3 +83,67 @@ async def sse_stream():
             'X-Accel-Buffering': 'no'
         }
     )
+
+
+@sse_bp.route('/check-payment/<payment_token>')
+async def check_payment(payment_token):
+    try:
+        # التحقق من وجود الدفعة في Redis أو قاعدة البيانات
+        payment_data = await redis_manager.redis.get(f'payment_{payment_token}')
+
+        if payment_data:
+            return jsonify(json.loads(payment_data)), 200
+
+        # إذا لم توجد في Redis، ابحث في قاعدة البيانات
+        async with current_app.db_pool.acquire() as conn:
+            record = await conn.fetchrow('''
+                SELECT status, created_at 
+                FROM payments 
+                WHERE payment_token = $1
+            ''', payment_token)
+
+            if record:
+                return jsonify({
+                    'status': record['status'],
+                    'created_at': record['created_at'].isoformat()
+                }), 200
+
+        return jsonify({'error': 'Payment not found'}), 404
+
+    except Exception as e:
+        logging.error(f"Check payment error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@sse_bp.route('/verify-payment/<payment_token>')
+async def verify_payment(payment_token):
+    try:
+        async with current_app.db_pool.acquire() as conn:
+            # التحقق من وجود الدفعة ومطابقة البيانات
+            record = await conn.fetchrow('''
+                SELECT 
+                    p.telegram_id,
+                    p.amount,
+                    p.status,
+                    tp.plan_id
+                FROM payments p
+                JOIN telegram_payments tp ON p.payment_token = tp.payment_token
+                WHERE p.payment_token = $1
+            ''', payment_token)
+
+            if not record:
+                return jsonify({'valid': False, 'reason': 'Invalid token'}), 404
+
+            # التحقق من الصلاحية (مثال: 24 ساعة)
+            is_expired = datetime.now() - record['created_at'] > timedelta(hours=24)
+
+            return jsonify({
+                'valid': not is_expired and record['status'] == 'pending',
+                'telegram_id': record['telegram_id'],
+                'plan_id': record['plan_id'],
+                'amount': record['amount']
+            }), 200
+
+    except Exception as e:
+        logging.error(f"Verify payment error: {str(e)}")
+        return jsonify({'valid': False}), 500
