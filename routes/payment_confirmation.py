@@ -216,7 +216,7 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'success',
-                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق.'
+                            'fmessage': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق.'
                         }
                     )
                     await asyncio.sleep(3)
@@ -226,7 +226,7 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'failed',
-                            'message': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
+                            'fmessage': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
                         }
                     )
                     continue
@@ -236,7 +236,7 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'success',
-                            'message': 'يبدو أنه لم يتم احتساب رسوم الشبكة في الدفعة، هذه المرة سنقوم بتجديد اشتراكك، لذا نرجو أن يتم تضمينها في المرة القادمة.'
+                            'fmessage': 'يبدو أنه لم يتم احتساب رسوم الشبكة في الدفعة، هذه المرة سنقوم بتجديد اشتراكك، لذا نرجو أن يتم تضمينها في المرة القادمة.'
                         }
                     )
                 await asyncio.sleep(3)
@@ -354,7 +354,7 @@ async def confirm_payment():
 
         webhook_secret_frontend = data.get("webhookSecret")
         if not webhook_secret_frontend or webhook_secret_frontend != os.getenv("WEBHOOK_SECRET"):
-            logging.warning("❌ طلب غير مصرح به: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
+            logging.warning("❌ طلب غير مصرح به إلى /api/confirm_payment: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
             return jsonify({"error": "Unauthorized request"}), 403
 
         user_wallet_address = data.get("userWalletAddress")
@@ -446,7 +446,6 @@ async def confirm_payment():
     except Exception as e:
         logging.error(f"❌ خطأ في /api/confirm_payment: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
 # تغيير قيمة timestamp إلى float لتفادي تحذيرات النوع
 _wallet_cache = {
     "address": None,
