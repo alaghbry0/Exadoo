@@ -4,7 +4,7 @@ import asyncio
 from quart import Blueprint, request, jsonify, current_app
 import json
 import os
-from decimal import Decimal, getcontext
+from decimal import Decimal, ROUND_DOWN, getcontext
 import aiohttp
 from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_token
 from pytoniq import LiteBalancer, begin_cell, Address
@@ -348,6 +348,7 @@ async def confirm_payment():
         data = await request.get_json()
         logging.info(f"📥 بيانات الطلب المستلمة: {json.dumps(data, indent=2)}")
 
+        # التحقق من مفتاح الـ webhook
         webhook_secret_frontend = data.get("webhookSecret")
         if not webhook_secret_frontend or webhook_secret_frontend != os.getenv("WEBHOOK_SECRET"):
             logging.warning("❌ طلب غير مصرح به: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
@@ -358,30 +359,23 @@ async def confirm_payment():
         telegram_id_str = data.get("telegramId")
         telegram_username = data.get("telegramUsername")
         full_name = data.get("fullName")
-        # لم يعد نستخدم orderId من الطلب
-        amount_str = data.get("amount", "0")  # قد يتم تجاهله هنا، حيث سيسترجع الخادم السعر الصحيح
-        try:
-            amount = float(amount_str)
-        except ValueError:
-            amount = 0.0
-            logging.warning(f"⚠️ قيمة amount غير صالحة: {amount_str}. سيتم تعيينها إلى 0.")
 
-        logging.info(
-            f"✅ استلام طلب تأكيد الدفع: userWalletAddress={user_wallet_address}, "
-            f"planId={plan_id_str}, telegramId={telegram_id_str}, username={telegram_username}, full_name={full_name}, amount={amount}"
-        )
-
+        # التحقق من معرّف الخطة وتحويله إلى عدد صحيح
         try:
             subscription_plan_id = int(plan_id_str)
         except (ValueError, TypeError):
             subscription_plan_id = 1
             logging.warning(f"⚠️ planId ليس عددًا صحيحًا: {plan_id_str}. تم استخدام الخطة الأساسية افتراضيًا.")
 
+        # التحقق من صحة telegramId
         try:
             telegram_id = int(telegram_id_str)
         except (ValueError, TypeError):
             logging.error(f"❌ telegramId ليس عددًا صحيحًا: {telegram_id_str}. تعذر تسجيل الدفعة.")
-            return jsonify({"error": "Invalid telegramId", "details": "telegramId must be an integer."}), 400
+            return jsonify({
+                "error": "Invalid telegramId",
+                "details": "telegramId must be an integer."
+            }), 400
 
         # إنشاء payment_token جديد مع إعادة المحاولة عند التضارب
         payment_token = str(uuid4())
@@ -391,13 +385,17 @@ async def confirm_payment():
         attempt = 0
 
         async with current_app.db_pool.acquire() as conn:
+            # استرجاع السعر من جدول subscription_plans
+            price = await get_subscription_price(conn, subscription_plan_id)
+            logging.info(f"✅ السعر المسترجع من قاعدة البيانات: {price}")
+
             while attempt < max_attempts:
                 try:
                     result = await record_payment(
                         conn=conn,
                         telegram_id=telegram_id,
                         user_wallet_address=user_wallet_address,
-                        amount=amount,
+                        amount=price,  # تمرير السعر كـ Decimal
                         subscription_plan_id=subscription_plan_id,
                         username=telegram_username,
                         full_name=full_name,
@@ -432,16 +430,18 @@ async def confirm_payment():
                 logging.error(f"❌ خطأ أثناء تسجيل البيانات في جدول telegram_payments: {str(e)}")
 
         logging.info(f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_token={payment_token}")
-        # إرجاع payment_token و amount حتى يتمكن العميل من استخدامها لاحقًا
+        # تنسيق السعر ليظهر بدقتين بعد الفاصلة
+        formatted_price = str(price.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
         return jsonify({
             "success": True,
             "payment_token": payment_token,
-            "amount": str(result.get("amount", amount))
+            "amount": formatted_price
         }), 200
 
     except Exception as e:
         logging.error(f"❌ خطأ في /api/confirm_payment: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
 # تغيير قيمة timestamp إلى float لتفادي تحذيرات النوع
 _wallet_cache = {
     "address": None,
