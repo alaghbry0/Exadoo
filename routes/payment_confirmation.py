@@ -39,9 +39,10 @@ def normalize_address(addr_str: str) -> str:
         return addr_str.strip()
 
 
+
 # دالة تحويل القيمة إلى الوحدة المطلوبة
-def convert_amount(raw_value: int, decimals: int = 9) -> float:
-    return raw_value / (10 ** decimals)
+def convert_amount(raw_value: int, decimals: int = 9) -> Decimal:
+    return Decimal(raw_value) / Decimal(10 ** decimals)
 
 async def get_subscription_price(conn, subscription_plan_id: int) -> Decimal:
     query = "SELECT price FROM subscription_plans WHERE id = $1"
@@ -112,16 +113,16 @@ async def parse_transactions(provider: LiteBalancer):
 
             dest_address = normalize_address(transaction.in_msg.info.dest.to_str(1, 1, 1))
             if dest_address != normalized_bot_address:
-                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
+                logging.info(
+                    f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
                 continue
 
             # استخراج عنوان المُرسل لأغراض التسجيل فقط
-
             sender_wallet_address = transaction.in_msg.info.src.to_str(1, 1, 1)
             normalized_sender = normalize_address(sender_wallet_address)
             value = transaction.in_msg.info.value_coins
             if value != 0:
-                value = convert_amount(value, 9)
+                value = value / 1e9
             logging.info(f"💰 معاملة tx_hash: {tx_hash_hex} من {normalized_sender} بقيمة {value} TON.")
 
             if len(transaction.in_msg.body.bits) < 32:
@@ -132,7 +133,8 @@ async def parse_transactions(provider: LiteBalancer):
             op_code = body_slice.load_uint(32)
             logging.info(f"📌 OP Code الأساسي: {hex(op_code)}")
             if op_code not in (0xf8a7ea5, 0x7362d09c):
-                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
+                logging.info(
+                    f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
                 continue
 
             body_slice.load_bits(64)  # تخطي query_id
@@ -250,11 +252,11 @@ async def parse_transactions(provider: LiteBalancer):
                         }
                     )
 
-                logging.info(f"✅ تطابق بيانات الدفع. متابعة التحديث لـ payment_id: {pending_payment['payment_id']}")
+                logging.info(f"✅ تطابق بيانات الدفع. متابعة التحديث لـ payment_token: {pending_payment['payment_token']}")
                 tx_hash = tx_hash_hex
-                updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_id'], tx_hash)
+                updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_token'], tx_hash)
                 if updated_payment_data:
-                    logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {pending_payment['payment_id']}، tx_hash: {tx_hash}")
+                    logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_token: {pending_payment['payment_token']}، tx_hash: {tx_hash}")
                     async with aiohttp.ClientSession() as session:
                         headers = {
                             "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
