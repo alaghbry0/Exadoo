@@ -118,16 +118,18 @@ async def parse_transactions(provider: LiteBalancer):
             # التحقق من صحة المعاملة على السلسلة (اختياري؛ يُساعد في التأكد من اكتمال البيانات)
             chain_data = await verify_transaction_on_chain(tx_hash_hex)
 
-            # تحديد نوع الرسالة: داخلي (int_msg) أو خارجي (ext_in_msg)
-            msg_type = getattr(transaction.in_msg, "msg_type", "int_msg")
+            # التحقق من وجود مصدر المعاملة
+            if not transaction.in_msg.info.src:
+                logging.warning(f"⚠️ لا يوجد مصدر (src) للمعاملة tx_hash: {tx_hash_hex} - تخطيها.")
+                continue
 
+            sender_wallet_address = transaction.in_msg.info.src.to_str(1, 1, 1)
+            normalized_sender = normalize_address(sender_wallet_address)
             dest_address = normalize_address(transaction.in_msg.info.dest.to_str(1, 1, 1))
             if dest_address != normalized_bot_address:
                 logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت - تخطيها.")
                 continue
 
-            sender_wallet_address = transaction.in_msg.info.src.to_str(1, 1, 1)
-            normalized_sender = normalize_address(sender_wallet_address)
             value = transaction.in_msg.info.value_coins
             if value != 0:
                 value = convert_amount(value, 9)
@@ -138,7 +140,8 @@ async def parse_transactions(provider: LiteBalancer):
                 logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} تبدو كتحويل TON وليس Jetton - تخطيها.")
                 continue
 
-            # إذا كانت المعاملة داخلية نستخدم بيانات الـ body_slice
+            # التمييز بين المعاملات الداخلية والخارجية بناءً على msg_type
+            msg_type = getattr(transaction.in_msg, "msg_type", "int_msg")
             if msg_type == "int_msg":
                 body_slice = transaction.in_msg.body.begin_parse()
                 op_code = body_slice.load_uint(32)
@@ -149,7 +152,6 @@ async def parse_transactions(provider: LiteBalancer):
 
                 body_slice.load_bits(64)  # تخطي query_id
 
-                # قراءة قيمة Jetton بأمان مع التحقق من وجود بيانات في الشريحة
                 try:
                     if len(body_slice.bits) > 0:
                         jetton_coins = body_slice.load_coins()
@@ -163,7 +165,6 @@ async def parse_transactions(provider: LiteBalancer):
 
                 logging.info(f"💸 قيمة Jetton: {jetton_amount}")
 
-                # استخراج عنوان المرسل من payload مع التحقق من توفر بيانات كافية
                 try:
                     if len(body_slice.bits) < 2:
                         logging.warning(f"⚠️ لا توجد بيانات كافية لاستخراج عنوان المرسل في tx_hash: {tx_hash_hex}")
@@ -171,7 +172,7 @@ async def parse_transactions(provider: LiteBalancer):
                     jetton_sender = body_slice.load_address().to_str(1, 1, 1)
                 except Exception as e:
                     logging.error(f"❌ خطأ أثناء استخراج عنوان المرسل من payload في tx_hash: {tx_hash_hex}: {str(e)}")
-                    # محاولة استخدام عنوان المرسل من بيانات السلسلة كخيار احتياطي
+                    # استخدام بيانات السلسلة كخيار احتياطي إذا كانت متوفرة
                     if chain_data and "in_msg" in chain_data and "decoded_body" in chain_data["in_msg"]:
                         decoded_body = chain_data["in_msg"]["decoded_body"]
                         jetton_sender = decoded_body.get("sender", "")
@@ -181,7 +182,6 @@ async def parse_transactions(provider: LiteBalancer):
                 normalized_jetton_sender = normalize_address(jetton_sender)
                 logging.info(f"📤 عنوان المرسل من payload: {normalized_jetton_sender}")
 
-                # استخراج forward payload إن وجد
                 try:
                     forward_payload = body_slice.load_ref().begin_parse() if body_slice.load_bit() else body_slice
                     logging.info("✅ تم استخراج forward payload.")
@@ -208,13 +208,11 @@ async def parse_transactions(provider: LiteBalancer):
                     payment_token_from_payload = None
 
             else:
-                # معالجة المعاملات الخارجية (ext_in_msg) باستخدام بيانات السلسلة
+                # معالجة المعاملات الخارجية باستخدام بيانات السلسلة
                 logging.info(f"📝 معالجة معاملة خارجية (msg_type: {msg_type}) باستخدام بيانات السلسلة")
                 if chain_data and "in_msg" in chain_data and "decoded_body" in chain_data["in_msg"]:
                     decoded_body = chain_data["in_msg"]["decoded_body"]
-                    # نفترض أن المفتاح "amount" يمثل قيمة الدفع بوحدات Nano (مثلاً 5000000 ل5 USDT)
                     jetton_amount = Decimal(decoded_body.get("amount", "0")) / Decimal(10**6)
-                    # ونفترض أن paymentToken موجود ضمن forward_payload
                     payment_token_from_payload = None
                     if "forward_payload" in decoded_body:
                         payment_token_from_payload = decoded_body["forward_payload"].get("value", {}).get("text", None)
@@ -226,7 +224,6 @@ async def parse_transactions(provider: LiteBalancer):
 
             logging.info(f"✅ paymentToken المستخرج: {payment_token_from_payload}")
 
-            # متابعة التحقق من الدفع في قاعدة البيانات وتحديث السجل
             async with current_app.db_pool.acquire() as conn:
                 pending_payment = await fetch_pending_payment_by_token(conn, payment_token_from_payload)
                 if not pending_payment:
