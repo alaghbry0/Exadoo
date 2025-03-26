@@ -6,7 +6,7 @@ import json
 import os
 from decimal import Decimal, ROUND_DOWN, getcontext
 import aiohttp
-from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_token
+from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_payment_token
 from pytoniq import LiteBalancer, begin_cell, Address
 from pytoniq.liteclient.client import LiteServerError
 from typing import Optional  # لإضافة تلميحات النوع
@@ -25,9 +25,23 @@ payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 
 getcontext().prec = 30
 
-# دالة تحويل القيمة إلى الوحدة المطلوبة باستخدام Decimal
-def convert_amount(raw_value: int, decimals: int = 9) -> Decimal:
-    return Decimal(raw_value) / Decimal(10 ** decimals)
+def normalize_address(addr_str: str) -> str:
+    """
+    دالة مساعدة لتوحيد تنسيق العناوين (لأغراض التسجيل فقط)
+    """
+    try:
+        if addr_str.startswith("0:"):
+            addr_str = addr_str[2:]
+        addr = Address(addr_str)
+        return addr.to_str(is_user_friendly=True, is_bounceable=False, is_url_safe=True).strip()
+    except Exception as e:
+        logging.warning(f"❌ فشل تطبيع العنوان {addr_str}: {str(e)}")
+        return addr_str.strip()
+
+
+# دالة تحويل القيمة إلى الوحدة المطلوبة
+def convert_amount(raw_value: int, decimals: int = 9) -> float:
+    return raw_value / (10 ** decimals)
 
 async def get_subscription_price(conn, subscription_plan_id: int) -> Decimal:
     query = "SELECT price FROM subscription_plans WHERE id = $1"
@@ -59,31 +73,20 @@ async def retry_get_transactions(provider: LiteBalancer, address: str, count: in
     raise Exception("فشل الحصول على المعاملات بعد {} محاولات".format(retries))
 
 
-def normalize_address(addr_str: str) -> str:
-    """
-    دالة مساعدة لتوحيد تنسيق العناوين (لأغراض التسجيل فقط)
-    """
-    try:
-        if addr_str.startswith("0:"):
-            addr_str = addr_str[2:]
-        addr = Address(addr_str)
-        return addr.to_str(is_user_friendly=True, is_bounceable=False, is_url_safe=True).strip()
-    except Exception as e:
-        logging.warning(f"❌ فشل تطبيع العنوان {addr_str}: {str(e)}")
-        return addr_str.strip()
-
 
 async def parse_transactions(provider: LiteBalancer):
     """
-    تقوم هذه الدالة بجلب آخر المعاملات من محفظة البوت وتحليلها باستخدام payment_token للمطابقة.
+    تقوم هذه الدالة بجلب آخر المعاملات من محفظة البوت وتحليلها.
     """
     logging.info("🔄 بدء parse_transactions...")
 
+    # الحصول على عنوان المحفظة من قاعدة البيانات عبر الدالة الجديدة
     my_wallet_address: Optional[str] = await get_bot_wallet_address()
     if not my_wallet_address:
         logging.error("❌ لم يتم تعريف عنوان محفظة البوت في قاعدة البيانات!")
         return
 
+    # استخدام العنوان المُطَبعة عند استعلام المعاملات
     normalized_bot_address = normalize_address(my_wallet_address)
     logging.info(f"🔍 جلب آخر المعاملات من محفظة البوت: {normalized_bot_address}")
 
@@ -103,8 +106,16 @@ async def parse_transactions(provider: LiteBalancer):
             tx_hash_hex = transaction.cell.hash.hex()
             logging.info(f"🔄 فحص المعاملة tx_hash: {tx_hash_hex}")
 
+            if not transaction.in_msg.is_internal:
+                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست داخلية - تم تجاهلها.")
+                continue
 
+            dest_address = normalize_address(transaction.in_msg.info.dest.to_str(1, 1, 1))
+            if dest_address != normalized_bot_address:
+                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
+                continue
 
+            # استخراج عنوان المُرسل لأغراض التسجيل فقط
 
             sender_wallet_address = transaction.in_msg.info.src.to_str(1, 1, 1)
             normalized_sender = normalize_address(sender_wallet_address)
@@ -120,12 +131,13 @@ async def parse_transactions(provider: LiteBalancer):
             body_slice = transaction.in_msg.body.begin_parse()
             op_code = body_slice.load_uint(32)
             logging.info(f"📌 OP Code الأساسي: {hex(op_code)}")
-            if op_code not in (0xf8a7ea5, 0x7362d09c, 0xd53276db):
+            if op_code not in (0xf8a7ea5, 0x7362d09c):
                 logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
                 continue
 
             body_slice.load_bits(64)  # تخطي query_id
 
+            # تحويل قيمة Jetton باستخدام دالة التحويل
             jetton_amount = convert_amount(body_slice.load_coins(), 9)
             logging.info(f"💸 قيمة Jetton: {jetton_amount}")
             jetton_sender = body_slice.load_address().to_str(1, 1, 1)
@@ -143,6 +155,7 @@ async def parse_transactions(provider: LiteBalancer):
 
             logging.info(f"📌 عدد البتات في forward payload: {len(forward_payload.bits)}")
 
+            # الحصول على expected_jetton_wallet لأغراض التسجيل فقط
             try:
                 jetton_master = (await provider.run_get_method(
                     address=sender_wallet_address, method="get_wallet_data", stack=[]
@@ -159,8 +172,9 @@ async def parse_transactions(provider: LiteBalancer):
 
             normalized_expected = normalize_address(expected_jetton_wallet)
             logging.info(f"🔍 (للتسجيل) مقارنة العناوين: payload={normalized_jetton_sender} vs expected={normalized_expected}")
-            logging.info("✅ سيتم استخدام paymentToken للمطابقة مع قاعدة البيانات.")
+            logging.info("✅ سيتم استخدام payment_token للمطابقة مع قاعدة البيانات.")
 
+            # استخراج forward payload للتعليق (payment_token)
             payment_token_from_payload = None
             if len(forward_payload.bits) < 32:
                 logging.info(f"💸 معاملة tx_hash: {tx_hash_hex} بدون forward payload (تعليق).")
@@ -171,8 +185,9 @@ async def parse_transactions(provider: LiteBalancer):
                     try:
                         comment = forward_payload.load_snake_string()
                         logging.info(f"📌 التعليق الكامل المستخرج: {comment}")
+                        # استخراج القيمة مباشرة بدون التحقق من بادئة "payment_token:"
                         payment_token_from_payload = comment.strip()
-                        logging.info(f"📦 تم استخراج paymentToken: '{payment_token_from_payload}' من tx_hash: {tx_hash_hex}")
+                        logging.info(f"📦 تم استخراج payment_token: '{payment_token_from_payload}' من tx_hash: {tx_hash_hex}")
                     except Exception as e:
                         logging.error(f"❌ خطأ أثناء قراءة التعليق في tx_hash: {tx_hash_hex}: {str(e)}")
                         continue
@@ -180,21 +195,30 @@ async def parse_transactions(provider: LiteBalancer):
                     logging.warning(f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
                     continue
 
-            logging.info(f"✅ paymentToken المستخرج: {payment_token_from_payload}")
+            logging.info(f"✅ payment_token المستخرج: {payment_token_from_payload}")
 
+            # المطابقة مع قاعدة البيانات باستخدام payment_token
             async with current_app.db_pool.acquire() as conn:
-                logging.info(f"🔍 البحث عن دفعة معلقة باستخدام paymentToken: {payment_token_from_payload}")
-                pending_payment = await fetch_pending_payment_by_token(conn, payment_token_from_payload)
+                logging.info(f"🔍 البحث عن دفعة معلقة باستخدام payment_token: {payment_token_from_payload}")
+                pending_payment = await fetch_pending_payment_by_payment_token(conn, payment_token_from_payload)
                 if not pending_payment:
-                    logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لـ paymentToken: {payment_token_from_payload}")
+                    logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لـ payment_token: {payment_token_from_payload}")
                     continue
 
-                # لم يعد هناك مقارنة بين orderId من قاعدة البيانات والتعليق؛ نثق بأن السجل مطابق
+                db_payment_token = pending_payment['payment_token'].strip()
+                db_amount = float(pending_payment.get('amount', 0))
+                logging.info(f"🔍 الدفعة المعلقة الموجودة: payment_token: '{db_payment_token}', amount: {db_amount}")
+                if db_payment_token != payment_token_from_payload:
+                    logging.warning(f"⚠️ عدم تطابق payment_token: DB '{db_payment_token}' vs payload '{payment_token_from_payload}' - تجاهل tx_hash: {tx_hash_hex}")
+                    continue
+
+                # استرجاع سعر الاشتراك من جدول subscription_plans باستخدام subscription_plan_id
                 subscription_plan_id = pending_payment['subscription_plan_id']
                 expected_subscription_price = await get_subscription_price(conn, subscription_plan_id)
-                tolerance = Decimal('0.30')
+                tolerance = 0.30  # الفارق المسموح به
                 logging.info(f"🔍 سعر الاشتراك: {expected_subscription_price}, tolerance: {tolerance}")
 
+                # مقارنة مبلغ الدفع مع سعر الاشتراك
                 difference = expected_subscription_price - jetton_amount
                 if difference < 0:
                     # دفعة زائدة
@@ -202,33 +226,27 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'success',
-                            'type': 'overpayment',
-                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق.',
-                            'metadata': {
-                                'paid_amount': jetton_amount,
-                                'expected_amount': expected_subscription_price
-                            }
+                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك بعد 3 ثواني.'
                         }
                     )
+                    await asyncio.sleep(3)
                 elif difference > tolerance:
                     # دفعة ناقصة خارج الفارق المسموح
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'failed',
-                            'type': 'overpayment',
                             'message': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
                         }
                     )
                     continue
-                elif difference >= Decimal('0.15'):
+                else:
                     # دفعة ناقصة ضمن الفارق المسموح
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'success',
-                            'type': 'overpayment',
-                            'message': 'يبدو أنه لم يتم احتساب رسوم الشبكة في الدفعة، هذه المرة سنقوم بتجديد اشتراكك، لذا نرجو أن يتم تضمينها في المرة القادمة.'
+                            'message': 'المبلغ المدفوع أقل من المطلوب، سنقوم بتجديد اشتراكك هذه المرة فقط.'
                         }
                     )
 
@@ -269,7 +287,6 @@ async def parse_transactions(provider: LiteBalancer):
         logging.error(f"❌ خطأ أثناء معالجة المعاملات الدورية: {str(e)}", exc_info=True)
     finally:
         logging.info("✅ انتهاء parse_transactions.")
-
 
 
 async def periodic_check_payments():
@@ -327,7 +344,6 @@ async def startup():
     logging.info("🚦 بدء المهام الخلفية...")
     asyncio.create_task(periodic_check_payments())
 
-
 async def handle_failed_transaction(tx_hash: str, retries: int = 3):
     for attempt in range(retries):
         try:
@@ -343,12 +359,12 @@ async def confirm_payment():
     logging.info("✅ تم استدعاء نقطة API /api/confirm_payment!")
     try:
         data = await request.get_json()
-        logging.info(f"📥 بيانات الطلب المستلمة: {json.dumps(data, indent=2)}")
+        logging.info(f"📥 بيانات الطلب المستلمة في /api/confirm_payment: {json.dumps(data, indent=2)}")
 
-        # التحقق من مفتاح الـ webhook
+        # التحقق من مفتاح الويب هوك المرسل من الواجهة الأمامية
         webhook_secret_frontend = data.get("webhookSecret")
         if not webhook_secret_frontend or webhook_secret_frontend != os.getenv("WEBHOOK_SECRET"):
-            logging.warning("❌ طلب غير مصرح به: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
+            logging.warning("❌ طلب غير مصرح به إلى /api/confirm_payment: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
             return jsonify({"error": "Unauthorized request"}), 403
 
         user_wallet_address = data.get("userWalletAddress")
@@ -356,43 +372,56 @@ async def confirm_payment():
         telegram_id_str = data.get("telegramId")
         telegram_username = data.get("telegramUsername")
         full_name = data.get("fullName")
+        # تم إزالة order_id واستقبال amount من العميل
 
-        # التحقق من معرّف الخطة وتحويله إلى عدد صحيح
+        logging.info(
+            f"✅ استلام طلب تأكيد الدفع: userWalletAddress={user_wallet_address}, "
+            f"planId={plan_id_str}, telegramId={telegram_id_str}, username={telegram_username}, full_name={full_name}"
+        )
+
         try:
             subscription_plan_id = int(plan_id_str)
         except (ValueError, TypeError):
             subscription_plan_id = 1
             logging.warning(f"⚠️ planId ليس عددًا صحيحًا: {plan_id_str}. تم استخدام الخطة الأساسية افتراضيًا.")
 
-        # التحقق من صحة telegramId
         try:
             telegram_id = int(telegram_id_str)
         except (ValueError, TypeError):
             logging.error(f"❌ telegramId ليس عددًا صحيحًا: {telegram_id_str}. تعذر تسجيل الدفعة.")
-            return jsonify({
-                "error": "Invalid telegramId",
-                "details": "telegramId must be an integer."
-            }), 400
+            return jsonify({"error": "Invalid telegramId", "details": "telegramId must be an integer."}), 400
 
-        # إنشاء payment_token جديد مع إعادة المحاولة عند التضارب
+        # إنشاء payment_token فريد
         payment_token = str(uuid4())
-        logging.info("💾 جاري تسجيل الدفعة المعلقة في قاعدة البيانات...")
-        result = None
-        max_attempts = 3
-        attempt = 0
 
+        # الحصول على قيمة المبلغ من جدول subscription_plans بناءً على subscription_plan_id
+        amount = 0.0
         async with current_app.db_pool.acquire() as conn:
-            # استرجاع السعر من جدول subscription_plans
-            price = await get_subscription_price(conn, subscription_plan_id)
-            logging.info(f"✅ السعر المسترجع من قاعدة البيانات: {price}")
+            try:
+                query = "SELECT price FROM subscription_plans WHERE id = $1"
+                record = await conn.fetchrow(query, subscription_plan_id)
+                if record and record.get("price") is not None:
+                    amount = float(record["price"])
+                    logging.info(f"✅ تم جلب السعر من جدول subscription_plans: {amount}")
+                else:
+                    logging.warning(f"⚠️ لم يتم العثور على خطة بالمعرف {subscription_plan_id}. سيتم تعيين المبلغ إلى 0.0")
+            except Exception as e:
+                logging.error(f"❌ خطأ أثناء جلب السعر من قاعدة البيانات: {str(e)}")
+                return jsonify({"error": "Internal server error"}), 500
+
+            logging.info("💾 جاري تسجيل الدفعة المعلقة في قاعدة البيانات...")
+            result = None
+            max_attempts = 3  # تحديد الحد الأقصى لمحاولات إعادة التسجيل
+            attempt = 0
 
             while attempt < max_attempts:
                 try:
+
                     result = await record_payment(
                         conn=conn,
                         telegram_id=telegram_id,
                         user_wallet_address=user_wallet_address,
-                        amount=price,  # تمرير السعر كـ Decimal
+                        amount=amount,
                         subscription_plan_id=subscription_plan_id,
                         username=telegram_username,
                         full_name=full_name,
@@ -408,6 +437,7 @@ async def confirm_payment():
                 logging.error("❌ فشل تسجيل الدفعة بعد محاولات متعددة بسبب تضارب payment_token.")
                 return jsonify({"error": "Failed to record payment after retries"}), 500
 
+            # تسجيل نفس البيانات في جدول telegram_payments
             try:
                 await conn.execute('''
                     INSERT INTO telegram_payments (
@@ -427,12 +457,12 @@ async def confirm_payment():
                 logging.error(f"❌ خطأ أثناء تسجيل البيانات في جدول telegram_payments: {str(e)}")
 
         logging.info(f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_token={payment_token}")
-        # تنسيق السعر ليظهر بدقتين بعد الفاصلة
-        formatted_price = str(price.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+        # تنسيق قيمة amount بدقتين بعد الفاصلة
+        formatted_amount = f"{amount:.2f}"
         return jsonify({
             "success": True,
             "payment_token": payment_token,
-            "amount": formatted_price
+            "amount": formatted_amount
         }), 200
 
     except Exception as e:

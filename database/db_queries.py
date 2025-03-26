@@ -310,7 +310,6 @@ async def record_payment(
                 user_id, 
                 subscription_plan_id, 
                 amount, 
-                payment_date, 
                 telegram_id, 
                 username, 
                 full_name, 
@@ -318,8 +317,8 @@ async def record_payment(
                 status, 
                 payment_token
             )
-            VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, 'pending', $8)
-            RETURNING payment_id, payment_date, amount;
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+            RETURNING payment_token, amount;
         """
         result = await conn.fetchrow(
             sql,
@@ -336,9 +335,7 @@ async def record_payment(
         if result:
             logging.info(f"✅ تم تسجيل الدفعة: {payment_token}")
             return {
-                "payment_id": result["payment_id"],
                 "payment_token": payment_token,
-                "payment_date": result["payment_date"],
                 "amount": result["amount"]
             }
         else:
@@ -350,45 +347,43 @@ async def record_payment(
         return None
 
 
-async def update_payment_with_txhash(conn, payment_id: str, tx_hash: str) -> Optional[dict]:
+async def update_payment_with_txhash(conn, payment_token: str, tx_hash: str) -> Optional[dict]:
     """
-    تحديث سجل الدفع باستخدام payment_id لتسجيل tx_hash وتحديث الحالة.
-    لا يتم استخدام order_id هنا.
+    تحديث سجل الدفع باستخدام payment_token لتسجيل tx_hash وتحديث الحالة.
     """
     try:
         row = await conn.fetchrow(
             """
             UPDATE payments
             SET tx_hash = $1,
-                status = 'completed',
-                payment_date = NOW()
-            WHERE payment_id = $2
+                status = 'completed'
+            WHERE payment_token = $2
             RETURNING telegram_id, subscription_plan_id, username, full_name, user_wallet_address, payment_token;
             """,
-            tx_hash, payment_id
+            tx_hash, payment_token
         )
         if row:
-            logging.info(f"✅ تم تحديث سجل الدفع بنجاح للـ payment_id: {payment_id}")
+            logging.info(f"✅ تم تحديث سجل الدفع بنجاح لـ payment_token: {payment_token}")
             return dict(row)
         else:
-            logging.error(f"❌ لم يتم العثور على سجل الدفع للـ payment_id: {payment_id}")
+            logging.error(f"❌ لم يتم العثور على سجل الدفع لـ payment_token: {payment_token}")
             return None
     except Exception as e:
         logging.error(f"❌ فشل تحديث سجل الدفع: {e}", exc_info=True)
         return None
 
 
-async def fetch_pending_payment_by_token(conn, payment_token: str) -> Optional[dict]:
+
+async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Optional[dict]:
     """
     جلب سجل دفع معلق من قاعدة البيانات بناءً على payment_token فقط.
     """
     try:
         sql = """
-            SELECT payment_id, telegram_id, subscription_plan_id, payment_token, username, full_name, user_wallet_address, amount
+            SELECT telegram_id, subscription_plan_id, payment_token, username, full_name, user_wallet_address, amount
             FROM payments
             WHERE TRIM(payment_token) = TRIM($1)
               AND status = 'pending'
-            ORDER BY payment_date ASC
             LIMIT 1;
         """
         row = await conn.fetchrow(sql, payment_token)
