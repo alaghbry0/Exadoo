@@ -103,7 +103,6 @@ async def parse_transactions(provider: LiteBalancer):
             tx_hash_hex = transaction.cell.hash.hex()
             logging.info(f"🔄 فحص المعاملة tx_hash: {tx_hash_hex}")
 
-
             dest_address = normalize_address(transaction.in_msg.info.dest.to_str(1, 1, 1))
             if dest_address != normalized_bot_address:
                 logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
@@ -129,7 +128,18 @@ async def parse_transactions(provider: LiteBalancer):
 
             body_slice.load_bits(64)  # تخطي query_id
 
-            jetton_amount = convert_amount(body_slice.load_coins(), 9)
+            # قراءة قيمة Jetton بأمان مع التحقق من وجود بيانات في الشريحة
+            try:
+                if len(body_slice.bits) > 0:
+                    jetton_coins = body_slice.load_coins()
+                    jetton_amount = convert_amount(jetton_coins, 9)
+                else:
+                    logging.warning(f"⚠️ لا توجد بيانات للعملة في tx_hash: {tx_hash_hex}")
+                    jetton_amount = Decimal('0')
+            except Exception as e:
+                logging.error(f"❌ خطأ أثناء قراءة قيمة العملات في tx_hash: {tx_hash_hex}: {str(e)}")
+                continue
+
             logging.info(f"💸 قيمة Jetton: {jetton_amount}")
             jetton_sender = body_slice.load_address().to_str(1, 1, 1)
             normalized_jetton_sender = normalize_address(jetton_sender)
@@ -272,7 +282,6 @@ async def parse_transactions(provider: LiteBalancer):
         logging.error(f"❌ خطأ أثناء معالجة المعاملات الدورية: {str(e)}", exc_info=True)
     finally:
         logging.info("✅ انتهاء parse_transactions.")
-
 
 
 async def periodic_check_payments():
