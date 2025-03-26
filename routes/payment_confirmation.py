@@ -123,7 +123,7 @@ async def parse_transactions(provider: LiteBalancer):
             body_slice = transaction.in_msg.body.begin_parse()
             op_code = body_slice.load_uint(32)
             logging.info(f"📌 OP Code الأساسي: {hex(op_code)}")
-            if op_code not in (0xf8a7ea5, 0x7362d09c):
+            if op_code not in (0xf8a7ea5, 0x7362d09c, 0xd53276db):
                 logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
                 continue
 
