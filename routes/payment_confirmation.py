@@ -73,9 +73,22 @@ def normalize_address(addr_str: str) -> str:
         return addr_str.strip()
 
 
+async def verify_transaction_on_chain(tx_hash: str):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://tonapi.io/v2/blockchain/transactions/{tx_hash}") as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+    except Exception as e:
+        logging.error(f"فشل التحقق من السلسلة: {str(e)}")
+        return None
+
+
 async def parse_transactions(provider: LiteBalancer):
     """
     تقوم هذه الدالة بجلب آخر المعاملات من محفظة البوت وتحليلها باستخدام payment_token للمطابقة.
+    تدعم معالجة المعاملات الداخلية (من المحافظ التقليدية) والمعاملات الخارجية (مثل معاملات محافظ ويب3 أو منصات خارجية).
     """
     logging.info("🔄 بدء parse_transactions...")
 
@@ -103,9 +116,15 @@ async def parse_transactions(provider: LiteBalancer):
             tx_hash_hex = transaction.cell.hash.hex()
             logging.info(f"🔄 فحص المعاملة tx_hash: {tx_hash_hex}")
 
+            # التحقق من صحة المعاملة على السلسلة (اختياري؛ يُساعد في التأكد من اكتمال البيانات)
+            chain_data = await verify_transaction_on_chain(tx_hash_hex)
+
+            # تحديد نوع الرسالة: داخلي (int_msg) أو خارجي (ext_in_msg)
+            msg_type = getattr(transaction.in_msg, "msg_type", "int_msg")
+
             dest_address = normalize_address(transaction.in_msg.info.dest.to_str(1, 1, 1))
             if dest_address != normalized_bot_address:
-                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
+                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت - تخطيها.")
                 continue
 
             sender_wallet_address = transaction.in_msg.info.src.to_str(1, 1, 1)
@@ -115,94 +134,103 @@ async def parse_transactions(provider: LiteBalancer):
                 value = convert_amount(value, 9)
             logging.info(f"💰 معاملة tx_hash: {tx_hash_hex} من {normalized_sender} بقيمة {value} TON.")
 
+            # حال عدم وجود جسم بيانات كافٍ نعتبرها تحويل TON وليس Jetton
             if len(transaction.in_msg.body.bits) < 32:
-                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} تبدو كتحويل TON وليس Jetton - تم تجاهلها.")
+                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} تبدو كتحويل TON وليس Jetton - تخطيها.")
                 continue
 
-            body_slice = transaction.in_msg.body.begin_parse()
-            op_code = body_slice.load_uint(32)
-            logging.info(f"📌 OP Code الأساسي: {hex(op_code)}")
-            if op_code not in (0xf8a7ea5, 0x7362d09c, 0xd53276db):
-                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
-                continue
+            # في حالة المعاملات الداخلية نستخدم بيانات الـ body_slice
+            if msg_type == "int_msg":
+                body_slice = transaction.in_msg.body.begin_parse()
+                op_code = body_slice.load_uint(32)
+                logging.info(f"📌 OP Code الأساسي: {hex(op_code)}")
+                if op_code not in (0xf8a7ea5, 0x7362d09c, 0xd53276db):
+                    logging.info(
+                        f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تخطيها.")
+                    continue
 
-            body_slice.load_bits(64)  # تخطي query_id
+                body_slice.load_bits(64)  # تخطي query_id
 
-            # قراءة قيمة Jetton بأمان مع التحقق من وجود بيانات في الشريحة
-            try:
-                if len(body_slice.bits) > 0:
-                    jetton_coins = body_slice.load_coins()
-                    jetton_amount = convert_amount(jetton_coins, 9)
-                else:
-                    logging.warning(f"⚠️ لا توجد بيانات للعملة في tx_hash: {tx_hash_hex}")
-                    jetton_amount = Decimal('0')
-            except Exception as e:
-                logging.error(f"❌ خطأ أثناء قراءة قيمة العملات في tx_hash: {tx_hash_hex}: {str(e)}")
-                continue
+                # قراءة قيمة Jetton بأمان مع التحقق من وجود بيانات في الشريحة
+                try:
+                    if len(body_slice.bits) > 0:
+                        jetton_coins = body_slice.load_coins()
+                        jetton_amount = convert_amount(jetton_coins, 9)
+                    else:
+                        logging.warning(f"⚠️ لا توجد بيانات للعملة في tx_hash: {tx_hash_hex}")
+                        jetton_amount = Decimal('0')
+                except Exception as e:
+                    logging.error(f"❌ خطأ أثناء قراءة قيمة العملات في tx_hash: {tx_hash_hex}: {str(e)}")
+                    continue
 
-            logging.info(f"💸 قيمة Jetton: {jetton_amount}")
-            jetton_sender = body_slice.load_address().to_str(1, 1, 1)
-            normalized_jetton_sender = normalize_address(jetton_sender)
-            logging.info(f"📤 عنوان المرسل من payload: {normalized_jetton_sender}")
+                logging.info(f"💸 قيمة Jetton: {jetton_amount}")
+                # التحقق من توفر بيانات كافية لاستخراج عنوان المرسل
+                try:
+                    if len(body_slice.bits) < 2:
+                        logging.warning(f"⚠️ لا توجد بيانات كافية لاستخراج عنوان المرسل في tx_hash: {tx_hash_hex}")
+                        continue
+                    jetton_sender = body_slice.load_address().to_str(1, 1, 1)
+                except Exception as e:
+                    logging.error(f"❌ خطأ أثناء استخراج عنوان المرسل من payload في tx_hash: {tx_hash_hex}: {str(e)}")
+                    continue
+                normalized_jetton_sender = normalize_address(jetton_sender)
+                logging.info(f"📤 عنوان المرسل من payload: {normalized_jetton_sender}")
 
-            try:
-                remaining_bits = len(body_slice.bits)
-                logging.info(f"📌 عدد البتات المتبقية قبل forward payload: {remaining_bits}")
-                forward_payload = body_slice.load_ref().begin_parse() if body_slice.load_bit() else body_slice
-                logging.info("✅ تم استخراج forward payload.")
-            except Exception as e:
-                logging.error(f"❌ خطأ أثناء استخراج forward payload في tx_hash: {tx_hash_hex}: {str(e)}")
-                continue
+                # استخراج forward payload إن وجد
+                try:
+                    forward_payload = body_slice.load_ref().begin_parse() if body_slice.load_bit() else body_slice
+                    logging.info("✅ تم استخراج forward payload.")
+                except Exception as e:
+                    logging.error(f"❌ خطأ أثناء استخراج forward payload في tx_hash: {tx_hash_hex}: {str(e)}")
+                    continue
 
-            logging.info(f"📌 عدد البتات في forward payload: {len(forward_payload.bits)}")
-
-            try:
-                jetton_master = (await provider.run_get_method(
-                    address=sender_wallet_address, method="get_wallet_data", stack=[]
-                ))[2].load_address()
-                expected_jetton_wallet = (await provider.run_get_method(
-                    address=jetton_master,
-                    method="get_wallet_address",
-                    stack=[begin_cell().store_address(my_wallet_address).end_cell().begin_parse()],
-                ))[0].load_address().to_str(is_user_friendly=True, is_bounceable=False, is_url_safe=True)
-                logging.info(f"📌 عنوان الجيتون المستخرج من العقد (للتسجيل فقط): {expected_jetton_wallet}")
-            except Exception as e:
-                logging.warning(f"⚠️ تجاوز التحقق من عنوان الجيتون بسبب الخطأ: {str(e)}")
-                expected_jetton_wallet = normalized_jetton_sender
-
-            normalized_expected = normalize_address(expected_jetton_wallet)
-            logging.info(f"🔍 (للتسجيل) مقارنة العناوين: payload={normalized_jetton_sender} vs expected={normalized_expected}")
-            logging.info("✅ سيتم استخدام paymentToken للمطابقة مع قاعدة البيانات.")
-
-            payment_token_from_payload = None
-            if len(forward_payload.bits) < 32:
-                logging.info(f"💸 معاملة tx_hash: {tx_hash_hex} بدون forward payload (تعليق).")
-            else:
-                forward_payload_op_code = forward_payload.load_uint(32)
-                logging.info(f"📌 OP Code داخل forward payload: {forward_payload_op_code}")
-                if forward_payload_op_code == 0:
-                    try:
-                        comment = forward_payload.load_snake_string()
-                        logging.info(f"📌 التعليق الكامل المستخرج: {comment}")
-                        payment_token_from_payload = comment.strip()
-                        logging.info(f"📦 تم استخراج paymentToken: '{payment_token_from_payload}' من tx_hash: {tx_hash_hex}")
-                    except Exception as e:
-                        logging.error(f"❌ خطأ أثناء قراءة التعليق في tx_hash: {tx_hash_hex}: {str(e)}")
+                if len(forward_payload.bits) >= 32:
+                    forward_payload_op_code = forward_payload.load_uint(32)
+                    logging.info(f"📌 OP Code داخل forward payload: {forward_payload_op_code}")
+                    if forward_payload_op_code == 0:
+                        try:
+                            comment = forward_payload.load_snake_string()
+                            payment_token_from_payload = comment.strip()
+                            logging.info(
+                                f"📦 تم استخراج paymentToken: '{payment_token_from_payload}' من tx_hash: {tx_hash_hex}")
+                        except Exception as e:
+                            logging.error(f"❌ خطأ أثناء قراءة التعليق في tx_hash: {tx_hash_hex}: {str(e)}")
+                            continue
+                    else:
+                        logging.warning(
+                            f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
                         continue
                 else:
-                    logging.warning(f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
+                    logging.info(f"💸 معاملة tx_hash: {tx_hash_hex} بدون forward payload (تعليق).")
+                    payment_token_from_payload = None
+
+            else:
+                # معالجة المعاملات الخارجية (ext_in_msg) باستخدام بيانات السلسلة
+                logging.info(f"📝 معالجة معاملة خارجية (msg_type: {msg_type}) باستخدام بيانات السلسلة")
+                if chain_data and "in_msg" in chain_data and "decoded_body" in chain_data["in_msg"]:
+                    decoded_body = chain_data["in_msg"]["decoded_body"]
+                    # نفترض أن المفتاح "amount" يمثل قيمة الدفع بوحدات Nano (مثلاً 5000000 ل5 USDT)
+                    jetton_amount = Decimal(decoded_body.get("amount", "0")) / Decimal(10 ** 6)
+                    # ونفترض أن paymentToken موجود ضمن forward_payload
+                    payment_token_from_payload = None
+                    if "forward_payload" in decoded_body:
+                        payment_token_from_payload = decoded_body["forward_payload"].get("value", {}).get("text", None)
+                    logging.info(f"💸 قيمة الدفع من السلسلة: {jetton_amount}")
+                    logging.info(f"📦 paymentToken المستخرج من السلسلة: {payment_token_from_payload}")
+                else:
+                    logging.warning(
+                        f"⚠️ لا تتوفر بيانات السلسلة الكافية لمعالجة المعاملة الخارجية tx_hash: {tx_hash_hex}")
                     continue
 
             logging.info(f"✅ paymentToken المستخرج: {payment_token_from_payload}")
 
+            # متابعة التحقق من الدفع في قاعدة البيانات وتحديث السجل
             async with current_app.db_pool.acquire() as conn:
-                logging.info(f"🔍 البحث عن دفعة معلقة باستخدام paymentToken: {payment_token_from_payload}")
                 pending_payment = await fetch_pending_payment_by_token(conn, payment_token_from_payload)
                 if not pending_payment:
                     logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لـ paymentToken: {payment_token_from_payload}")
                     continue
 
-                # لم يعد هناك مقارنة بين orderId من قاعدة البيانات والتعليق؛ نثق بأن السجل مطابق
                 subscription_plan_id = pending_payment['subscription_plan_id']
                 expected_subscription_price = await get_subscription_price(conn, subscription_plan_id)
                 tolerance = Decimal('0.30')
@@ -210,7 +238,6 @@ async def parse_transactions(provider: LiteBalancer):
 
                 difference = expected_subscription_price - jetton_amount
                 if difference < 0:
-                    # دفعة زائدة
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
@@ -224,7 +251,6 @@ async def parse_transactions(provider: LiteBalancer):
                         }
                     )
                 elif difference > tolerance:
-                    # دفعة ناقصة خارج الفارق المسموح
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
@@ -235,7 +261,6 @@ async def parse_transactions(provider: LiteBalancer):
                     )
                     continue
                 elif difference >= Decimal('0.15'):
-                    # دفعة ناقصة ضمن الفارق المسموح
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
@@ -249,7 +274,8 @@ async def parse_transactions(provider: LiteBalancer):
                 tx_hash = tx_hash_hex
                 updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_id'], tx_hash)
                 if updated_payment_data:
-                    logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {pending_payment['payment_id']}، tx_hash: {tx_hash}")
+                    logging.info(
+                        f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_id: {pending_payment['payment_id']}، tx_hash: {tx_hash}")
                     async with aiohttp.ClientSession() as session:
                         headers = {
                             "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
@@ -263,19 +289,23 @@ async def parse_transactions(provider: LiteBalancer):
                             "username": str(pending_payment['username']),
                             "full_name": str(pending_payment['full_name']),
                         }
-                        logging.info(f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
+                        logging.info(
+                            f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
                         try:
-                            async with session.post(subscribe_api_url, json=subscription_payload, headers=headers) as response:
+                            async with session.post(subscribe_api_url, json=subscription_payload,
+                                                    headers=headers) as response:
                                 if response.status == 200:
                                     subscribe_data = await response.json()
                                     logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_data}")
                                 else:
                                     error_details = await response.text()
-                                    logging.error(f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {error_details}")
+                                    logging.error(
+                                        f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {error_details}")
                         except Exception as e:
                             logging.error(f"❌ استثناء أثناء استدعاء /api/subscribe: {str(e)}")
                 else:
-                    logging.error(f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ payment_id: {pending_payment['payment_id']}")
+                    logging.error(
+                        f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ payment_id: {pending_payment['payment_id']}")
             logging.info(f"📝 Transaction processed: tx_hash: {tx_hash_hex}, lt: {transaction.lt}")
 
     except Exception as e:
