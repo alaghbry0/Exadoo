@@ -75,9 +75,7 @@ def normalize_address(addr_str: str) -> str:
 
 async def parse_transactions(provider: LiteBalancer):
     """
-    تقوم هذه الدالة بجلب آخر المعاملات من محفظة البوت وتحليلها.
-    يتم التمييز بين المعاملات الداخلية (التي تحتوي على بيانات Jetton) والمعاملات الخارجية (التي لا تحتوي على forward payload)
-    لمعالجتها بشكل مناسب.
+    تقوم هذه الدالة بجلب آخر المعاملات من محفظة البوت وتحليلها باستخدام payment_token للمطابقة.
     """
     logging.info("🔄 بدء parse_transactions...")
 
@@ -105,10 +103,8 @@ async def parse_transactions(provider: LiteBalancer):
             tx_hash_hex = transaction.cell.hash.hex()
             logging.info(f"🔄 فحص المعاملة tx_hash: {tx_hash_hex}")
 
-            dest_address = normalize_address(transaction.in_msg.info.dest.to_str(1, 1, 1))
-            if dest_address != normalized_bot_address:
-                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
-                continue
+
+
 
             sender_wallet_address = transaction.in_msg.info.src.to_str(1, 1, 1)
             normalized_sender = normalize_address(sender_wallet_address)
@@ -117,95 +113,10 @@ async def parse_transactions(provider: LiteBalancer):
                 value = convert_amount(value, 9)
             logging.info(f"💰 معاملة tx_hash: {tx_hash_hex} من {normalized_sender} بقيمة {value} TON.")
 
-            # إذا كانت المعاملة لا تحتوي على بيانات Jetton (forward payload) فتعتبر معاملة خارجية
             if len(transaction.in_msg.body.bits) < 32:
-                logging.info(f"🔄 معاملة tx_hash: {tx_hash_hex} تبدو كدفعة خارجية (TON) بدون بيانات Jetton.")
-                # معالجة الدفعات الخارجية: سيتم البحث عن سجل دفع معلق بناءً على عنوان المرسل وقيمة الدفعة
-                async with current_app.db_pool.acquire() as conn:
-                    logging.info(f"🔍 البحث عن دفعة معلقة خارجية باستخدام العنوان: {normalized_sender} والمبلغ: {value} TON")
-                    pending_payment = await fetch_pending_external_payment(conn, normalized_sender, value)
-                    if not pending_payment:
-                        logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق للمعاملة الخارجية tx_hash: {tx_hash_hex}")
-                        continue
+                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} تبدو كتحويل TON وليس Jetton - تم تجاهلها.")
+                continue
 
-                    # التحقق من المبلغ المتوقع للاشتراك
-                    subscription_plan_id = pending_payment['subscription_plan_id']
-                    expected_subscription_price = await get_subscription_price(conn, subscription_plan_id)
-                    tolerance = Decimal('0.30')
-                    logging.info(f"🔍 سعر الاشتراك المتوقع: {expected_subscription_price}, tolerance: {tolerance}")
-
-                    difference = expected_subscription_price - value
-                    if difference < 0:
-                        # دفعة زائدة
-                        await redis_manager.publish_event(
-                            f"payment_{pending_payment['payment_token']}",
-                            {
-                                'status': 'success',
-                                'type': 'overpayment',
-                                'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق.',
-                                'metadata': {
-                                    'paid_amount': value,
-                                    'expected_amount': expected_subscription_price
-                                }
-                            }
-                        )
-                    elif difference > tolerance:
-                        # دفعة ناقصة خارج الفارق المسموح
-                        await redis_manager.publish_event(
-                            f"payment_{pending_payment['payment_token']}",
-                            {
-                                'status': 'failed',
-                                'type': 'underpayment',
-                                'message': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
-                            }
-                        )
-                        continue
-                    elif difference >= Decimal('0.15'):
-                        # دفعة ناقصة ضمن الفارق المسموح
-                        await redis_manager.publish_event(
-                            f"payment_{pending_payment['payment_token']}",
-                            {
-                                'status': 'success',
-                                'type': 'underpayment',
-                                'message': 'يبدو أنه لم يتم احتساب رسوم الشبكة في الدفعة، هذه المرة سنقوم بتجديد اشتراكك، لذا نرجو أن يتم تضمينها في المرة القادمة.'
-                            }
-                        )
-
-                    logging.info(f"✅ تطابق بيانات الدفع الخارجية. متابعة التحديث لـ payment_id: {pending_payment['payment_id']}")
-                    tx_hash = tx_hash_hex
-                    updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_id'], tx_hash)
-                    if updated_payment_data:
-                        logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' للدفعة الخارجية payment_id: {pending_payment['payment_id']}، tx_hash: {tx_hash}")
-                        async with aiohttp.ClientSession() as session:
-                            headers = {
-                                "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
-                                "Content-Type": "application/json"
-                            }
-                            subscription_payload = {
-                                "telegram_id": int(pending_payment['telegram_id']),
-                                "subscription_plan_id": pending_payment['subscription_plan_id'],
-                                "payment_id": tx_hash,
-                                "payment_token": pending_payment['payment_token'],
-                                "username": str(pending_payment['username']),
-                                "full_name": str(pending_payment['full_name']),
-                            }
-                            logging.info(f"📞 استدعاء /api/subscribe لتجديد الاشتراك بالبيانات: {json.dumps(subscription_payload, indent=2)}")
-                            try:
-                                async with session.post(subscribe_api_url, json=subscription_payload, headers=headers) as response:
-                                    if response.status == 200:
-                                        subscribe_data = await response.json()
-                                        logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_data}")
-                                    else:
-                                        error_details = await response.text()
-                                        logging.error(f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {error_details}")
-                            except Exception as e:
-                                logging.error(f"❌ استثناء أثناء استدعاء /api/subscribe: {str(e)}")
-                    else:
-                        logging.error(f"❌ فشل تحديث حالة الدفع في قاعدة البيانات للدفعة الخارجية payment_id: {pending_payment['payment_id']}")
-                logging.info(f"📝 المعاملة الخارجية تمت معالجتها: tx_hash: {tx_hash_hex}, lt: {transaction.lt}")
-                continue  # الانتقال إلى المعاملة التالية
-
-            # الفرع الخاص بمعالجة المدفوعات الداخلية التي تحتوي على بيانات Jetton:
             body_slice = transaction.in_msg.body.begin_parse()
             op_code = body_slice.load_uint(32)
             logging.info(f"📌 OP Code الأساسي: {hex(op_code)}")
@@ -278,6 +189,7 @@ async def parse_transactions(provider: LiteBalancer):
                     logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لـ paymentToken: {payment_token_from_payload}")
                     continue
 
+                # لم يعد هناك مقارنة بين orderId من قاعدة البيانات والتعليق؛ نثق بأن السجل مطابق
                 subscription_plan_id = pending_payment['subscription_plan_id']
                 expected_subscription_price = await get_subscription_price(conn, subscription_plan_id)
                 tolerance = Decimal('0.30')
@@ -285,6 +197,7 @@ async def parse_transactions(provider: LiteBalancer):
 
                 difference = expected_subscription_price - jetton_amount
                 if difference < 0:
+                    # دفعة زائدة
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
@@ -298,21 +211,23 @@ async def parse_transactions(provider: LiteBalancer):
                         }
                     )
                 elif difference > tolerance:
+                    # دفعة ناقصة خارج الفارق المسموح
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'failed',
-                            'type': 'underpayment',
+                            'type': 'overpayment',
                             'message': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
                         }
                     )
                     continue
                 elif difference >= Decimal('0.15'):
+                    # دفعة ناقصة ضمن الفارق المسموح
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'success',
-                            'type': 'underpayment',
+                            'type': 'overpayment',
                             'message': 'يبدو أنه لم يتم احتساب رسوم الشبكة في الدفعة، هذه المرة سنقوم بتجديد اشتراكك، لذا نرجو أن يتم تضمينها في المرة القادمة.'
                         }
                     )
