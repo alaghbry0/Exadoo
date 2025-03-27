@@ -358,12 +358,12 @@ async def update_payment_with_txhash(conn, payment_token: str, tx_hash: str) -> 
             SET tx_hash = $1,
                 status = 'completed'
             WHERE payment_token = $2
-            RETURNING telegram_id, subscription_plan_id, username, full_name, user_wallet_address, payment_token;
+            RETURNING telegram_id, subscription_plan_id, username, full_name, user_wallet_address, payment_token, tx_hash;
             """,
             tx_hash, payment_token
         )
         if row:
-            logging.info(f"✅ تم تحديث سجل الدفع بنجاح لـ payment_token: {payment_token}")
+            logging.info(f"✅ تم تحديث سجل الدفع بنجاح لـ payment_token: {payment_token} مع tx_hash: {tx_hash}")
             return dict(row)
         else:
             logging.error(f"❌ لم يتم العثور على سجل الدفع لـ payment_token: {payment_token}")
@@ -371,6 +371,7 @@ async def update_payment_with_txhash(conn, payment_token: str, tx_hash: str) -> 
     except Exception as e:
         logging.error(f"❌ فشل تحديث سجل الدفع: {e}", exc_info=True)
         return None
+
 
 
 

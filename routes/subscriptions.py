@@ -66,7 +66,7 @@ async def subscribe():
 
         async with db_pool.acquire() as connection:
             existing_payment = await connection.fetchrow(
-                "SELECT * FROM payments WHERE payment_id = $1", payment_id
+                "SELECT * FROM payments WHERE tx_hash = $1", payment_id
             )
             if existing_payment:
                 logging.warning(f"⚠️ الدفع مسجل مسبقًا: {payment_id}")

@@ -41,8 +41,9 @@ def normalize_address(addr_str: str) -> str:
 
 
 # دالة تحويل القيمة إلى الوحدة المطلوبة
-def convert_amount(raw_value: int, decimals: int = 9) -> Decimal:
-    return Decimal(raw_value) / Decimal(10 ** decimals)
+
+def convert_amount(raw_value: int, decimals: int = 9) -> float:
+    return raw_value / (10 ** decimals)
 
 async def get_subscription_price(conn, subscription_plan_id: int) -> Decimal:
     query = "SELECT price FROM subscription_plans WHERE id = $1"
@@ -113,8 +114,7 @@ async def parse_transactions(provider: LiteBalancer):
 
             dest_address = normalize_address(transaction.in_msg.info.dest.to_str(1, 1, 1))
             if dest_address != normalized_bot_address:
-                logging.info(
-                    f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
+                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} ليست موجهة إلى محفظة البوت (dest: {dest_address} vs expected: {normalized_bot_address}) - تم تجاهلها.")
                 continue
 
             # استخراج عنوان المُرسل لأغراض التسجيل فقط
@@ -122,7 +122,7 @@ async def parse_transactions(provider: LiteBalancer):
             normalized_sender = normalize_address(sender_wallet_address)
             value = transaction.in_msg.info.value_coins
             if value != 0:
-                value = value / 1e9
+                value = convert_amount(value, 9)
             logging.info(f"💰 معاملة tx_hash: {tx_hash_hex} من {normalized_sender} بقيمة {value} TON.")
 
             if len(transaction.in_msg.body.bits) < 32:
@@ -133,14 +133,13 @@ async def parse_transactions(provider: LiteBalancer):
             op_code = body_slice.load_uint(32)
             logging.info(f"📌 OP Code الأساسي: {hex(op_code)}")
             if op_code not in (0xf8a7ea5, 0x7362d09c):
-                logging.info(
-                    f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
+                logging.info(f"➡️ معاملة tx_hash: {tx_hash_hex} OP Code ({hex(op_code)}) غير متوافق مع تحويل Jetton - تم تجاهلها.")
                 continue
 
             body_slice.load_bits(64)  # تخطي query_id
 
             # تحويل قيمة Jetton باستخدام دالة التحويل
-            jetton_amount = convert_amount(body_slice.load_coins(), 9)
+            jetton_amount = convert_amount(body_slice.load_coins(), 6)  # <-- التصحيح هنا
             logging.info(f"💸 قيمة Jetton: {jetton_amount}")
             jetton_sender = body_slice.load_address().to_str(1, 1, 1)
             normalized_jetton_sender = normalize_address(jetton_sender)
@@ -174,9 +173,9 @@ async def parse_transactions(provider: LiteBalancer):
 
             normalized_expected = normalize_address(expected_jetton_wallet)
             logging.info(f"🔍 (للتسجيل) مقارنة العناوين: payload={normalized_jetton_sender} vs expected={normalized_expected}")
-            logging.info("✅ سيتم استخدام payment_token للمطابقة مع قاعدة البيانات.")
+            logging.info("✅ سيتم استخدام orderId للمطابقة مع قاعدة البيانات.")
 
-            # استخراج forward payload للتعليق (payment_token)
+            # استخراج forward payload للتعليق (orderId)
             payment_token_from_payload = None
             if len(forward_payload.bits) < 32:
                 logging.info(f"💸 معاملة tx_hash: {tx_hash_hex} بدون forward payload (تعليق).")
@@ -187,9 +186,9 @@ async def parse_transactions(provider: LiteBalancer):
                     try:
                         comment = forward_payload.load_snake_string()
                         logging.info(f"📌 التعليق الكامل المستخرج: {comment}")
-                        # استخراج القيمة مباشرة بدون التحقق من بادئة "payment_token:"
+                        # استخراج القيمة مباشرة بدون التحقق من بادئة "orderId:"
                         payment_token_from_payload = comment.strip()
-                        logging.info(f"📦 تم استخراج payment_token: '{payment_token_from_payload}' من tx_hash: {tx_hash_hex}")
+                        logging.info(f"📦 تم استخراج orderId: '{payment_token_from_payload}' من tx_hash: {tx_hash_hex}")
                     except Exception as e:
                         logging.error(f"❌ خطأ أثناء قراءة التعليق في tx_hash: {tx_hash_hex}: {str(e)}")
                         continue
@@ -197,7 +196,7 @@ async def parse_transactions(provider: LiteBalancer):
                     logging.warning(f"⚠️ معاملة tx_hash: {tx_hash_hex} تحتوي على OP Code غير معروف في forward payload: {forward_payload_op_code}")
                     continue
 
-            logging.info(f"✅ payment_token المستخرج: {payment_token_from_payload}")
+            logging.info(f"✅ orderId المستخرج: {payment_token_from_payload}")
 
             # المطابقة مع قاعدة البيانات باستخدام payment_token
             async with current_app.db_pool.acquire() as conn:
@@ -221,7 +220,10 @@ async def parse_transactions(provider: LiteBalancer):
                 logging.info(f"🔍 سعر الاشتراك: {expected_subscription_price}, tolerance: {tolerance}")
 
                 # مقارنة مبلغ الدفع مع سعر الاشتراك
-                difference = expected_subscription_price - jetton_amount
+                difference = expected_subscription_price - Decimal(str(jetton_amount))
+                logging.warning(
+                    f"⚠️ عدم تطابق مبلغ الدفع: DB amount {db_amount} vs jetton_amount {jetton_amount} في tx_hash: {tx_hash_hex} - تجاهل المعاملة.")
+
                 if difference < 0:
                     # دفعة زائدة
                     await redis_manager.publish_event(
@@ -282,7 +284,7 @@ async def parse_transactions(provider: LiteBalancer):
                         except Exception as e:
                             logging.error(f"❌ استثناء أثناء استدعاء /api/subscribe: {str(e)}")
                 else:
-                    logging.error(f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ payment_id: {pending_payment['payment_id']}")
+                    logging.error(f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ tx_hash: {pending_payment['tx_hash']}")
             logging.info(f"📝 Transaction processed: tx_hash: {tx_hash_hex}, lt: {transaction.lt}")
 
     except Exception as e:
