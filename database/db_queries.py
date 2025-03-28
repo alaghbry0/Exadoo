@@ -347,7 +347,7 @@ async def record_payment(
         return None
 
 
-async def update_payment_with_txhash(conn, payment_token: str, tx_hash: str) -> Optional[dict]:
+async def update_payment_with_txhash(conn, payment_token: str, tx_hash: str, amount_received) -> Optional[dict]:
     """
     تحديث سجل الدفع باستخدام payment_token لتسجيل tx_hash وتحديث الحالة.
     """

@@ -22,7 +22,7 @@ from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
 from server.sse_routes import sse_bp
 from server.redis_manager import redis_manager
-from routes.crypto_payments import crypto_payment_bp
+
 
 
 # التحقق من المتغيرات البيئية الأساسية
@@ -50,7 +50,7 @@ app = cors(app, allow_origin=ALLOWED_ORIGINS, allow_credentials=True)
 
 # تسجيل Blueprints
 app.register_blueprint(sse_bp, url_prefix='/api')
-app.register_blueprint(crypto_payment_bp)
+
 app.register_blueprint(public_routes)
 app.register_blueprint(admin_routes)
 app.register_blueprint(auth_routes)

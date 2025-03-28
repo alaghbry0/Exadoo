@@ -6,33 +6,50 @@ from server.redis_manager import redis_manager
 
 sse_bp = Blueprint('sse', __name__)
 
+
 async def event_generator(payment_token):
-    pubsub = None
+    pubsub = None  # تهيئة المتغير خارج كتلة try
     try:
-        logging.info(f"بدء الاشتراك في قناة Redis: payment_{payment_token}")
         pubsub = redis_manager.redis.pubsub()
         await pubsub.subscribe(f'payment_{payment_token}')
+
+        event_buffer = []
+        last_sent_seq = -1
+
         while True:
-            try:
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=30
-                )
-                if message:
-                    logging.debug(f"تم استلام رسالة من Redis: {message}")
-                    yield f"data: {message['data']}\n\n"
-            except Exception as inner_e:
-                logging.error(f"خطأ أثناء انتظار رسالة من Redis: {str(inner_e)}", exc_info=True)
+            message = await pubsub.get_message(
+                ignore_subscribe_messages=True,
+                timeout=30
+            )
+
+            if message:
+                try:
+                    data = json.loads(message['data'])
+                    event_buffer.append(data)
+
+                    # فرز البافر حسب التسلسل
+                    event_buffer.sort(key=lambda x: x.get('_seq', 0))
+
+                    # إرسال الأحداث بالترتيب
+                    while event_buffer and event_buffer[0].get('_seq', 0) == last_sent_seq + 1:
+                        next_event = event_buffer.pop(0)
+                        last_sent_seq = next_event.get('_seq', 0)
+                        yield f"data: {json.dumps(next_event)}\n\n"
+
+                except Exception as e:
+                    logging.error(f"Error processing message: {str(e)}")
+
             await asyncio.sleep(0.1)
+
     except Exception as e:
-        logging.error(f"SSE error in event_generator: {str(e)}", exc_info=True)
+        logging.error(f"SSE error: {str(e)}", exc_info=True)
     finally:
-        if pubsub:
+        if pubsub:  # التحقق من وجود pubsub قبل الإغلاق
             try:
                 await pubsub.unsubscribe(f'payment_{payment_token}')
-                logging.info(f"🏁 تم إغلاق اتصال Redis للقناة: payment_{payment_token}")
-            except Exception as unsub_e:
-                logging.error(f"خطأ أثناء إلغاء الاشتراك من Redis: {str(unsub_e)}", exc_info=True)
+                logging.info(f"تم إلغاء الاشتراك من القناة: payment_{payment_token}")
+            except Exception as e:
+                logging.error(f"Error during unsubscribe: {str(e)}")
 
 @sse_bp.route('/sse')
 async def sse_stream():

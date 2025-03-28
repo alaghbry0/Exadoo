@@ -229,8 +229,9 @@ async def parse_transactions(provider: LiteBalancer):
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
-                            'status': 'success',
-                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك بعد 3 ثواني.'
+                            'status': 'warning',
+                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك حالا.',
+                            '_seq': None
                         }
                     )
                     await asyncio.sleep(3)
@@ -249,14 +250,16 @@ async def parse_transactions(provider: LiteBalancer):
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
-                            'status': 'success',
-                            'message': 'المبلغ المدفوع أقل من المطلوب، سنقوم بتجديد اشتراكك هذه المرة فقط.'
+                            'status': 'warning',
+                            'message': 'المبلغ المدفوع أقل من المطلوب، سنقوم بتجديد اشتراكك هذه المرة فقط.',
+                            '_seq': None
                         }
                     )
 
                 logging.info(f"✅ تطابق بيانات الدفع. متابعة التحديث لـ payment_token: {pending_payment['payment_token']}")
                 tx_hash = tx_hash_hex
-                updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_token'], tx_hash)
+                amount_received = Decimal(str(jetton_amount))
+                updated_payment_data = await update_payment_with_txhash(conn, pending_payment['payment_token'], tx_hash, amount_received)
                 if updated_payment_data:
                     logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_token: {pending_payment['payment_token']}، tx_hash: {tx_hash}")
                     async with aiohttp.ClientSession() as session:
