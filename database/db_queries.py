@@ -413,7 +413,7 @@ async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Op
 
 async def record_incoming_transaction(
     conn,
-    tx_hash: str,
+    txhash: str,
     sender: str,
     amount: float,
     payment_token: Optional[str] = None,

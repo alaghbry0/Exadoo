@@ -203,7 +203,7 @@ async def parse_transactions(provider: LiteBalancer):
             async with current_app.db_pool.acquire() as conn:
                 await record_incoming_transaction(
                     conn=conn,
-                    tx_hash=tx_hash_hex,
+                    txhash=tx_hash_hex,
                     sender=normalized_sender,
                     amount=jetton_amount,
                     payment_token=payment_token_from_payload
