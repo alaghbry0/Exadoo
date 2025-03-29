@@ -442,8 +442,8 @@ async def record_incoming_transaction(
         payment_token,
         False,
         memo)
-        logging.info(f"✅ تم تسجيل المعاملة {tx_hash}")
+        logging.info(f"✅ تم تسجيل المعاملة {txhash}")
     except Exception as e:
-        logging.error(f"❌ فشل تسجيل المعاملة {tx_hash}: {str(e)}")
+        logging.error(f"❌ فشل تسجيل المعاملة {txhash}: {str(e)}")
 
 
