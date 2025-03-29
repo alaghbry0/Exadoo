@@ -383,7 +383,7 @@ async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Op
         sql = """
             SELECT telegram_id, subscription_plan_id, payment_token, username, full_name, user_wallet_address, amount
             FROM payments
-            WHERE TRIM(payment_token) = TRIM($1)
+            WHERE TRIM(payment_token::text) = TRIM($1)
               AND status = 'pending'
             LIMIT 1;
         """
@@ -397,4 +397,3 @@ async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Op
     except Exception as e:
         logging.error(f"❌ فشل في جلب سجل الدفع المعلق: {e}", exc_info=True)
         return None
-

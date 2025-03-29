@@ -25,6 +25,17 @@ payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 
 getcontext().prec = 30
 
+async def record_incoming_transaction(conn, tx_hash, sender, amount, payment_token=None):
+    try:
+        await conn.execute('''
+            INSERT INTO incoming_transactions 
+                (txhash, sender_address, amount, payment_token, processed)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (txhash) DO NOTHING
+        ''', tx_hash, sender, amount, payment_token, False)
+    except Exception as e:
+        logging.error(f"❌ فشل تسجيل المعاملة {tx_hash}: {str(e)}")
+
 def normalize_address(addr_str: str) -> str:
     """
     دالة مساعدة لتوحيد تنسيق العناوين (لأغراض التسجيل فقط)
@@ -174,6 +185,8 @@ async def parse_transactions(provider: LiteBalancer):
             normalized_expected = normalize_address(expected_jetton_wallet)
             logging.info(f"🔍 (للتسجيل) مقارنة العناوين: payload={normalized_jetton_sender} vs expected={normalized_expected}")
             logging.info("✅ سيتم استخدام orderId للمطابقة مع قاعدة البيانات.")
+
+
 
             # استخراج forward payload للتعليق (orderId)
             payment_token_from_payload = None
