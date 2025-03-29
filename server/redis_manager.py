@@ -63,30 +63,21 @@ class RedisManager:
 
     async def publish_event(self, channel: str, data: dict):
         try:
-            # إنشاء تسلسل فريد لكل قناة
-            seq_key = f"event_seq:{channel}"
-            seq = await self.redis.incr(seq_key)
+            # توليد تسلسل آلي إذا لم يكن موجودًا
+            if '_seq' not in data:
+                seq_key = f"event_seq:{channel}"
+                data['_seq'] = await self.redis.incr(seq_key)
 
             event_data = {
                 **data,
-                "_seq": seq,
                 "_ts": time.time()
             }
 
             await self.redis.publish(channel, json.dumps(event_data))
-            logging.debug(f"تم نشر الحدث: {event_data}")
+            logging.info(f"✅ تم نشر الحدث على {channel}: {json.dumps(event_data, ensure_ascii=False)}")  # <-- log مفصل
 
-        except (ConnectionError, TimeoutError) as e:
-            logging.error(f"⚠️ خطأ في الاتصال أثناء النشر: {str(e)}")
-            raise
-        except json.JSONDecodeError as e:
-            logging.error(f"⚠️ خطأ في تحويل البيانات إلى JSON: {str(e)}")
-            raise
-        except RedisError as e:
-            logging.error(f"⚠️ خطأ Redis أثناء النشر: {str(e)}")
-            raise
         except Exception as e:
-            logging.error(f"⚠️ خطأ غير متوقع أثناء النشر: {str(e)}")
+            logging.error(f"⚠️ خطأ في النشر: {str(e)}")
             raise
 
     async def close(self) -> None:

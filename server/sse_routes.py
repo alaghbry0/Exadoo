@@ -10,10 +10,11 @@ sse_bp = Blueprint('sse', __name__)
 
 
 async def event_generator(payment_token):
-    pubsub = None  # تهيئة المتغير خارج كتلة try
+    pubsub = None
     try:
         pubsub = redis_manager.redis.pubsub()
         await pubsub.subscribe(f'payment_{payment_token}')
+        logging.info(f"✅ تم الاشتراك في قناة payment_{payment_token}")  # <-- إضافة log
 
         event_buffer = []
         last_sent_seq = -1
@@ -25,8 +26,11 @@ async def event_generator(payment_token):
             )
 
             if message:
+                logging.debug(f"📨 رسالة مستلمة: {message}")  # <-- إضافة log
                 try:
                     data = json.loads(message['data'])
+                    if '_seq' not in data:  # <-- معالجة الحالات بدون تسلسل
+                        data['_seq'] = last_sent_seq + 1
                     event_buffer.append(data)
 
                     # فرز البافر حسب التسلسل
@@ -36,6 +40,7 @@ async def event_generator(payment_token):
                     while event_buffer and event_buffer[0].get('_seq', 0) == last_sent_seq + 1:
                         next_event = event_buffer.pop(0)
                         last_sent_seq = next_event.get('_seq', 0)
+                        logging.debug(f"🚀 إرسال حدث: {next_event}")  # <-- إضافة log
                         yield f"data: {json.dumps(next_event)}\n\n"
 
                 except Exception as e:
@@ -46,8 +51,9 @@ async def event_generator(payment_token):
     except Exception as e:
         logging.error(f"SSE error: {str(e)}", exc_info=True)
     finally:
-        if pubsub:  # التحقق من وجود pubsub قبل الإغلاق
+        if pubsub:
             try:
+                await asyncio.sleep(1)  # <-- تأخير قبل إلغاء الاشتراك
                 await pubsub.unsubscribe(f'payment_{payment_token}')
                 logging.info(f"تم إلغاء الاشتراك من القناة: payment_{payment_token}")
             except Exception as e:

@@ -230,8 +230,8 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'warning',
-                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك حالا.',
-                            '_seq': None
+                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك حالا.'
+
                         }
                     )
                     await asyncio.sleep(3)
@@ -251,8 +251,8 @@ async def parse_transactions(provider: LiteBalancer):
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'warning',
-                            'message': 'المبلغ المدفوع أقل من المطلوب، سنقوم بتجديد اشتراكك هذه المرة فقط.',
-                            '_seq': None
+                            'message': 'المبلغ المدفوع أقل من المطلوب، سنقوم بتجديد اشتراكك هذه المرة فقط.'
+
                         }
                     )
 
