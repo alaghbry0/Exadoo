@@ -364,7 +364,7 @@ async def update_payment_with_txhash(
         query = """
             UPDATE payments
             SET 
-                txhash = $1,
+                tx_hash = $1,
                 amount_received = $2,
                 status = $3,
                 error_message = $4,
@@ -434,7 +434,7 @@ async def record_incoming_transaction(
             ) VALUES (
                 $1, $2, $3, $4, $5, $6
             )
-            ON CONFLICT (txhash) DO NOTHING
+            ON CONFLICT (tx_hash) DO NOTHING
         ''',
         tx_hash,
         sender,
