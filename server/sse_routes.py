@@ -14,50 +14,30 @@ async def event_generator(payment_token):
     try:
         pubsub = redis_manager.redis.pubsub()
         await pubsub.subscribe(f'payment_{payment_token}')
-        logging.info(f"✅ تم الاشتراك في قناة payment_{payment_token}")  # <-- إضافة log
-
-        event_buffer = []
-        last_sent_seq = -1
+        logging.info(f"✅ تم الاشتراك في قناة payment_{payment_token}")
 
         while True:
-            message = await pubsub.get_message(
-                ignore_subscribe_messages=True,
-                timeout=30
-            )
-
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30)
             if message:
-                logging.debug(f"📨 رسالة مستلمة: {message}")  # <-- إضافة log
+                logging.debug(f"📨 رسالة مستلمة: {message}")
                 try:
                     data = json.loads(message['data'])
-                    if '_seq' not in data:  # <-- معالجة الحالات بدون تسلسل
-                        data['_seq'] = last_sent_seq + 1
-                    event_buffer.append(data)
-
-                    # فرز البافر حسب التسلسل
-                    event_buffer.sort(key=lambda x: x.get('_seq', 0))
-
-                    # إرسال الأحداث بالترتيب
-                    while event_buffer and event_buffer[0].get('_seq', 0) == last_sent_seq + 1:
-                        next_event = event_buffer.pop(0)
-                        last_sent_seq = next_event.get('_seq', 0)
-                        logging.debug(f"🚀 إرسال حدث: {next_event}")  # <-- إضافة log
-                        yield f"data: {json.dumps(next_event)}\n\n"
-
+                    # إذا لم يكن هناك مفتاح _seq، نقوم بإرساله كما هو
+                    yield f"data: {json.dumps(data)}\n\n"
                 except Exception as e:
                     logging.error(f"Error processing message: {str(e)}")
-
             await asyncio.sleep(0.1)
-
     except Exception as e:
         logging.error(f"SSE error: {str(e)}", exc_info=True)
     finally:
         if pubsub:
             try:
-                await asyncio.sleep(1)  # <-- تأخير قبل إلغاء الاشتراك
+                await asyncio.sleep(1)
                 await pubsub.unsubscribe(f'payment_{payment_token}')
                 logging.info(f"تم إلغاء الاشتراك من القناة: payment_{payment_token}")
             except Exception as e:
                 logging.error(f"Error during unsubscribe: {str(e)}")
+
 
 @sse_bp.route('/sse')
 async def sse_stream():
