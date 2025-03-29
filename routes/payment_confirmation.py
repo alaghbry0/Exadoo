@@ -6,7 +6,7 @@ import json
 import os
 from decimal import Decimal, ROUND_DOWN, getcontext
 import aiohttp
-from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_payment_token
+from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_payment_token, record_incoming_transaction
 from pytoniq import LiteBalancer, begin_cell, Address
 from pytoniq.liteclient.client import LiteServerError
 from typing import Optional  # لإضافة تلميحات النوع
@@ -25,16 +25,7 @@ payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 
 getcontext().prec = 30
 
-async def record_incoming_transaction(conn, tx_hash, sender, amount, payment_token=None):
-    try:
-        await conn.execute('''
-            INSERT INTO incoming_transactions 
-                (txhash, sender_address, amount, payment_token, processed)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (txhash) DO NOTHING
-        ''', tx_hash, sender, amount, payment_token, False)
-    except Exception as e:
-        logging.error(f"❌ فشل تسجيل المعاملة {tx_hash}: {str(e)}")
+
 
 def normalize_address(addr_str: str) -> str:
     """

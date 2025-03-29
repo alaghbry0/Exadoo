@@ -398,3 +398,38 @@ async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Op
         logging.error(f"❌ فشل في جلب سجل الدفع المعلق: {e}", exc_info=True)
         return None
 
+
+async def record_incoming_transaction(
+    conn,
+    tx_hash: str,
+    sender: str,
+    amount: float,
+    payment_token: Optional[str] = None,
+    memo: Optional[str] = None
+):
+    """
+    تسجيل المعاملة الواردة في جدول incoming_transactions
+    """
+    try:
+        await conn.execute('''
+            INSERT INTO incoming_transactions (
+                txhash, 
+                sender_address, 
+                amount, 
+                payment_token, 
+                processed, 
+                memo
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6
+            )
+            ON CONFLICT (txhash) DO NOTHING
+        ''',
+        tx_hash,
+        sender,
+        amount,
+        payment_token,
+        False,
+        memo)
+        logging.info(f"✅ تم تسجيل المعاملة {tx_hash}")
+    except Exception as e:
+        logging.error(f"❌ فشل تسجيل المعاملة {tx_hash}: {str(e)}")
