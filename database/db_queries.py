@@ -347,31 +347,41 @@ async def record_payment(
         return None
 
 
-async def update_payment_with_txhash(conn, payment_token: str, tx_hash: str, amount_received) -> Optional[dict]:
+async def update_payment_with_txhash(
+    conn,
+    payment_token: str,
+    tx_hash: str,
+    amount_received: Decimal,
+    status: str,
+    error_message: Optional[str] = None
+) -> Optional[dict]:
     """
-    تحديث سجل الدفع باستخدام payment_token لتسجيل tx_hash وتحديث الحالة.
+    تحديث سجل الدفع مع تفاصيل جديدة
     """
     try:
-        row = await conn.fetchrow(
-            """
+        query = """
             UPDATE payments
-            SET tx_hash = $1,
-                status = 'completed'
-            WHERE payment_token = $2
-            RETURNING telegram_id, subscription_plan_id, username, full_name, user_wallet_address, payment_token, tx_hash;
-            """,
-            tx_hash, payment_token
+            SET 
+                txhash = $1,
+                amount_received = $2,
+                status = $3,
+                error_message = $4,
+                processed_at = NOW()
+            WHERE payment_token = $5
+            RETURNING *;
+        """
+        row = await conn.fetchrow(
+            query,
+            tx_hash,
+            amount_received,
+            status,
+            error_message,
+            payment_token
         )
-        if row:
-            logging.info(f"✅ تم تحديث سجل الدفع بنجاح لـ payment_token: {payment_token} مع tx_hash: {tx_hash}")
-            return dict(row)
-        else:
-            logging.error(f"❌ لم يتم العثور على سجل الدفع لـ payment_token: {payment_token}")
-            return None
+        return dict(row) if row else None
     except Exception as e:
-        logging.error(f"❌ فشل تحديث سجل الدفع: {e}", exc_info=True)
+        logging.error(f"❌ فشل تحديث الدفعة: {str(e)}")
         return None
-
 
 
 
@@ -433,3 +443,5 @@ async def record_incoming_transaction(
         logging.info(f"✅ تم تسجيل المعاملة {tx_hash}")
     except Exception as e:
         logging.error(f"❌ فشل تسجيل المعاملة {tx_hash}: {str(e)}")
+
+
