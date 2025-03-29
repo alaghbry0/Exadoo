@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone  # <-- تأكد من وجود
 from config import DATABASE_CONFIG
 import pytz
 import logging
+from decimal import Decimal
+
 from typing import Optional
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
