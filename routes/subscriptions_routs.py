@@ -3,6 +3,9 @@ import logging
 from quart import Blueprint, request, jsonify, current_app
 from config import DATABASE_CONFIG
 import asyncpg
+from asyncpg.exceptions import DataError
+from datetime import datetime
+
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
@@ -98,3 +101,61 @@ async def get_public_wallet():
         logging.error("❌ Error fetching public wallet address: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
+@public_routes.route("/user/payments", methods=["GET"])
+async def get_user_payment_history():
+    try:
+        # التحقق من المعلمات المطلوبة
+        telegram_id = request.args.get('telegram_id')
+        if not telegram_id:
+            return jsonify({"error": "المعلمة المطلوبة telegram_id مفقودة"}), 400
+
+        # معلمات التقسيم الصفحي
+        page = int(request.args.get('page', 1))
+        page_size = min(int(request.args.get('page_size', 10)), 50)
+        offset = (page - 1) * page_size
+
+        # بناء الاستعلام
+        query = '''
+            SELECT 
+                p.payment_token,
+                p.amount_received,
+                p.status,
+                p.error_message,
+                p.created_at,
+                p.txhash,
+                sp.name as plan_name,
+                sp.duration_days,
+                (SELECT COUNT(*) FROM payments WHERE telegram_id = $1) as total_count
+            FROM payments p
+            JOIN subscription_plans sp ON p.subscription_plan_id = sp.id
+            WHERE p.telegram_id = $1
+            ORDER BY p.created_at DESC
+            LIMIT $2 OFFSET $3
+        '''
+
+        async with current_app.db_pool.acquire() as conn:
+            records = await conn.fetch(query, int(telegram_id), page_size, offset)
+            total_count = records[0]['total_count'] if records else 0
+
+            payments = []
+            for record in records:
+                payment = dict(record)
+                payment.pop('total_count', None)
+                if payment['txhash']:
+                    payment['explorer_url'] = f"https://tonscan.org/tx/{payment['txhash']}"
+                payment['created_at'] = payment['created_at'].isoformat()
+                payments.append(payment)
+
+            return jsonify({
+                "results": payments,
+                "pagination": {
+                    "current_page": page,
+                    "total_pages": (total_count + page_size - 1) // page_size,
+                    "total_items": total_count
+                }
+            }), 200
+
+    except Exception as e:
+        logging.error(f"خطأ في جلب البيانات: {str(e)}")
+        return jsonify({"error": "خطأ في الخادم"}), 500
