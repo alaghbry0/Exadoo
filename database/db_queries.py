@@ -434,7 +434,7 @@ async def record_incoming_transaction(
             ) VALUES (
                 $1, $2, $3, $4, $5, $6
             )
-            ON CONFLICT (tx_hash) DO NOTHING
+            ON CONFLICT (txhash) DO NOTHING
         ''',
         txhash,
         sender,
