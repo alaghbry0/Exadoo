@@ -436,7 +436,7 @@ async def record_incoming_transaction(
             )
             ON CONFLICT (tx_hash) DO NOTHING
         ''',
-        tx_hash,
+        txhash,
         sender,
         amount,
         payment_token,
