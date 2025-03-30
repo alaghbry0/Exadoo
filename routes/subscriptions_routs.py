@@ -123,7 +123,7 @@ async def get_user_payment_history():
                 p.status,
                 p.error_message,
                 p.created_at,
-                p.txhash,
+                p.tx-hash,
                 sp.name as plan_name,
                 sp.duration_days,
                 (SELECT COUNT(*) FROM payments WHERE telegram_id = $1) as total_count
@@ -142,8 +142,8 @@ async def get_user_payment_history():
             for record in records:
                 payment = dict(record)
                 payment.pop('total_count', None)
-                if payment['txhash']:
-                    payment['explorer_url'] = f"https://tonscan.org/tx/{payment['txhash']}"
+                if payment['tx-hash']:
+                    payment['explorer_url'] = f"https://tonscan.org/tx/{payment['tx-hash']}"
                 payment['created_at'] = payment['created_at'].isoformat()
                 payments.append(payment)
 
