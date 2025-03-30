@@ -88,25 +88,9 @@ async def get_public_subscription_plans():
         return jsonify({"error": "Internal server error"}), 500
     
 
-@public_routes.route("/wallet", methods=["GET"])
-async def get_public_wallet():
-    try:
-        async with current_app.db_pool.acquire() as connection:
-            wallet = await connection.fetchrow("SELECT wallet_address FROM wallet ORDER BY id DESC LIMIT 1")
-        if wallet:
-            return jsonify({"wallet_address": wallet["wallet_address"]}), 200
-        else:
-            return jsonify({"wallet_address": ""}), 200
-    except Exception as e:
-        logging.error("❌ Error fetching public wallet address: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
-
-
-# نقطة API لجلب قائمة بخطط الاشتراك العامة
 @public_routes.route("/payment-history", methods=["GET"])
 async def get_payment_history():
     try:
-        # في تحسين لاحق يُفضّل استخراج telegram_id من بيانات الجلسة أو التوكن بدلاً من معلمة URL
         telegram_id = request.args.get("telegram_id")
         offset = request.args.get("offset", "0")
         limit = request.args.get("limit", "10")
@@ -116,10 +100,21 @@ async def get_payment_history():
 
         async with current_app.db_pool.acquire() as connection:
             query = """
-                SELECT tx_hash, amount_received, subscription_plan_id, status, processed_at, payment_token, error_message
-                FROM payments
-                WHERE telegram_id = $1 AND status IN ('completed', 'failed')
-                ORDER BY processed_at DESC
+                SELECT 
+                    p.tx_hash, 
+                    p.amount_received, 
+                    p.subscription_plan_id, 
+                    p.status, 
+                    p.processed_at, 
+                    p.payment_token, 
+                    p.error_message,
+                    sp.name AS plan_name,
+                    st.name AS subscription_name
+                FROM payments p
+                JOIN subscription_plans sp ON p.subscription_plan_id = sp.id
+                JOIN subscription_types st ON sp.subscription_type_id = st.id
+                WHERE p.telegram_id = $1 AND p.status IN ('completed', 'failed')
+                ORDER BY p.id DESC
                 OFFSET $2 LIMIT $3;
             """
             results = await connection.fetch(query, int(telegram_id), int(offset), int(limit))
