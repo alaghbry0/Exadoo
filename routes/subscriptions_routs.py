@@ -102,60 +102,37 @@ async def get_public_wallet():
         return jsonify({"error": "Internal server error"}), 500
 
 
-@public_routes.route("/user/payments", methods=["GET"])
-async def get_user_payment_history():
+# نقطة API لجلب قائمة بخطط الاشتراك العامة
+@public_routes.route("/payment-history", methods=["GET"])
+async def get_payment_history():
     try:
-        # التحقق من المعلمات المطلوبة
-        telegram_id = request.args.get('telegram_id')
+        # في تحسين لاحق يُفضّل استخراج telegram_id من بيانات الجلسة أو التوكن بدلاً من معلمة URL
+        telegram_id = request.args.get("telegram_id")
+        offset = request.args.get("offset", "0")
+        limit = request.args.get("limit", "10")
+
         if not telegram_id:
-            return jsonify({"error": "المعلمة المطلوبة telegram_id مفقودة"}), 400
+            return jsonify({"error": "telegram_id is required"}), 400
 
-        # معلمات التقسيم الصفحي
-        page = int(request.args.get('page', 1))
-        page_size = min(int(request.args.get('page_size', 10)), 50)
-        offset = (page - 1) * page_size
-
-        # بناء الاستعلام
-        query = '''
-            SELECT 
-                p.payment_token,
-                p.amount_received,
-                p.status,
-                p.error_message,
-                p.created_at,
-                p.tx-hash,
-                sp.name as plan_name,
-                sp.duration_days,
-                (SELECT COUNT(*) FROM payments WHERE telegram_id = $1) as total_count
-            FROM payments p
-            JOIN subscription_plans sp ON p.subscription_plan_id = sp.id
-            WHERE p.telegram_id = $1
-            ORDER BY p.created_at DESC
-            LIMIT $2 OFFSET $3
-        '''
-
-        async with current_app.db_pool.acquire() as conn:
-            records = await conn.fetch(query, int(telegram_id), page_size, offset)
-            total_count = records[0]['total_count'] if records else 0
-
-            payments = []
-            for record in records:
-                payment = dict(record)
-                payment.pop('total_count', None)
-                if payment['tx-hash']:
-                    payment['explorer_url'] = f"https://tonscan.org/tx/{payment['tx-hash']}"
-                payment['created_at'] = payment['created_at'].isoformat()
-                payments.append(payment)
-
-            return jsonify({
-                "results": payments,
-                "pagination": {
-                    "current_page": page,
-                    "total_pages": (total_count + page_size - 1) // page_size,
-                    "total_items": total_count
-                }
-            }), 200
-
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                SELECT tx_hash, amount_received, subscription_plan_id, status, processed_at, payment_token, error_message
+                FROM payments
+                WHERE telegram_id = $1 AND status IN ('completed', 'failed')
+                ORDER BY processed_at DESC
+                OFFSET $2 LIMIT $3;
+            """
+            results = await connection.fetch(query, int(telegram_id), int(offset), int(limit))
+        
+        payments = [dict(r) for r in results]
+        return (
+            jsonify(payments),
+            200,
+            {
+                "Cache-Control": "public, max-age=300",
+                "Content-Type": "application/json; charset=utf-8"
+            }
+        )
     except Exception as e:
-        logging.error(f"خطأ في جلب البيانات: {str(e)}")
-        return jsonify({"error": "خطأ في الخادم"}), 500
+        logging.error("Error fetching payment history: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500

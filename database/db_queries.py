@@ -445,5 +445,3 @@ async def record_incoming_transaction(
         logging.info(f"✅ تم تسجيل المعاملة {txhash}")
     except Exception as e:
         logging.error(f"❌ فشل تسجيل المعاملة {txhash}: {str(e)}")
-
-
