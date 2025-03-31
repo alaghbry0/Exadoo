@@ -225,29 +225,39 @@ async def parse_transactions(provider: LiteBalancer):
                     continue
 
                 # استرجاع سعر الاشتراك من جدول subscription_plans باستخدام subscription_plan_id
+                
                 subscription_plan_id = pending_payment['subscription_plan_id']
                 expected_subscription_price = await get_subscription_price(conn, subscription_plan_id)
-                tolerance = Decimal('0.30')  # الفارق المسموح به
-                logging.info(f"🔍 سعر الاشتراك: {expected_subscription_price}, tolerance: {tolerance}")
+                logging.info(f"🔍 سعر الاشتراك: {expected_subscription_price}")
 
-                # مقارنة مبلغ الدفع مع سعر الاشتراك
+                # حساب الفرق بين السعر المتوقع والمبلغ المستلم
                 difference = expected_subscription_price - Decimal(str(jetton_amount))
-                logging.warning(
-                    f"⚠️ عدم تطابق مبلغ الدفع: DB amount {db_amount} vs jetton_amount {jetton_amount} في tx_hash: {tx_hash_hex} - تجاهل المعاملة."
-                )
+                logging.info(f"🔍 الفرق بين السعر المتوقع والمبلغ المستلم: {difference}")
+
+                acceptable_tolerance = Decimal('0.30')  # الفارق المسموح فيه للتجديد مع إشعار
+                silent_tolerance = Decimal('0.15')      # الفارق الذي لا يتم إرسال إشعار فيه
 
                 if difference < 0:
-                    # دفعة زائدة
+                    # دفعة زائدة: إرسال إشعار مناسب مع رسالة تحذيرية
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
                             'status': 'warning',
-                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك حالا.'
+                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك حالاً.'
                         }
                     )
                     await asyncio.sleep(3)
-                elif difference > tolerance:
-                    # دفعة ناقصة خارج الفارق المسموح
+                elif difference > acceptable_tolerance:
+                    # دفعة ناقصة خارج الفارق المسموح: تحديث سجل الدفع إلى failed مع تسجيل سبب الفشل
+                    error_message = "دفعة ناقصة خارج النطاق المسموح"
+                    updated_payment_data = await update_payment_with_txhash(
+                        conn,
+                        pending_payment['payment_token'],
+                        tx_hash_hex,
+                        Decimal(str(jetton_amount)),
+                        status="failed",
+                        error_message=error_message
+                    )
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
@@ -256,8 +266,12 @@ async def parse_transactions(provider: LiteBalancer):
                         }
                     )
                     continue
+                elif difference <= silent_tolerance:
+                    # دفعة ناقصة ضمن النطاق الصامت (<= 0.15): تجديد الاشتراك دون إرسال أي إشعار
+                    logging.info("✅ دفعة ضمن النطاق الصامت (<= 0.15): تجديد الاشتراك دون إشعار.")
+                    # لا نقوم بنشر أي حدث عبر redis_manager هنا
                 else:
-                    # دفعة ناقصة ضمن الفارق المسموح
+                    # الفرق بين 0.15 و0.30: تجديد الاشتراك مع نشر التحديث
                     await redis_manager.publish_event(
                         f"payment_{pending_payment['payment_token']}",
                         {
