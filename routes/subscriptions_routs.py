@@ -131,3 +131,5 @@ async def get_payment_history():
     except Exception as e:
         logging.error("Error fetching payment history: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
+
