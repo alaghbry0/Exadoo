@@ -249,7 +249,7 @@ async def parse_transactions(provider: LiteBalancer):
                     await asyncio.sleep(3)
                 elif difference > acceptable_tolerance:
                     # دفعة ناقصة خارج الفارق المسموح: تحديث سجل الدفع إلى failed مع تسجيل سبب الفشل
-                    error_message = "دفعة ناقصة خارج النطاق المسموح"
+                    error_message = "دفعة ناقصة "
                     updated_payment_data = await update_payment_with_txhash(
                         conn,
                         pending_payment['payment_token'],
