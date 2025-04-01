@@ -14,19 +14,25 @@ async def create_db_pool():
 
 # ----------------- 🔹 إدارة المستخدمين ----------------- #
 async def add_user(connection, telegram_id, username=None, full_name=None, wallet_app=None):
-    """إضافة مستخدم جديد أو تحديث بيانات مستخدم موجود."""
+    """
+    إضافة مستخدم جديد أو تحديث بيانات مستخدم موجود.
+    يتم هنا استخدام عبارة ON CONFLICT لتحديث الحقول في حالة وجود المستخدم مسبقًا.
+    """
     try:
         await connection.execute("""
             INSERT INTO users (telegram_id, username, full_name, wallet_app)
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (telegram_id) DO UPDATE
-            SET username = $2, full_name = $3, wallet_app = $4
+            SET username = EXCLUDED.username,
+                full_name = EXCLUDED.full_name,
+                wallet_app = EXCLUDED.wallet_app
         """, telegram_id, username, full_name, wallet_app)
         logging.info(f"User {telegram_id} added/updated successfully.")
         return True
     except Exception as e:
         logging.error(f"Error adding/updating user {telegram_id}: {e}")
         return False
+
 
 
 async def get_user(connection, telegram_id: int):
@@ -61,6 +67,7 @@ async def add_subscription(
     telegram_id: int,
     channel_id: int,
     subscription_type_id: int,
+    subscription_plan_id: int,
     start_date: datetime,
     expiry_date: datetime,
     is_active: bool = True,
@@ -69,9 +76,9 @@ async def add_subscription(
     try:
         await connection.execute("""
             INSERT INTO subscriptions 
-            (telegram_id, channel_id, subscription_type_id, start_date, expiry_date, is_active, payment_id, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-        """, telegram_id, channel_id, subscription_type_id, start_date, expiry_date, is_active, payment_id)
+            (telegram_id, channel_id, subscription_type_id, subscription_plan_id, start_date, expiry_date, is_active, payment_id, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        """, telegram_id, channel_id, subscription_type_id, subscription_plan_id,  start_date, expiry_date, is_active, payment_id)
 
         logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id})")
         return True
@@ -87,6 +94,7 @@ async def update_subscription(
     telegram_id: int,
     channel_id: int,
     subscription_type_id: int,
+    subscription_plan_id: int,
     new_expiry_date: datetime,
     start_date: datetime,
     is_active: bool = True,
@@ -97,22 +105,24 @@ async def update_subscription(
             await connection.execute("""
                 UPDATE subscriptions SET
                     subscription_type_id = $1,
-                    expiry_date = $2,
-                    start_date = $3,
-                    is_active = $4,
-                    payment_id = $5,
+                    subscription_plan_id = $2,                
+                    expiry_date = $3,
+                    start_date = $4,
+                    is_active = $5,
+                    payment_id = $6,
                     updated_at = NOW()
-                WHERE telegram_id = $6 AND channel_id = $7
-            """, subscription_type_id, new_expiry_date, start_date, is_active, payment_id, telegram_id, channel_id)
+                WHERE telegram_id = $7 AND channel_id = $8
+            """, subscription_type_id, subscription_plan_id, new_expiry_date, start_date, is_active, payment_id, telegram_id, channel_id)
         else:  # ✅ تحديث بدون تعديل `payment_id`
             await connection.execute("""
                 UPDATE subscriptions SET
                     subscription_type_id = $1,
-                    expiry_date = $2,
-                    start_date = $3,
-                    is_active = $4,
+                    subscription_plan_id = $2,                 
+                    expiry_date = $3,
+                    start_date = $4,
+                    is_active = $5,
                     updated_at = NOW()
-                WHERE telegram_id = $5 AND channel_id = $6
+                WHERE telegram_id = $6 AND channel_id = $7
             """, subscription_type_id, new_expiry_date, start_date, is_active, telegram_id, channel_id)
 
         logging.info(f"✅ Subscription updated for {telegram_id} (Channel: {channel_id})")

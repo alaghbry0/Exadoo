@@ -458,7 +458,7 @@ async def get_subscriptions():
                 sp.name AS subscription_plan_name,
                 st.name AS subscription_type_name
             FROM subscriptions s
-            LEFT JOIN users u ON s.user_id = u.id
+            LEFT JOIN users u ON s.telegram_id = u.telegram_id
             LEFT JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
             LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
             WHERE 1=1
@@ -466,7 +466,7 @@ async def get_subscriptions():
         params = []
 
         if user_id:
-            query += f" AND s.user_id = ${len(params) + 1}"
+            query += f" AND s.telegram_id = ${len(params) + 1}"
             params.append(user_id)
         if channel_id:
             query += f" AND s.channel_id = ${len(params) + 1}"
@@ -494,7 +494,6 @@ async def get_subscriptions():
         async with current_app.db_pool.acquire() as connection:
             # حل مشكلة InvalidCachedStatementError
             await connection.execute("DEALLOCATE ALL")
-
             rows = await connection.fetch(query, *params)
 
         return jsonify([dict(row) for row in rows])
@@ -504,11 +503,12 @@ async def get_subscriptions():
         return jsonify({"error": "Internal server error"}), 500
 
 
+
 # =====================================
 # 2. API لجلب بيانات الدفعات مع دعم الفلاتر والتجزئة والتقارير المالية
 # =====================================
 @admin_routes.route("/payments", methods=["GET"])
-@role_required("admin")  # ✅ استخدام @role_required("admin")
+@role_required("admin")
 async def get_payments():
     try:
         status = request.args.get("status")
@@ -518,35 +518,54 @@ async def get_payments():
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
-        search_term = request.args.get("search", "")  # ✅ استلام search term
+        search_term = request.args.get("search", "")
 
-        query = "SELECT * FROM payments WHERE 1=1"
+        # الاستعلام الأساسي مع الحقول الجديدة
+        query = """
+            SELECT 
+                p.*, 
+                sp.name AS plan_name,
+                st.name AS subscription_name
+            FROM payments p
+            JOIN subscription_plans sp ON p.subscription_plan_id = sp.id
+            JOIN subscription_types st ON sp.subscription_type_id = st.id
+            WHERE 1=1
+        """
         params = []
 
+        # تصفية الدفعات حسب الحالة المطلوبة (ناجحة أو فاشلة)
+        # في حالة البحث عن الدفعات المعلقة فقط، يمكن استخدام شرط منفصل (مثلاً: status = 'pending')
         if status:
-            query += f" AND status = ${len(params) + 1}"
+            query += f" AND p.status = ${len(params) + 1}"
             params.append(status)
+        else:
+            # جلب الدفعات الناجحة والفاشلة بشكل افتراضي
+            query += f" AND p.status IN ('completed', 'failed')"
+
         if user_id:
-            query += f" AND user_id = ${len(params) + 1}"
+            query += f" AND p.user_id = ${len(params) + 1}"
             params.append(user_id)
         if start_date:
-            query += f" AND payment_date >= ${len(params) + 1}"
+            query += f" AND p.created_at >= ${len(params) + 1}"
             params.append(start_date)
         if end_date:
-            query += f" AND payment_date <= ${len(params) + 1}"
+            query += f" AND p.created_at <= ${len(params) + 1}"
             params.append(end_date)
-        if search_term:  # ✅ إضافة شرط البحث
-            query += f" AND (payment_id::TEXT ILIKE ${len(params) + 1} OR user_id::TEXT ILIKE ${len(params) + 1})"  # البحث في payment_id و user_id كمثال
+
+        # إضافة شرط البحث باستخدام الحقول المطلوبة
+        if search_term:
+            query += f" AND (p.tx_hash ILIKE ${len(params) + 1} OR p.payment_token ILIKE ${len(params) + 1} OR p.username ILIKE ${len(params) + 1} OR p.telegram_id::TEXT ILIKE ${len(params) + 1})"
             params.append(f"%{search_term}%")
 
-        query += f" ORDER BY payment_date DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+        # ترتيب النتائج من الأحدث إلى الأقدم
+        query += f" ORDER BY p.created_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
         params.append(page_size)
         params.append(offset)
 
         async with current_app.db_pool.acquire() as connection:
             rows = await connection.fetch(query, *params)
 
-        # تقارير مالية: إذا طلب الأدمن إجمالي الإيرادات عبر استخدام معامل report=total_revenue
+        # التقارير المالية (مثال: إجمالي الإيرادات)
         total_revenue = 0
         if request.args.get("report") == "total_revenue":
             rev_query = "SELECT SUM(amount) as total FROM payments WHERE 1=1"
@@ -558,10 +577,10 @@ async def get_payments():
                 rev_query += f" AND user_id = ${len(rev_params) + 1}"
                 rev_params.append(user_id)
             if start_date:
-                rev_query += f" AND payment_date >= ${len(rev_params) + 1}"
+                rev_query += f" AND created_at >= ${len(rev_params) + 1}"
                 rev_params.append(start_date)
             if end_date:
-                rev_query += f" AND payment_date <= ${len(rev_params) + 1}"
+                rev_query += f" AND created_at <= ${len(rev_params) + 1}"
                 rev_params.append(end_date)
             async with current_app.db_pool.acquire() as connection:
                 rev_row = await connection.fetchrow(rev_query, *rev_params)
@@ -574,6 +593,36 @@ async def get_payments():
         return jsonify(response)
     except Exception as e:
         logging.error("Error fetching payments: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+
+@admin_routes.route("/incoming-transactions", methods=["GET"])
+@role_required("admin")
+async def get_incoming_transactions():
+    try:
+        page = int(request.args.get("page", 1))
+        page_size = int(request.args.get("page_size", 20))
+        offset = (page - 1) * page_size
+
+        query = """
+            SELECT 
+                it.txhash,
+                it.sender_address,
+                it.amount,
+                it.payment_token,
+                it.processed,
+                it.received_at,
+                it.memo
+            FROM incoming_transactions it
+            ORDER BY it.received_at DESC
+            LIMIT $1 OFFSET $2
+        """
+        async with current_app.db_pool.acquire() as connection:
+            rows = await connection.fetch(query, page_size, offset)
+        return jsonify([dict(row) for row in rows])
+    except Exception as e:
+        logging.error("Error fetching incoming transactions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 

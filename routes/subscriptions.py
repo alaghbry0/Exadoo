@@ -79,12 +79,11 @@ async def subscribe():
                     return jsonify({"message": "Subscription already updated"}), 200
 
         async with db_pool.acquire() as connection:
-            user = await get_user(connection, telegram_id)
-            if not user:
-                added = await add_user(connection, telegram_id, username=username, full_name=full_name)
-                if not added:
-                    logging.error(f"❌ Failed to add user {telegram_id}")
-                    return jsonify({"error": "Failed to register user"}), 500
+            # تحديث بيانات المستخدم أو إضافته إن لم يكن موجودًا
+            user_updated = await add_user(connection, telegram_id, username=username, full_name=full_name)
+            if not user_updated:
+                logging.error(f"❌ Failed to add/update user {telegram_id}")
+                return jsonify({"error": "Failed to register user"}), 500
 
             subscription_plan = await connection.fetchrow(
                 "SELECT id, subscription_type_id, name, duration_days FROM subscription_plans WHERE id = $1",
@@ -130,6 +129,7 @@ async def subscribe():
                     telegram_id,
                     channel_id,
                     subscription_plan["subscription_type_id"],
+                    subscription_plan_id,
                     new_expiry,
                     start_date,
                     True,
@@ -150,6 +150,7 @@ async def subscribe():
                     telegram_id,
                     channel_id,
                     subscription_plan["subscription_type_id"],
+                    subscription_plan_id,
                     start_date,
                     new_expiry,
                     True,
