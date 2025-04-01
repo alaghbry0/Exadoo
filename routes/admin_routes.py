@@ -601,6 +601,7 @@ async def get_payments():
 @role_required("admin")
 async def get_incoming_transactions():
     try:
+        search_term = request.args.get("search", "")
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
@@ -615,14 +616,25 @@ async def get_incoming_transactions():
                 it.received_at,
                 it.memo
             FROM incoming_transactions it
-            ORDER BY it.received_at DESC
-            LIMIT $1 OFFSET $2
+            WHERE 1=1
         """
+        params = []
+
+        # إضافة شرط البحث إذا تم تمرير search_term
+        if search_term:
+            query += f" AND (it.txhash ILIKE ${len(params) + 1} OR it.sender_address ILIKE ${len(params) + 1} OR it.memo ILIKE ${len(params) + 1})"
+            params.append(f"%{search_term}%")
+
+        # ترتيب النتائج وتطبيق التجزئة
+        query += f" ORDER BY it.received_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+        params.append(page_size)
+        params.append(offset)
+
         async with current_app.db_pool.acquire() as connection:
-            rows = await connection.fetch(query, page_size, offset)
+            rows = await connection.fetch(query, *params)
         return jsonify([dict(row) for row in rows])
     except Exception as e:
-        logging.error("Error fetching incoming transactions: %s", e, exc_info=True)
+        logging.error("Error fetching incoming transactions: %s", e, exc_info=True) 
         return jsonify({"error": "Internal server error"}), 500
 
 
