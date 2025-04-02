@@ -540,7 +540,7 @@ async def get_payments():
             params.append(status)
         else:
             # جلب الدفعات الناجحة والفاشلة بشكل افتراضي
-            query += f" AND p.status IN ('completed', 'failed')"
+            query += f" AND p.status IN ('completed', 'failed', )"
 
         if user_id:
             query += f" AND p.user_id = ${len(params) + 1}"
@@ -700,9 +700,8 @@ async def update_subscription(subscription_id):
 # 4. API لإضافة اشتراك جديد
 # =====================================
 @admin_routes.route("/subscriptions", methods=["POST"])
+@role_required("admin")
 async def add_subscription():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
     try:
         data = await request.get_json()
         # استلام البيانات الأساسية من الـ Modal
@@ -790,9 +789,9 @@ async def add_subscription():
 
 
 @admin_routes.route("/subscriptions/export", methods=["GET"])
+@role_required("admin")
 async def export_subscriptions():
-    if not is_admin():
-        return jsonify({"error": "Unauthorized"}), 403
+    
     try:
         subscription_type_id = request.args.get("subscription_type_id")
         start_date = request.args.get("start_date")

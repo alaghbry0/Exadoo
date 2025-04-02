@@ -364,35 +364,56 @@ async def update_payment_with_txhash(
     payment_token: str,
     tx_hash: str,
     amount_received: Decimal,
-    status: str,
+    status: str = "completed",
     error_message: Optional[str] = None
 ) -> Optional[dict]:
     """
-    تحديث سجل الدفع مع تفاصيل جديدة
+    تحديث سجل الدفع مع تفاصيل جديدة وتحديث حالة المعاملة في incoming_transactions
     """
     try:
-        query = """
-            UPDATE payments
-            SET 
-                tx_hash = $1,
-                amount_received = $2,
-                status = $3,
-                error_message = $4,
-                processed_at = NOW()
-            WHERE payment_token = $5
-            RETURNING *;
-        """
-        row = await conn.fetchrow(
-            query,
-            tx_hash,
-            amount_received,
-            status,
-            error_message,
-            payment_token
-        )
-        return dict(row) if row else None
+        # بدء transaction واحدة لضمان التزامن
+        async with conn.transaction():
+            # 1. تحديث جدول payments
+            payment_query = """
+                UPDATE payments
+                SET 
+                    tx_hash = $1,
+                    amount_received = $2,
+                    status = $3,
+                    error_message = $4,
+                    processed_at = NOW()
+                WHERE payment_token = $5
+                RETURNING *;
+            """
+            payment_row = await conn.fetchrow(
+                payment_query,
+                tx_hash,
+                amount_received,
+                status,
+                error_message,
+                payment_token
+            )
+            
+            if not payment_row:
+                logging.error(f"❌ لم يتم العثور على دفعة بالـ token: {payment_token}")
+                return None
+            
+            # 2. تحديث جدول incoming_transactions
+            incoming_query = """
+                UPDATE incoming_transactions
+                SET processed = TRUE
+                WHERE txhash = $1
+                RETURNING txhash;
+            """
+            incoming_row = await conn.fetchrow(incoming_query, tx_hash)
+            
+            if not incoming_row:
+                logging.warning(f"⚠️ لم يتم العثور على معاملة واردة بالـ txhash: {tx_hash}")
+            
+            return dict(payment_row)
+            
     except Exception as e:
-        logging.error(f"❌ فشل تحديث الدفعة: {str(e)}")
+        logging.error(f"❌ فشل تحديث الدفعة والمعاملة: {str(e)}", exc_info=True)
         return None
 
 
@@ -422,36 +443,37 @@ async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Op
 
 
 async def record_incoming_transaction(
-    conn,
-    txhash: str,
-    sender: str,
-    amount: float,
-    payment_token: Optional[str] = None,
-    memo: Optional[str] = None
+        conn,
+        txhash: str,
+        sender: str,
+        amount: float,
+        payment_token: Optional[str] = None,
+        received_at: Optional[datetime] = None
 ):
     """
-    تسجيل المعاملة الواردة في جدول incoming_transactions
+    نسخة معدلة مع استخدام timezone-aware datetime
     """
     try:
         await conn.execute('''
             INSERT INTO incoming_transactions (
-                txhash, 
-                sender_address, 
-                amount, 
-                payment_token, 
-                processed, 
-                memo
+                txhash,
+                sender_address,
+                amount,
+                payment_token,
+                processed,
+                received_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6
             )
             ON CONFLICT (txhash) DO NOTHING
         ''',
-        txhash,
-        sender,
-        amount,
-        payment_token,
-        False,
-        memo)
+                           txhash,
+                           sender,
+                           amount,
+                           payment_token,
+                           False,
+                           received_at or datetime.now(timezone.utc))
+
         logging.info(f"✅ تم تسجيل المعاملة {txhash}")
     except Exception as e:
         logging.error(f"❌ فشل تسجيل المعاملة {txhash}: {str(e)}")

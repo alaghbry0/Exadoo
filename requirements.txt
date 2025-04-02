@@ -98,7 +98,7 @@ PyJWT==2.8.0
 pytoniq
 pytz==2024.2
 
-
+base64
 qrcode==8.0
 Quart==0.20.0
 quart-cors==0.8.0
