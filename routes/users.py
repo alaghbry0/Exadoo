@@ -17,14 +17,19 @@ def handle_date_timezone(dt: datetime, tz: pytz.BaseTzInfo) -> datetime:
 
 
 def calculate_subscription_details(sub: Dict[str, Any], local_tz: pytz.BaseTzInfo) -> Dict[str, Any]:
-    """حساب تفاصيل الاشتراك مع معالجة التواريخ"""
+    """حساب تفاصيل الاشتراك مع معالجة التواريخ بدقة أكبر"""
     expiry_date = handle_date_timezone(sub['expiry_date'], local_tz)
     start_date = sub['start_date'] or expiry_date - timedelta(days=30)
     start_date = handle_date_timezone(start_date, local_tz)
 
     now = datetime.now(local_tz)
-    total_days = (expiry_date - start_date).days
-    days_left = max((expiry_date - now).days, 0)
+    # حساب الفرق بالثواني
+    seconds_left = max((expiry_date - now).total_seconds(), 0)
+    days_left = seconds_left / (60 * 60 * 24)
+
+    # حساب إجمالي مدة الاشتراك بدقة
+    total_seconds = (expiry_date - start_date).total_seconds()
+    total_days = total_seconds / (60 * 60 * 24)
 
     progress = 0
     if total_days > 0:
@@ -32,11 +37,12 @@ def calculate_subscription_details(sub: Dict[str, Any], local_tz: pytz.BaseTzInf
 
     is_active = sub['is_active'] and days_left > 0
     status = "نشط" if is_active else "منتهي"
+    expiry_text = f"متبقي {days_left:.2f} يوم" if is_active else "انتهى الاشتراك"
 
     return {
         "id": sub['subscription_type_id'],
         "name": sub['subscription_name'],
-        "expiry": f"متبقي {days_left} يوم" if is_active else "انتهى الاشتراك",
+        "expiry": expiry_text,
         "progress": progress,
         "status": status,
         "start_date": start_date.isoformat(),
