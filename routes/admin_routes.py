@@ -540,7 +540,7 @@ async def get_payments():
             params.append(status)
         else:
             # جلب الدفعات الناجحة والفاشلة بشكل افتراضي
-            query += f" AND p.status IN ('completed', 'failed', )"
+            query += f" AND p.status IN ('completed', 'failed' )"
 
         if user_id:
             query += f" AND p.user_id = ${len(params) + 1}"

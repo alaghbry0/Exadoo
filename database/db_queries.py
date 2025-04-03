@@ -443,37 +443,38 @@ async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Op
 
 
 async def record_incoming_transaction(
-        conn,
-        txhash: str,
-        sender: str,
-        amount: float,
-        payment_token: Optional[str] = None,
-        received_at: Optional[datetime] = None
+    conn,
+    txhash: str,
+    sender: str,
+    amount: float,
+    payment_token: Optional[str] = None,
+    memo: Optional[str] = None
 ):
     """
-    نسخة معدلة مع استخدام timezone-aware datetime
+    تسجيل المعاملة الواردة في جدول incoming_transactions مع التوقيت المصحح
     """
     try:
         await conn.execute('''
             INSERT INTO incoming_transactions (
-                txhash,
-                sender_address,
-                amount,
-                payment_token,
-                processed,
-                received_at
+                txhash, 
+                sender_address, 
+                amount, 
+                payment_token, 
+                processed, 
+                memo,
+                received_at  -- إضافة القيمة يدويًا
             ) VALUES (
-                $1, $2, $3, $4, $5, $6
+                $1, $2, $3, $4, $5, $6,
+                (NOW() AT TIME ZONE 'UTC' + INTERVAL '3 hours')::timestamp  -- حساب التوقيت الصحيح
             )
             ON CONFLICT (txhash) DO NOTHING
         ''',
-                           txhash,
-                           sender,
-                           amount,
-                           payment_token,
-                           False,
-                           received_at or datetime.now(timezone.utc))
-
+        txhash,
+        sender,
+        amount,
+        payment_token,
+        False,
+        memo)
         logging.info(f"✅ تم تسجيل المعاملة {txhash}")
     except Exception as e:
         logging.error(f"❌ فشل تسجيل المعاملة {txhash}: {str(e)}")
