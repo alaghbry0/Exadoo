@@ -17,7 +17,7 @@ def handle_date_timezone(dt: datetime, tz: pytz.BaseTzInfo) -> datetime:
 
 
 def calculate_subscription_details(sub: Dict[str, Any], local_tz: pytz.BaseTzInfo) -> Dict[str, Any]:
-    """حساب تفاصيل الاشتراك مع معالجة التواريخ بدقة أكبر"""
+    """حساب تفاصيل الاشتراك مع تحسين عرض الوقت المتبقي"""
     expiry_date = handle_date_timezone(sub['expiry_date'], local_tz)
     start_date = sub['start_date'] or expiry_date - timedelta(days=30)
     start_date = handle_date_timezone(start_date, local_tz)
@@ -25,11 +25,11 @@ def calculate_subscription_details(sub: Dict[str, Any], local_tz: pytz.BaseTzInf
     now = datetime.now(local_tz)
     # حساب الفرق بالثواني
     seconds_left = max((expiry_date - now).total_seconds(), 0)
-    days_left = seconds_left / (60 * 60 * 24)
+    days_left = int(seconds_left // (60 * 60 * 24))  # تقريب لعدد صحيح
 
-    # حساب إجمالي مدة الاشتراك بدقة
+    # حساب إجمالي مدة الاشتراك
     total_seconds = (expiry_date - start_date).total_seconds()
-    total_days = total_seconds / (60 * 60 * 24)
+    total_days = max(int(total_seconds // (60 * 60 * 24)), 1)  # ضمان أن لا يكون صفرًا
 
     progress = 0
     if total_days > 0:
@@ -37,18 +37,22 @@ def calculate_subscription_details(sub: Dict[str, Any], local_tz: pytz.BaseTzInf
 
     is_active = sub['is_active'] and days_left > 0
     status = "نشط" if is_active else "منتهي"
-    expiry_text = f"متبقي {days_left:.2f} يوم" if is_active else "انتهى الاشتراك"
+
+    # تحديد نص انتهاء الاشتراك
+    if days_left == 0:
+        expiry_text = "متبقي أقل من يوم"
+    else:
+        expiry_text = f"متبقي {days_left} يوم"
 
     return {
         "id": sub['subscription_type_id'],
         "name": sub['subscription_name'],
-        "expiry": expiry_text,
+        "expiry": expiry_text if is_active else "انتهى الاشتراك",
         "progress": progress,
         "status": status,
         "start_date": start_date.isoformat(),
         "expiry_date": expiry_date.isoformat()
     }
-
 
 @user_bp.route("/api/user/subscriptions", methods=["GET"])
 async def get_user_subscriptions_endpoint():
