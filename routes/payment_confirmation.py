@@ -107,6 +107,7 @@ async def parse_transactions(provider: LiteBalancer):
         logging.info(f"✅ تم جلب {len(transactions)} معاملة.")
 
         for transaction in transactions:
+            print(json.dumps(transaction, default=str, indent=2))
             tx_hash_hex = transaction.cell.hash.hex()
             logging.info(f"🔄 فحص المعاملة tx_hash: {tx_hash_hex}")
 
@@ -209,6 +210,7 @@ async def parse_transactions(provider: LiteBalancer):
                     amount=jetton_amount,
                     payment_token=payment_token_from_payload
                 )
+
 
             # المطابقة مع سجل الدفع المعلق والتحقق من الدفع وحساب الفروق
             async with current_app.db_pool.acquire() as conn:
@@ -326,6 +328,7 @@ async def parse_transactions(provider: LiteBalancer):
         logging.info("✅ انتهاء parse_transactions.")
 
 
+
 async def periodic_check_payments():
     """
     تقوم هذه الدالة بالتحقق الدوري من المعاملات باستخدام LiteBalancer،
@@ -347,7 +350,6 @@ async def periodic_check_payments():
                     logging.warning(f"⚠️ أثناء إغلاق provider: {e}")
         logging.info("✅ انتهاء دورة parse_transactions الدورية. سيتم إعادة التشغيل بعد 30 ثانية.")
         await asyncio.sleep(30)
-
 
 @payment_confirmation_bp.before_app_serving
 async def startup():
