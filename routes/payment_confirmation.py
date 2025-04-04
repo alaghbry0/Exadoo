@@ -303,6 +303,7 @@ async def parse_transactions(provider: LiteBalancer):
                             "telegram_id": int(pending_payment['telegram_id']),
                             "subscription_plan_id": pending_payment['subscription_plan_id'],
                             "payment_id": tx_hash,
+
                             "payment_token": pending_payment['payment_token'],
                             "username": str(pending_payment['username']),
                             "full_name": str(pending_payment['full_name']),

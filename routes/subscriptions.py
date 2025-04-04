@@ -1,24 +1,24 @@
 import logging
 import pytz
 import os
+import json
 from quart import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta, timezone
 from database.db_queries import (
     get_user, add_user, add_subscription, update_subscription, add_scheduled_task
 )
 from utils.db_utils import add_user_to_channel
-import json
 from server.redis_manager import redis_manager
 
+# نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
+from utils.notifications import create_notification
 
 # إنشاء Blueprint لنقاط API الخاصة بالاشتراكات
 subscriptions_bp = Blueprint("subscriptions", __name__)
 
 LOCAL_TZ = pytz.timezone("Asia/Riyadh")  # التوقيت المحلي
 IS_DEVELOPMENT = True  # يمكن تغييره بناءً على بيئة التطبيق
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # تحميل مفتاح Webhook من المتغيرات البيئية
-
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # مفتاح Webhook
 
 @subscriptions_bp.route("/api/subscribe", methods=["POST"])
 async def subscribe():
@@ -27,19 +27,18 @@ async def subscribe():
     تُعيد الرد بيانات الاشتراك ورابط الدعوة.
     """
     try:
-        import json
         secret = request.headers.get("Authorization")
         if not secret or secret != f"Bearer {WEBHOOK_SECRET}":
             logging.warning("❌ Unauthorized request: Invalid or missing WEBHOOK_SECRET")
             return jsonify({"error": "Unauthorized request"}), 403
 
         data = await request.get_json()
-        logging.info(f"📥 بيانات الطلب المستلمة في /api/subscribe: {json.dumps(data, indent=2)}")
+        logging.info(f"📥 Received subscription request: {json.dumps(data, indent=2)}")
 
         telegram_id = data.get("telegram_id")
         subscription_plan_id = data.get("subscription_plan_id")
         payment_id = data.get("payment_id")
-        payment_token = data.get("payment_token")  # قراءة payment_token من البيانات الواردة
+        payment_token = data.get("payment_token")  # قراءة payment_token
         username = data.get("username", None)
         full_name = data.get("full_name", None)
 
@@ -51,35 +50,32 @@ async def subscribe():
                           f"subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
             return jsonify({"error": "Invalid data format"}), 400
 
-        # التأكد من وجود payment_token
         if not payment_token:
             logging.error("❌ Missing payment_token in the request data")
             return jsonify({"error": "Missing payment_token"}), 400
-
-        logging.info(f"✅ استلام طلب اشتراك: telegram_id={telegram_id}, "
-                     f"subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
 
         db_pool = getattr(current_app, "db_pool", None)
         if not db_pool:
             logging.critical("❌ Database connection is missing!")
             return jsonify({"error": "Internal Server Error"}), 500
 
+        # التحقق من وجود الدفع مسبقًا
         async with db_pool.acquire() as connection:
             existing_payment = await connection.fetchrow(
                 "SELECT * FROM payments WHERE tx_hash = $1", payment_id
             )
             if existing_payment:
-                logging.warning(f"⚠️ الدفع مسجل مسبقًا: {payment_id}")
+                logging.warning(f"⚠️ Payment already registered: {payment_id}")
                 existing_subscription = await connection.fetchrow(
                     "SELECT * FROM subscriptions WHERE telegram_id = $1 AND subscription_type_id = $2 AND payment_id = $3",
                     telegram_id, existing_payment.get("subscription_type_id"), payment_id
                 )
                 if existing_subscription:
-                    logging.info(f"✅ الاشتراك محدث بالفعل لـ {telegram_id}, لا حاجة للتحديث.")
+                    logging.info(f"✅ Subscription already updated for {telegram_id}, no update needed.")
                     return jsonify({"message": "Subscription already updated"}), 200
 
         async with db_pool.acquire() as connection:
-            # تحديث بيانات المستخدم أو إضافته إن لم يكن موجودًا
+            # تحديث أو إضافة المستخدم
             user_updated = await add_user(connection, telegram_id, username=username, full_name=full_name)
             if not user_updated:
                 logging.error(f"❌ Failed to add/update user {telegram_id}")
@@ -109,10 +105,10 @@ async def subscribe():
             duration_minutes = 120 if IS_DEVELOPMENT else 0
             current_time = datetime.now(timezone.utc)
 
+            # الحصول على الاشتراك الحالي إن وجد
             subscription = await connection.fetchrow(
                 "SELECT * FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2",
-                telegram_id,
-                channel_id
+                telegram_id, channel_id
             )
 
             if subscription:
@@ -140,11 +136,9 @@ async def subscribe():
                     return jsonify({"error": "Failed to update subscription"}), 500
 
                 logging.info(f"🔄 Subscription renewed for {telegram_id} until {new_expiry}")
-
             else:
                 start_date = current_time
                 new_expiry = start_date + timedelta(minutes=duration_minutes, days=duration_days)
-
                 added = await add_subscription(
                     connection,
                     telegram_id,
@@ -162,11 +156,11 @@ async def subscribe():
 
                 logging.info(f"✅ New subscription created for {telegram_id} until {new_expiry}")
 
-            # استدعاء دالة add_user_to_channel للحصول على رابط الدعوة (دون تخزينه في قاعدة البيانات)
+            # الحصول على رابط الدعوة عبر دالة add_user_to_channel
             channel_result = await add_user_to_channel(telegram_id, subscription_plan["subscription_type_id"], db_pool)
             invite_link = channel_result.get("invite_link")
 
-            # جدولة التذكيرات (مثال، يمكن تعديله حسب الحاجة)
+            # جدولة التذكيرات
             reminders = [
                 ("first_reminder", new_expiry - timedelta(minutes=30 if IS_DEVELOPMENT else 1440)),
                 ("second_reminder", new_expiry - timedelta(minutes=15 if IS_DEVELOPMENT else 60)),
@@ -185,8 +179,58 @@ async def subscribe():
                 )
                 logging.info(f"📅 Scheduled '{task_type}' at {execute_time_local}")
 
+            # تحسين تنسيق التواريخ للعرض باستخدام المنطقة المحلية
             start_date_local = start_date.astimezone(LOCAL_TZ)
             new_expiry_local = new_expiry.astimezone(LOCAL_TZ)
+
+            # تسجيل سجل الاشتراك في subscription_history مع RETURNING للحصول على معرف السجل
+            history_query = """
+                INSERT INTO subscription_history (
+                    subscription_id, invite_link, subscription_type_name, subscription_plan_name,
+                    renewal_date, expiry_date, telegram_id, extra_data
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING id
+            """
+            subscription_id_val = subscription["id"] if subscription else None
+            subscription_type_name = subscription_type["name"]
+            subscription_plan_name = subscription_plan["name"]
+            renewal_date = start_date    # يمكن تعديل التاريخ حسب الحاجة
+            expiry_date = new_expiry
+            extra_history = json.dumps({
+                "full_name": full_name,
+                "username": username
+            })
+            history_record = await connection.fetchrow(
+                history_query,
+                subscription_id_val,
+                invite_link,
+                subscription_type_name,
+                subscription_plan_name,
+                renewal_date,
+                expiry_date,
+                telegram_id,
+                extra_history
+            )
+            subscription_history_id = history_record["id"]
+
+            # تسجيل إشعار تجديد الاشتراك باستخدام create_notification
+            # هنا نستخدم معرف subscription_history بدلاً من subscription_id
+            extra_notification = {
+                "subscription_history_id": subscription_history_id,
+                "expiry_date": new_expiry.isoformat(),
+                "payment_token": payment_token
+            }
+            await create_notification(
+                connection=connection,
+                notification_type="subscription_renewal",
+                title="تجديد الاشتراك",
+                message=f"✅ تم تجديد اشتراكك في {subscription_type['name']} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
+                extra_data=extra_notification,
+                is_public=False,
+                telegram_ids=[telegram_id]
+
+            )
 
             response_data = {
                 "fmessage": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
@@ -196,7 +240,7 @@ async def subscribe():
                 "formatted_message": f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
             }
 
-            # نشر الحدث عبر Redis باستخدام payment_token
+            # نشر الحدث عبر Redis باستخدام payment_token مع تحسين تنسيق التاريخ
             await redis_manager.publish_event(
                 f"payment_{payment_token}",
                 {
@@ -205,7 +249,6 @@ async def subscribe():
                     'message': f'✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime("%Y-%m-%d %H:%M:%S UTC+3")}',
                     'invite_link': invite_link,
                     'formatted_message': f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
-
                 }
             )
 
@@ -214,6 +257,3 @@ async def subscribe():
     except Exception as e:
         logging.error(f"❌ Critical error in /api/subscribe: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
-
-
