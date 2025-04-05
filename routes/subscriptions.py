@@ -186,10 +186,10 @@ async def subscribe():
             # تسجيل سجل الاشتراك في subscription_history مع RETURNING للحصول على معرف السجل
             history_query = """
                 INSERT INTO subscription_history (
-                    subscription_id, invite_link, subscription_type_name, subscription_plan_name,
+                    subscription_id, invite_link,action_type, subscription_type_name, subscription_plan_name,
                     renewal_date, expiry_date, telegram_id, extra_data
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING id
             """
             subscription_id_val = subscription["id"] if subscription else None
@@ -201,9 +201,12 @@ async def subscribe():
                 "full_name": full_name,
                 "username": username
             })
+            action_type = 'RENEWAL' if subscription else 'NEW'
+
             history_record = await connection.fetchrow(
                 history_query,
                 subscription_id_val,
+                action_type,
                 invite_link,
                 subscription_type_name,
                 subscription_plan_name,
