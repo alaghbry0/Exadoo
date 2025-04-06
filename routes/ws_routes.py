@@ -13,6 +13,8 @@ ws_bp = Blueprint('ws_bp', __name__)
 active_connections = {}
 # قاموس لتخزين آخر وقت تلقي رسالة من كل اتصال
 connection_timestamps = {}
+# قاموس لتخزين مهام ping الدورية
+ping_tasks = {}
 
 
 @ws_bp.websocket('/ws/notifications')
@@ -27,9 +29,13 @@ async def notifications_ws():
     telegram_id = str(telegram_id)
     ws = websocket._get_current_object()
 
+    # تسجيل معلومات المتصفح للتشخيص
+    user_agent = request.headers.get('User-Agent', 'غير معروف')
+    logging.info(f"🌐 محاولة اتصال من: {user_agent} للمستخدم {telegram_id}")
+
     # إغلاق الاتصالات المكررة لنفس المستخدم
-    # إذا كان هناك أكثر من 3 اتصالات، قم بإغلاق الأقدم
-    if telegram_id in active_connections and len(active_connections[telegram_id]) >= 3:
+    # إذا كان هناك أكثر من 2 اتصالات، قم بإغلاق الأقدم
+    if telegram_id in active_connections and len(active_connections[telegram_id]) >= 2:
         logging.warning(f"⚠️ تم اكتشاف اتصالات متعددة لـ {telegram_id}، سيتم إغلاق أقدم اتصال")
         try:
             oldest_ws = active_connections[telegram_id][0]
@@ -46,6 +52,39 @@ async def notifications_ws():
     active_connections[telegram_id].append(ws)
     connection_timestamps[ws] = time.time()
 
+    # إنشاء مهمة ping فردية لهذا الاتصال
+    async def ping_client():
+        try:
+            ping_interval = 15  # 15 ثانية
+            while ws in connection_timestamps:
+                await asyncio.sleep(ping_interval)
+                try:
+                    if ws not in connection_timestamps:
+                        break
+                    # إرسال ping فقط إذا كان الاتصال لا يزال مفتوحًا
+                    await ws.send(json.dumps({"type": "ping", "timestamp": time.time()}))
+                    logging.debug(f"📍 تم إرسال ping إلى {telegram_id}")
+                except Exception as e:
+                    logging.warning(f"⚠️ فشل إرسال ping: {str(e)}")
+                    # إزالة الاتصال إذا فشل ping
+                    if telegram_id in active_connections and ws in active_connections[telegram_id]:
+                        active_connections[telegram_id].remove(ws)
+                        if ws in connection_timestamps:
+                            del connection_timestamps[ws]
+                        if not active_connections[telegram_id]:
+                            del active_connections[telegram_id]
+                    break
+        except asyncio.CancelledError:
+            logging.debug(f"🔌 تم إلغاء مهمة ping لـ {telegram_id}")
+        except Exception as e:
+            logging.error(f"❌ خطأ في مهمة ping: {str(e)}")
+
+    # بدء مهمة ping وتخزين المرجع
+    ping_task = asyncio.create_task(ping_client())
+    if telegram_id not in ping_tasks:
+        ping_tasks[telegram_id] = []
+    ping_tasks[telegram_id].append(ping_task)
+
     # إرسال تأكيد الاتصال
     await ws.send(json.dumps({
         "type": "connection_established",
@@ -56,8 +95,6 @@ async def notifications_ws():
     }))
 
     logging.info(f"✅ تم فتح اتصال WebSocket لـ telegram_id: {telegram_id}")
-
-
 
     # إرسال عدد الإشعارات غير المقروءة عند الاتصال
     try:
@@ -83,13 +120,15 @@ async def notifications_ws():
     try:
         while True:
             message = await websocket.receive()
-            connection_timestamps[ws] = time.time()  # تحديث الطابع الزمني
+            current_time = time.time()
+            connection_timestamps[ws] = current_time  # تحديث الطابع الزمني
 
             # معالجة الرسائل الواردة
             try:
                 data = json.loads(message)
                 if data.get("type") == "ping":
-                    await ws.send(json.dumps({"type": "pong", "timestamp": time.time()}))
+                    await ws.send(json.dumps({"type": "pong", "timestamp": current_time}))
+                    logging.debug(f"🏓 تم الرد على ping من {telegram_id}")
             except json.JSONDecodeError:
                 logging.warning(f"⚠️ تم استلام رسالة WebSocket غير صالحة: {message}")
     except asyncio.CancelledError:
@@ -98,6 +137,16 @@ async def notifications_ws():
         logging.error(f"❌ خطأ في اتصال WebSocket لـ telegram_id {telegram_id}: {str(e)}")
         logging.error(traceback.format_exc())
     finally:
+        # إلغاء مهمة ping
+        if telegram_id in ping_tasks:
+            for task in ping_tasks[telegram_id]:
+                if task == ping_task:
+                    task.cancel()
+                    ping_tasks[telegram_id].remove(task)
+                    break
+            if not ping_tasks[telegram_id]:
+                del ping_tasks[telegram_id]
+
         # تنظيف الاتصال عند الإغلاق
         if telegram_id in active_connections and ws in active_connections[telegram_id]:
             active_connections[telegram_id].remove(ws)
@@ -131,9 +180,8 @@ async def broadcast_unread_count(telegram_id, unread_count):
                 logging.debug(f"✅ تم إرسال تحديث عدد الإشعارات بنجاح إلى {telegram_id_str}")
             except Exception as e:
                 logging.error(f"❌ فشل إرسال تحديث عدد الإشعارات إلى {telegram_id_str}: {str(e)}")
-                # لا نقوم بإزالة الاتصال هنا، سيتم معالجة ذلك في مهمة فحص الاتصالات
     else:
-        logging.warning(f"⚠️ لا توجد اتصالات WebSocket نشطة للمستخدم {telegram_id_str}")
+        logging.debug(f"⚠️ لا توجد اتصالات WebSocket نشطة للمستخدم {telegram_id_str}")
 
 
 async def broadcast_notification(telegram_id, notification_data):
@@ -154,71 +202,10 @@ async def broadcast_notification(telegram_id, notification_data):
                 successful_sends += 1
             except Exception as e:
                 logging.error(f"❌ فشل إرسال الإشعار إلى اتصال WebSocket: {str(e)}")
-                # لا نقوم بإزالة الاتصال هنا، سيتم معالجة ذلك في مهمة فحص الاتصالات
 
         logging.info(
             f"✅ تم إرسال الإشعار بنجاح إلى {successful_sends} من {len(active_connections[telegram_id_str])} اتصالات")
         return successful_sends > 0
     else:
-        logging.warning(f"⚠️ لا توجد اتصالات WebSocket نشطة للمستخدم {telegram_id_str}")
+        logging.debug(f"⚠️ لا توجد اتصالات WebSocket نشطة للمستخدم {telegram_id_str}")
         return False
-
-
-async def check_connections():
-    """مهمة دورية للتحقق من حالة الاتصالات وإزالة الاتصالات الميتة"""
-    while True:
-        try:
-            current_time = time.time()
-            inactive_timeout = 120  # 2 دقيقة بدون نشاط
-
-            for telegram_id in list(active_connections.keys()):
-                for ws in active_connections[telegram_id][:]:  # استخدام نسخة من القائمة
-                    try:
-                        # التحقق من وقت آخر نشاط
-                        last_active = connection_timestamps.get(ws, 0)
-                        if current_time - last_active > inactive_timeout:
-                            logging.warning(
-                                f"⚠️ إزالة اتصال غير نشط لـ {telegram_id} (غير نشط منذ {current_time - last_active:.1f}s)")
-
-                            # محاولة إغلاق الاتصال بأمان
-                            try:
-                                await ws.close(code=1000, reason="Inactive connection")
-                            except Exception:
-                                pass
-
-                            # إزالة الاتصال من القائمة
-                            if ws in active_connections[telegram_id]:
-                                active_connections[telegram_id].remove(ws)
-
-                            if ws in connection_timestamps:
-                                del connection_timestamps[ws]
-
-                        # إرسال ping للتأكد من أن الاتصال لا يزال حيًا
-                        elif current_time - last_active > 45:  # 45 ثانية
-                            try:
-                                await ws.send(json.dumps({"type": "ping", "timestamp": current_time}))
-                            except Exception:
-                                # محاولة إغلاق وإزالة الاتصال
-                                if ws in active_connections[telegram_id]:
-                                    active_connections[telegram_id].remove(ws)
-
-                                if ws in connection_timestamps:
-                                    del connection_timestamps[ws]
-                    except Exception as e:
-                        logging.error(f"❌ خطأ أثناء فحص الاتصال: {str(e)}")
-
-                # إزالة المستخدمين بدون اتصالات
-                if not active_connections[telegram_id]:
-                    del active_connections[telegram_id]
-
-        except Exception as e:
-            logging.error(f"❌ خطأ في مهمة فحص الاتصالات: {str(e)}")
-
-        # انتظار قبل الفحص التالي
-        await asyncio.sleep(30)
-
-
-# بدء مهمة فحص الاتصالات عند تسجيل البلوبرنت
-@ws_bp.before_app_serving
-async def start_connection_checker():
-    asyncio.create_task(check_connections())
