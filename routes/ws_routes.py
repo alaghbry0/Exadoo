@@ -18,7 +18,8 @@ async def notifications_ws():
         await websocket.close(code=4000)
         return
 
-    ws = websocket
+    ws = websocket._get_current_object()
+
     if telegram_id not in active_connections:
         active_connections[telegram_id] = []
     active_connections[telegram_id].append(ws)
