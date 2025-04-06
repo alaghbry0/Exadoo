@@ -19,7 +19,7 @@ async def validate_telegram_id(telegram_id):
 @ws_bp.websocket('/ws/notifications')
 async def notifications_ws():
     telegram_id = websocket.args.get('telegram_id')
-    if not is_valid_telegram_id(telegram_id):
+    if not await validate_telegram_id(telegram_id):  # استخدام await مع validate_telegram_id
         logging.error(f"❌ Invalid Telegram ID: {telegram_id}")
         await websocket.close(code=4000)
         return

@@ -133,7 +133,7 @@
 
             try {
                 // إنشاء اتصال WebSocket
-                socket = new WebSocket(`ws://${window.location.hostname}:5000/ws/notifications/${telegramId}`);
+                socket = new WebSocket(`ws://${window.location.hostname}:5000/ws/notifications?telegram_id=${telegramId}`);
 
                 // معالجة أحداث WebSocket
                 socket.onopen = function(e) {
