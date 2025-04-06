@@ -11,32 +11,29 @@ active_connections = {}
 
 @ws_bp.websocket('/ws/notifications')
 async def notifications_ws():
-    # الحصول على telegram_id من معلمات الاستعلام
-    telegram_id = request.args.get('telegram_id')
-    if not telegram_id:
+    # ✅ استخدم websocket بدلًا من request
+    telegram_id = websocket.args.get('telegram_id')
+    if not telegram_id or not telegram_id.isdigit():
         await websocket.close(code=4000)
         return
 
-    # إضافة الاتصال إلى القائمة الخاصة بـ telegram_id
     ws = websocket
     if telegram_id not in active_connections:
         active_connections[telegram_id] = []
     active_connections[telegram_id].append(ws)
-    logging.info(f"تم فتح اتصال WebSocket لـ telegram_id: {telegram_id}")
+    logging.info(f"✅ تم فتح اتصال WebSocket لـ telegram_id: {telegram_id}")
 
     try:
-        # حلقة الاستماع؛ يمكن تعديلها لاستقبال رسائل من العميل إذا احتجت لذلك
         while True:
             _ = await websocket.receive()
             await asyncio.sleep(0.1)
     except Exception as e:
-        logging.error(f"خطأ في اتصال WebSocket: {e}")
+        logging.error(f"❌ خطأ في اتصال WebSocket: {e}")
     finally:
-        # إزالة الاتصال عند قطع الاتصال
         active_connections[telegram_id].remove(ws)
         if not active_connections[telegram_id]:
             del active_connections[telegram_id]
-        logging.info(f"تم قطع اتصال WebSocket لـ telegram_id: {telegram_id}")
+        logging.info(f"🔌 تم قطع اتصال WebSocket لـ telegram_id: {telegram_id}")
 
 def broadcast_unread_count(telegram_id, unread_count):
     """
