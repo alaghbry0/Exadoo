@@ -9,7 +9,7 @@ from database.db_queries import (
 )
 from utils.db_utils import add_user_to_channel
 
-from routes.ws_routes import broadcast_unread_count, active_connections, broadcast_notification
+from routes.ws_routes import broadcast_unread_count, active_connections
 
 # نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
 from utils.notifications import create_notification
@@ -246,10 +246,8 @@ async def subscribe():
             unread_count = result["unread_count"] if result else 0
 
             # بث التحديث عبر WebSocket لتحديث العدد وإرسال إشعار فوري للمستخدم
-            await broadcast_unread_count(str(telegram_id), unread_count)
+            broadcast_unread_count(str(telegram_id), unread_count)
 
-            # تحضير بيانات الإشعار
-            # في قسم إرسال الإشعارات
             notification_message = json.dumps({
                 "type": "subscription_renewal",
                 "data": {
@@ -258,7 +256,9 @@ async def subscribe():
                     "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')
                 }
             })
-
+            if str(telegram_id) in active_connections:
+                logging.info(
+                    f"📤 محاولة إرسال إشعار إلى {telegram_id}, عدد الاتصالات: {len(active_connections[str(telegram_id)])}")
             # استخدام الدالة الجديدة لإرسال الإشعار
             notification_sent = await broadcast_notification(telegram_id, json.loads(notification_message))
             if notification_sent:
@@ -291,7 +291,7 @@ async def subscribe():
             #     }
             # )
 
-            return jsonify(response_data), 200
+
 
     except Exception as e:
         logging.error(f"❌ Critical error in /api/subscribe: {str(e)}", exc_info=True)
