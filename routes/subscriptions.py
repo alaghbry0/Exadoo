@@ -9,7 +9,7 @@ from database.db_queries import (
 )
 from utils.db_utils import add_user_to_channel
 from server.redis_manager import redis_manager
-from routes.ws_routes import broadcast_unread_count
+from routes.ws_routes import broadcast_unread_count, active_connections
 from server.shared_state import connection_manager
 # نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
 from utils.notifications import create_notification
@@ -235,12 +235,13 @@ async def subscribe():
                 telegram_ids=[telegram_id]
             )
 
+
             # بعد إنشاء الإشعار، نقوم بحساب عدد الرسائل غير المقروءة
             unread_query = """
-                SELECT COUNT(*) AS unread_count
-                FROM user_notifications
-                WHERE telegram_id = $1 AND read_status = FALSE;
-            """
+                        SELECT COUNT(*) AS unread_count
+                        FROM user_notifications
+                        WHERE telegram_id = $1 AND read_status = FALSE;
+                    """
             result = await connection.fetchrow(unread_query, int(telegram_id))
             unread_count = result["unread_count"] if result else 0
 
@@ -255,8 +256,8 @@ async def subscribe():
                     "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')
                 }
             })
-            if connection_manager.get_connections(str(telegram_id)):
-                for ws in connection_manager.get_connections(str(telegram_id)):
+            if str(telegram_id) in active_connections:
+                for ws in active_connections[str(telegram_id)]:
                     try:
                         await ws.send(notification_message)
                     except Exception as e:
@@ -279,3 +280,4 @@ async def subscribe():
     except Exception as e:
         logging.error(f"❌ Critical error in /api/subscribe: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+

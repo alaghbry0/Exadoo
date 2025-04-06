@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import traceback
-from server.shared_state import connection_manager
+
 
 ws_bp = Blueprint('ws_bp', __name__)
 
