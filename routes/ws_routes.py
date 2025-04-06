@@ -1,39 +1,42 @@
 # server/ws_routes.py
-from quart import Blueprint, websocket, request
+from quart import Blueprint, websocket
+from quart.websockets import WebSocket
+from server.shared_state import connection_manager
 import asyncio
 import json
 import logging
-import traceback
-from server.shared_state import connection_manager
 
 ws_bp = Blueprint('ws_bp', __name__)
 
 
 @ws_bp.websocket('/ws/notifications')
-async def notifications_ws():
-    ws = None
-    telegram_id = None
+async def websocket_handler():
+    telegram_id = websocket.args.get('telegram_id')
+    if not (telegram_id and telegram_id.isdigit()):
+        await websocket.close(code=4000)
+        return
+
+    ws: WebSocket = websocket._get_current_object()
+    await connection_manager.connect(telegram_id, ws)
+
     try:
-        telegram_id = websocket.args.get('telegram_id')
-        if not telegram_id or not telegram_id.isdigit():
-            await websocket.close(code=4000)
-            return
-
-        ws = websocket._get_current_object()
-        await connection_manager.connect(telegram_id, ws)
-
         while True:
-            message = await websocket.receive()
-            if message == 'pong':
+            data = await websocket.receive()
+            if data == 'pong':
                 continue
 
-    except asyncio.CancelledError:
-        logging.info("WebSocket connection cancelled")
+
+    except (asyncio.CancelledError, ConnectionResetError):
+
+        logging.info("WebSocket connection closed normally")
+
     except Exception as e:
+
         logging.error(f"WebSocket error: {str(e)}")
+
     finally:
-        if ws is not None and telegram_id is not None:
-            connection_manager.disconnect(telegram_id, ws)
+
+        connection_manager.disconnect(telegram_id, ws)
 
 def broadcast_unread_count(telegram_id: str, unread_count: int):
     if not isinstance(unread_count, int) or unread_count < 0:
