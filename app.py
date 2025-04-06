@@ -41,15 +41,7 @@ app.aiohttp_session = None  # Initialize aiohttp session
 app.bot = None  # Initialize bot
 app.bot_running = False  # Bot running state
 
-# إعدادات CORS
-ALLOWED_ORIGINS = [
-    "https://exadooo-plum.vercel.app",
-    "https://exaado-panel.vercel.app",
-    "https://exadoo-rxr9.onrender.com",
-    "https://telegram.org",
-    "http://localhost:5000"
-]
-app = cors(app, allow_origin=ALLOWED_ORIGINS, allow_credentials=True)
+app = cors(app, allow_origin="*")
 
 # تسجيل Blueprints
 app.register_blueprint(sse_bp, url_prefix='/api')
