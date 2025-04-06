@@ -27,16 +27,18 @@ async def notifications_ws():
     telegram_id = str(telegram_id)
     ws = websocket._get_current_object()
 
-    # تسجيل معلومات الاتصال
-    client_info = {
-         "remote_addr": websocket.headers.get("X-Real-IP", "Unknown"),
-    "user_agent": websocket.headers.get("User-Agent", "Unknown"),
-    "connected_at": datetime.now().isoformat()
-}
-    if telegram_id not in active_connections:
-        active_connections[telegram_id] = []
-    active_connections[telegram_id].append(ws)
-    connection_timestamps[ws] = time.time()
+    # إغلاق الاتصالات المكررة لنفس المستخدم
+    # إذا كان هناك أكثر من 3 اتصالات، قم بإغلاق الأقدم
+    if telegram_id in active_connections and len(active_connections[telegram_id]) >= 3:
+        logging.warning(f"⚠️ تم اكتشاف اتصالات متعددة لـ {telegram_id}، سيتم إغلاق أقدم اتصال")
+        try:
+            oldest_ws = active_connections[telegram_id][0]
+            active_connections[telegram_id].remove(oldest_ws)
+            await oldest_ws.close(code=1000, reason="Too many connections")
+            if oldest_ws in connection_timestamps:
+                del connection_timestamps[oldest_ws]
+        except Exception as e:
+            logging.error(f"❌ خطأ أثناء إغلاق الاتصال القديم: {str(e)}")
 
     # إرسال تأكيد الاتصال
     await ws.send(json.dumps({

@@ -59,7 +59,7 @@ async def get_notifications():
 
 
 # 2. الحصول على عدد الإشعارات غير المقروءة للمستخدم الحالي
-@notifications_bp.route("/notifications/unread/count", methods=["GET"])
+@notifications_bp.route("/notifications/unread-count", methods=["GET"])
 async def count_unread_notifications():
     try:
         telegram_id = request.args.get("telegram_id")
