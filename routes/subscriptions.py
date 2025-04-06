@@ -263,6 +263,15 @@ async def subscribe():
                     except Exception as e:
                         logging.error(f"فشل إرسال الإشعار: {e}")
 
+                        # الرد للعميل
+                    response_data = {
+                        "fmessage": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
+                        "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
+                        "start_date": start_date_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
+                        "invite_link": invite_link,
+                        "formatted_message": f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
+                    }
+
             # (يمكن إزالة استخدام Redis هنا إذا لم يعد مطلوباً)
             # await redis_manager.publish_event(
             #     f"payment_{payment_token}",
