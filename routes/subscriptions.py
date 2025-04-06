@@ -246,28 +246,26 @@ async def subscribe():
             unread_count = result["unread_count"] if result else 0
 
             # بث التحديث عبر WebSocket لتحديث العدد وإرسال إشعار فوري للمستخدم
-            await broadcast_unread_count(str(telegram_id), unread_count)
+            broadcast_unread_count(str(telegram_id), unread_count)
 
-            notification_message = json.dumps({
+            # تحضير بيانات الإشعار
+            notification_data = {
                 "type": "subscription_renewal",
                 "data": {
                     "message": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
                     "invite_link": invite_link,
                     "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')
                 }
-            })
+            }
 
-            # استخدام الدالة الجديدة لإرسال الإشعار
-            notification_sent = await broadcast_notification(telegram_id, json.loads(notification_message))
+            # استخدام وظيفة بث الإشعارات المطورة
+            notification_sent = await broadcast_notification(telegram_id, notification_data)
             if notification_sent:
-                logging.info(f"✅ تم إرسال إشعار الاشتراك بنجاح إلى {telegram_id}")
+                logging.info(f"✅ تم إرسال إشعار الاشتراك عبر WebSocket بنجاح للمستخدم {telegram_id}")
             else:
-                logging.warning(f"⚠️ لم يتم إرسال إشعار الاشتراك مباشرة، سيظهر في صفحة الإشعارات")
-
-            # في جميع الحالات، تحديث عدد الإشعارات غير المقروءة
-            await broadcast_unread_count(str(telegram_id), unread_count)
-
-            # الرد للعميل
+                logging.warning(
+                    f"⚠️ لم يتم إرسال إشعار الاشتراك عبر WebSocket للمستخدم {telegram_id} - سيتم إخطاره عند الاتصال التالي")
+            # الرد للعميل (خارج حلقة for!)
             response_data = {
                 "fmessage": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
                 "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
@@ -275,6 +273,17 @@ async def subscribe():
                 "invite_link": invite_link,
                 "formatted_message": f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
             }
+            # (يمكن إزالة استخدام Redis هنا إذا لم يعد مطلوباً)
+            # await redis_manager.publish_event(
+            #     f"payment_{payment_token}",
+            #     {
+            #         'status': 'success',
+            #         'type': 'subscription_success',
+            #         'message': f'✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime("%Y-%m-%d %H:%M:%S UTC+3")}',
+            #         'invite_link': invite_link,
+            #         'formatted_message': f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
+            #     }
+            # )
 
             return jsonify(response_data), 200
 
