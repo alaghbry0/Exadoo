@@ -107,7 +107,6 @@ async def parse_transactions(provider: LiteBalancer):
         logging.info(f"✅ تم جلب {len(transactions)} معاملة.")
 
         for transaction in transactions:
-            print(json.dumps(transaction, default=str, indent=2))
             tx_hash_hex = transaction.cell.hash.hex()
             logging.info(f"🔄 فحص المعاملة tx_hash: {tx_hash_hex}")
 

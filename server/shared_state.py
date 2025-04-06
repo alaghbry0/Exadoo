@@ -1,6 +1,6 @@
 # shared_state.py
 from typing import Dict, List
-from quart import WebSocket
+from quart.websocket import WebSocket
 
 class ConnectionManager:
     def __init__(self):
