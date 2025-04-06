@@ -29,7 +29,7 @@ async def notifications_ws():
 
     # تسجيل معلومات الاتصال
     client_info = {
-        "remote_addr": request.remote_addr,
+        "remote_addr": websocket.remote_addr,
         "user_agent": websocket.headers.get("User-Agent", "Unknown"),
         "connected_at": datetime.now().isoformat()
     }
