@@ -12,6 +12,7 @@ from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
 from routes.admin_routes import admin_routes
+from routes.notifications_routes import notifications_bp
 from routes.subscriptions_routs import public_routes
 from routes.telegram_payments import payment_bp
 from routes.payment_confirmation import payment_confirmation_bp
@@ -50,7 +51,7 @@ app = cors(app, allow_origin=ALLOWED_ORIGINS, allow_credentials=True)
 
 # تسجيل Blueprints
 app.register_blueprint(sse_bp, url_prefix='/api')
-
+app.register_blueprint(notifications_bp)
 app.register_blueprint(public_routes)
 app.register_blueprint(admin_routes)
 app.register_blueprint(auth_routes)
