@@ -248,7 +248,7 @@ async def subscribe():
 
             # الرد للعميل
             response_data = {
-                "fmessage": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
+                "message": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
                 "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
                 "start_date": start_date_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
                 "invite_link": invite_link,

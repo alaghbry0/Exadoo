@@ -13,7 +13,7 @@ active_connections = {}
 @ws_bp.websocket('/ws/notifications')
 async def notifications_ws():
     # ✅ استخدم websocket بدلًا من request
-    telegram_id = websocket.args.get('telegram_id')
+    telegram_id = websocket.request.args.get('telegram_id')
     if not telegram_id or not telegram_id.isdigit():
         await websocket.close(code=4000)
         return
@@ -33,16 +33,20 @@ async def notifications_ws():
         logging.error(f"❌ خطأ في اتصال WebSocket: {e}")
         logging.error(traceback.format_exc())
     finally:
-        active_connections[telegram_id].remove(ws)
-        if not active_connections[telegram_id]:
-            del active_connections[telegram_id]
-        logging.info(f"🔌 تم قطع اتصال WebSocket لـ telegram_id: {telegram_id}")
+        if telegram_id in active_connections:
+            try:
+                active_connections[telegram_id].remove(ws)
+                if not active_connections[telegram_id]:
+                    del active_connections[telegram_id]
+            except ValueError:
+                pass
+            logging.info(f"🔌 تم قطع اتصال WebSocket لـ telegram_id: {telegram_id}")
 
 def broadcast_unread_count(telegram_id, unread_count):
-    """
-    ترسل رسالة تحديث للعميل الذي يحمل telegram_id معين تحتوي على عدد الرسائل غير المقروءة.
-    """
     if telegram_id in active_connections:
         message = json.dumps({"unread_count": unread_count})
         for ws in active_connections[telegram_id]:
-            asyncio.create_task(ws.send(message))
+            try:
+                asyncio.create_task(ws.send(message))
+            except Exception as e:
+                logging.error(f"فشل إرسال الرسالة: {e}")

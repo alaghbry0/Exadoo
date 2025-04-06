@@ -198,8 +198,6 @@ async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
 
 
 
-
-
 # 🔹 تشغيل Polling بدلاً من Webhook
 is_bot_running = False
 
