@@ -3,6 +3,7 @@ from quart import Blueprint, websocket, request
 import asyncio
 import json
 import logging
+import traceback
 
 ws_bp = Blueprint('ws_bp', __name__)
 
@@ -29,6 +30,7 @@ async def notifications_ws():
             await asyncio.sleep(0.1)
     except Exception as e:
         logging.error(f"❌ خطأ في اتصال WebSocket: {e}")
+        logging.error(traceback.format_exc())
     finally:
         active_connections[telegram_id].remove(ws)
         if not active_connections[telegram_id]:
