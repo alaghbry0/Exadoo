@@ -1,6 +1,5 @@
 import json
 
-
 async def create_notification(
         connection,
         notification_type: str,
@@ -17,9 +16,9 @@ async def create_notification(
     :param notification_type: نوع الإشعار (مثال: "subscription_renewal" أو "payment_success").
     :param title: عنوان مختصر للإشعار.
     :param message: نص الرسالة الأساسية للإشعار.
-    :param extra_data: بيانات إضافية (مثال: {"subscription_id": 123, "expiry_date": "2025-05-10T12:00:00Z", ...}).
+    :param extra_data: بيانات إضافية.
     :param is_public: إذا كان الإشعار عامًا لجميع المستخدمين.
-    :param telegram_ids: قائمة بمعرفات تليجرام للمستخدمين المستهدفين (في حالة الإشعار الخاص).
+    :param telegram_ids: قائمة بمعرفات تليجرام للمستخدمين المستهدفين (للإشعارات الخاصة).
     :return: معرف الإشعار المُنشأ.
     """
     extra_data = extra_data or {}
@@ -39,7 +38,6 @@ async def create_notification(
     notification_id = record["id"]
 
     if not is_public:
-        # في حالة الإشعار الخاص
         if not telegram_ids:
             raise ValueError("telegram_ids is required for private notifications")
         if not isinstance(telegram_ids, list):
@@ -51,7 +49,6 @@ async def create_notification(
         for tg_id in telegram_ids:
             await connection.execute(insert_query, tg_id, notification_id)
     else:
-        # في حالة الإشعار العام: ربطه بجميع المستخدمين من جدول users
         insert_query = """
             INSERT INTO user_notifications (telegram_id, notification_id)
             SELECT telegram_id, $1 FROM users

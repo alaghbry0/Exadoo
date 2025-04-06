@@ -76,6 +76,7 @@ async def count_unread_notifications():
             unread_count = result["unread_count"] if result else 0
 
         return jsonify({"unread_count": unread_count}), 200
+
     except Exception as e:
         logging.error("Error counting unread notifications: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500

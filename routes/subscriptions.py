@@ -9,6 +9,7 @@ from database.db_queries import (
 )
 from utils.db_utils import add_user_to_channel
 from server.redis_manager import redis_manager
+from routes.ws_routes import broadcast_unread_count
 
 # نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
 from utils.notifications import create_notification
@@ -38,7 +39,7 @@ async def subscribe():
         telegram_id = data.get("telegram_id")
         subscription_plan_id = data.get("subscription_plan_id")
         payment_id = data.get("payment_id")
-        payment_token = data.get("payment_token")  # قراءة payment_token
+        payment_token = data.get("payment_token")
         username = data.get("username", None)
         full_name = data.get("full_name", None)
 
@@ -186,7 +187,7 @@ async def subscribe():
             # تسجيل سجل الاشتراك في subscription_history مع RETURNING للحصول على معرف السجل
             history_query = """
                 INSERT INTO subscription_history (
-                    subscription_id, invite_link,action_type, subscription_type_name, subscription_plan_name,
+                    subscription_id, invite_link, action_type, subscription_type_name, subscription_plan_name,
                     renewal_date, expiry_date, telegram_id, extra_data
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -195,7 +196,7 @@ async def subscribe():
             subscription_id_val = subscription["id"] if subscription else None
             subscription_type_name = subscription_type["name"]
             subscription_plan_name = subscription_plan["name"]
-            renewal_date = start_date    # يمكن تعديل التاريخ حسب الحاجة
+            renewal_date = start_date
             expiry_date = new_expiry
             extra_history = json.dumps({
                 "full_name": full_name,
@@ -206,8 +207,8 @@ async def subscribe():
             history_record = await connection.fetchrow(
                 history_query,
                 subscription_id_val,
-                action_type,
                 invite_link,
+                action_type,
                 subscription_type_name,
                 subscription_plan_name,
                 renewal_date,
@@ -218,7 +219,6 @@ async def subscribe():
             subscription_history_id = history_record["id"]
 
             # تسجيل إشعار تجديد الاشتراك باستخدام create_notification
-            # هنا نستخدم معرف subscription_history بدلاً من subscription_id
             extra_notification = {
                 "subscription_history_id": subscription_history_id,
                 "expiry_date": new_expiry.isoformat(),
@@ -232,9 +232,21 @@ async def subscribe():
                 extra_data=extra_notification,
                 is_public=False,
                 telegram_ids=[telegram_id]
-
             )
 
+            # بعد إنشاء الإشعار، نقوم بحساب عدد الرسائل غير المقروءة
+            unread_query = """
+                SELECT COUNT(*) AS unread_count
+                FROM user_notifications
+                WHERE telegram_id = $1 AND read_status = FALSE;
+            """
+            result = await connection.fetchrow(unread_query, int(telegram_id))
+            unread_count = result["unread_count"] if result else 0
+
+            # بث التحديث عبر WebSocket لتحديث العدد وإرسال إشعار فوري للمستخدم
+            broadcast_unread_count(str(telegram_id), unread_count)
+
+            # الرد للعميل
             response_data = {
                 "fmessage": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
                 "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
@@ -243,17 +255,17 @@ async def subscribe():
                 "formatted_message": f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
             }
 
-            # نشر الحدث عبر Redis باستخدام payment_token مع تحسين تنسيق التاريخ
-            await redis_manager.publish_event(
-                f"payment_{payment_token}",
-                {
-                    'status': 'success',
-                    'type': 'subscription_success',
-                    'message': f'✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime("%Y-%m-%d %H:%M:%S UTC+3")}',
-                    'invite_link': invite_link,
-                    'formatted_message': f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
-                }
-            )
+            # (يمكن إزالة استخدام Redis هنا إذا لم يعد مطلوباً)
+            # await redis_manager.publish_event(
+            #     f"payment_{payment_token}",
+            #     {
+            #         'status': 'success',
+            #         'type': 'subscription_success',
+            #         'message': f'✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime("%Y-%m-%d %H:%M:%S UTC+3")}',
+            #         'invite_link': invite_link,
+            #         'formatted_message': f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
+            #     }
+            # )
 
             return jsonify(response_data), 200
 
