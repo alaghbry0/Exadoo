@@ -29,11 +29,10 @@ async def notifications_ws():
 
     # تسجيل معلومات الاتصال
     client_info = {
-        "remote_addr": request.remote_addr,
-        "user_agent": websocket.headers.get("User-Agent", "Unknown"),
-        "connected_at": datetime.now().isoformat()
-    }
-
+         "remote_addr": websocket.headers.get("X-Real-IP", "Unknown"),
+    "user_agent": websocket.headers.get("User-Agent", "Unknown"),
+    "connected_at": datetime.now().isoformat()
+}
     if telegram_id not in active_connections:
         active_connections[telegram_id] = []
     active_connections[telegram_id].append(ws)
