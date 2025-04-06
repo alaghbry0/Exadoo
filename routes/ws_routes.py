@@ -40,6 +40,12 @@ async def notifications_ws():
         except Exception as e:
             logging.error(f"❌ خطأ أثناء إغلاق الاتصال القديم: {str(e)}")
 
+    # إضافة الاتصال الجديد
+    if telegram_id not in active_connections:
+        active_connections[telegram_id] = []
+    active_connections[telegram_id].append(ws)
+    connection_timestamps[ws] = time.time()
+
     # إرسال تأكيد الاتصال
     await ws.send(json.dumps({
         "type": "connection_established",
@@ -49,7 +55,9 @@ async def notifications_ws():
         }
     }))
 
-    logging.info(f"✅ تم فتح اتصال WebSocket لـ telegram_id: {telegram_id}, معلومات العميل: {client_info}")
+    logging.info(f"✅ تم فتح اتصال WebSocket لـ telegram_id: {telegram_id}")
+
+
 
     # إرسال عدد الإشعارات غير المقروءة عند الاتصال
     try:
