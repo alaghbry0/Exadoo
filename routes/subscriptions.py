@@ -257,11 +257,17 @@ async def subscribe():
                 }
             })
             if str(telegram_id) in active_connections:
+                logging.info(
+                    f"📤 محاولة إرسال إشعار إلى {telegram_id}, عدد الاتصالات: {len(active_connections[str(telegram_id)])}")
                 for ws in active_connections[str(telegram_id)]:
                     try:
+                        logging.info(f"📤 إرسال رسالة: {notification_message}")
                         await ws.send(notification_message)
+                        logging.info("✅ تم إرسال الإشعار بنجاح")
                     except Exception as e:
-                        logging.error(f"فشل إرسال الإشعار: {e}")
+                        logging.error(f"❌ فشل إرسال الإشعار: {e}")
+            else:
+                logging.warning(f"⚠️ لا يوجد اتصالات WebSocket نشطة للمستخدم {telegram_id}")
 
             # الرد للعميل (خارج حلقة for!)
             response_data = {
