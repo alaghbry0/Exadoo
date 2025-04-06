@@ -10,7 +10,7 @@ from database.db_queries import (
 from utils.db_utils import add_user_to_channel
 from server.redis_manager import redis_manager
 from routes.ws_routes import broadcast_unread_count
-
+from server.shared_state import connection_manager
 # نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
 from utils.notifications import create_notification
 
@@ -255,8 +255,8 @@ async def subscribe():
                     "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')
                 }
             })
-            if str(telegram_id) in active_connections:
-                for ws in active_connections[str(telegram_id)]:
+            if connection_manager.get_connections(str(telegram_id)):
+                for ws in connection_manager.get_connections(str(telegram_id)):
                     try:
                         await ws.send(notification_message)
                     except Exception as e:
