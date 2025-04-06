@@ -10,7 +10,7 @@ from database.db_queries import (
 from utils.db_utils import add_user_to_channel
 from server.redis_manager import redis_manager
 from routes.ws_routes import broadcast_unread_count, active_connections
-from server.shared_state import connection_manager
+
 # نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
 from utils.notifications import create_notification
 

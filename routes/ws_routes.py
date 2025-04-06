@@ -45,10 +45,13 @@ async def notifications_ws():
             logging.info(f"🔌 تم قطع اتصال WebSocket لـ telegram_id: {telegram_id}")
 
 def broadcast_unread_count(telegram_id, unread_count):
-    if telegram_id in active_connections:
-        message = json.dumps({"unread_count": unread_count})
-        for ws in active_connections[telegram_id]:
+    if str(telegram_id) in active_connections:  # تأكيد التحويل إلى string
+        message = json.dumps({
+            "type": "unread_update",
+            "data": {"count": unread_count}
+        })
+        for ws in active_connections[str(telegram_id)]:
             try:
                 asyncio.create_task(ws.send(message))
             except Exception as e:
-                logging.error(f"فشل إرسال الرسالة: {e}")
+                logging.error(f"فشل الإرسال لـ {telegram_id}: {e}")
