@@ -220,6 +220,7 @@ async def subscribe():
 
             # تسجيل إشعار تجديد الاشتراك باستخدام create_notification
             extra_notification = {
+                "type": "subscription_renewal",
                 "subscription_history_id": subscription_history_id,
                 "expiry_date": new_expiry.isoformat(),
                 "payment_token": payment_token
@@ -246,14 +247,20 @@ async def subscribe():
             # بث التحديث عبر WebSocket لتحديث العدد وإرسال إشعار فوري للمستخدم
             broadcast_unread_count(str(telegram_id), unread_count)
 
-            # الرد للعميل
-            response_data = {
-                "message": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
-                "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
-                "start_date": start_date_local.strftime('%Y-%m-%d %H:%M:%S UTC+3'),
-                "invite_link": invite_link,
-                "formatted_message": f"تم تفعيل اشتراكك بنجاح! اضغط <a href='{invite_link}' target='_blank'>هنا</a> للانضمام إلى القناة."
-            }
+            notification_message = json.dumps({
+                "type": "subscription_renewal",
+                "data": {
+                    "message": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
+                    "invite_link": invite_link,
+                    "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')
+                }
+            })
+            if str(telegram_id) in active_connections:
+                for ws in active_connections[str(telegram_id)]:
+                    try:
+                        await ws.send(notification_message)
+                    except Exception as e:
+                        logging.error(f"فشل إرسال الإشعار: {e}")
 
             # (يمكن إزالة استخدام Redis هنا إذا لم يعد مطلوباً)
             # await redis_manager.publish_event(
