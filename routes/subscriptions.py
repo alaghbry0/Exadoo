@@ -249,22 +249,26 @@ async def subscribe():
             broadcast_unread_count(str(telegram_id), unread_count)
 
             # تحضير بيانات الإشعار
-            notification_data = {
+            # في قسم إرسال الإشعارات
+            notification_message = json.dumps({
                 "type": "subscription_renewal",
                 "data": {
                     "message": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
                     "invite_link": invite_link,
                     "expiry_date": new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')
                 }
-            }
+            })
 
-            # استخدام وظيفة بث الإشعارات المطورة
-            notification_sent = await broadcast_notification(telegram_id, notification_data)
-            if notification_sent:
-                logging.info(f"✅ تم إرسال إشعار الاشتراك عبر WebSocket بنجاح للمستخدم {telegram_id}")
-            else:
-                logging.warning(
-                    f"⚠️ لم يتم إرسال إشعار الاشتراك عبر WebSocket للمستخدم {telegram_id} - سيتم إخطاره عند الاتصال التالي")
+            # استخدام نسخة من القائمة لتجنب التعديلات أثناء التكرار
+            connections = list(active_connections.get(str(telegram_id), []))
+            for ws in connections:
+                try:
+                    await ws.send(notification_message)
+                    logging.info(f"✅ Notification sent to {telegram_id}")
+                except Exception as e:
+                    logging.error(f"❌ Failed to send notification: {e}")
+                    # إزالة الاتصال الفاشل
+                    active_connections.get(str(telegram_id), []).remove(ws)
             # الرد للعميل (خارج حلقة for!)
             response_data = {
                 "fmessage": f"✅ تم الاشتراك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}",
