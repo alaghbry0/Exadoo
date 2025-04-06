@@ -13,7 +13,7 @@ active_connections = {}
 @ws_bp.websocket('/ws/notifications')
 async def notifications_ws():
     # ✅ استخدم websocket بدلًا من request
-    telegram_id = websocket.request.args.get('telegram_id')
+    telegram_id = websocket.args.get('telegram_id')
     if not telegram_id or not telegram_id.isdigit():
         await websocket.close(code=4000)
         return
