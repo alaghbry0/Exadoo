@@ -10,13 +10,6 @@ from database.db_queries import get_unread_notifications_count
 
 ws_bp = Blueprint('ws_bp', __name__)
 
-
-# دالة للتحقق من صحة telegram_id
-async def validate_telegram_id(telegram_id):
-    # في بيئة الإنتاج يمكن التحقق من API Telegram أو قاعدة البيانات
-    return telegram_id is not None and telegram_id.strip() != '' and telegram_id.isdigit()
-
-
 # قاموس لتخزين الاتصالات المفتوحة حسب telegram_id
 active_connections = {}
 # تخزين آخر نشاط للمستخدم
@@ -24,6 +17,10 @@ last_activity = {}
 # مدة انتهاء الجلسة (بالثواني)
 SESSION_TIMEOUT = 3600  # ساعة واحدة
 
+# دالة للتحقق من صحة telegram_id
+async def validate_telegram_id(telegram_id):
+    # في بيئة الإنتاج يمكن التحقق من API Telegram أو قاعدة البيانات
+    return telegram_id is not None and telegram_id.strip() != '' and telegram_id.isdigit()
 
 # دالة لتنظيف الاتصالات غير النشطة
 async def cleanup_inactive_connections():
@@ -31,11 +28,9 @@ async def cleanup_inactive_connections():
         try:
             current_time = time.time()
             inactive_ids = []
-
             for telegram_id, last_time in list(last_activity.items()):
                 if current_time - last_time > SESSION_TIMEOUT:
                     inactive_ids.append(telegram_id)
-
             for telegram_id in inactive_ids:
                 if telegram_id in active_connections:
                     for ws in active_connections[telegram_id]:
@@ -46,25 +41,19 @@ async def cleanup_inactive_connections():
                     del active_connections[telegram_id]
                 if telegram_id in last_activity:
                     del last_activity[telegram_id]
-
                 logging.info(f"🧹 Cleaned up inactive connection for {telegram_id}")
-
         except Exception as e:
             logging.error(f"❌ Error in cleanup task: {e}")
-
         await asyncio.sleep(300)  # تشغيل كل 5 دقائق
-
 
 # بدء مهمة التنظيف
 cleanup_task = None
-
 
 @ws_bp.before_app_serving
 async def before_serving():
     global cleanup_task
     cleanup_task = asyncio.create_task(cleanup_inactive_connections())
     logging.info("✅ Started WebSocket cleanup task")
-
 
 @ws_bp.after_app_serving
 async def after_serving():
@@ -102,9 +91,10 @@ async def notifications_ws():
         logging.error(f"❌ Error sending confirmation: {e}")
 
     # إرسال عدد الإشعارات غير المقروءة فور الاتصال باستخدام دالة من db_queries.py
-    @copy_current_app_context
     async def send_initial_unread_count():
-        async with current_app.db_pool.acquire() as connection:
+        # التقاط نسخة من التطبيق
+        app = current_app._get_current_object()
+        async with app.db_pool.acquire() as connection:
             unread_count = await get_unread_notifications_count(connection, int(telegram_id))
         await ws.send(json.dumps({
             "type": "unread_update",
@@ -144,7 +134,7 @@ async def notifications_ws():
         # انتظار الرسائل من العميل
         while True:
             try:
-                data = await asyncio.wait_for(websocket.receive(), timeout=120)  # مهلة 120 ثانية
+                data = await asyncio.wait_for(websocket.receive(), timeout=120)
                 # تحديث وقت آخر نشاط عند استلام أي رسالة
                 last_activity[telegram_id] = time.time()
                 try:
@@ -155,7 +145,6 @@ async def notifications_ws():
                 except json.JSONDecodeError:
                     logging.warning(f"Invalid JSON received: {data}")
             except asyncio.TimeoutError:
-                # لا نقوم بإغلاق الاتصال عند انتهاء المهلة، فقط التحقق من النشاط
                 if telegram_id in last_activity and time.time() - last_activity[telegram_id] > SESSION_TIMEOUT:
                     logging.info(f"🔌 Session timeout for {telegram_id}")
                     break
@@ -165,17 +154,14 @@ async def notifications_ws():
             except Exception as e:
                 logging.error(f"❌ Error receiving message from {telegram_id}: {e}")
                 break
-
     except asyncio.CancelledError:
         logging.info(f"WebSocket task cancelled for {telegram_id}")
     except Exception as e:
         logging.error(f"❌ Error in WebSocket connection for {telegram_id}: {e}")
         logging.error(traceback.format_exc())
     finally:
-        # إلغاء مهمة النبض إذا كانت موجودة
         if ping_task:
             ping_task.cancel()
-        # تنظيف الاتصال عند الإغلاق
         if telegram_id in active_connections:
             try:
                 active_connections[telegram_id].remove(ws)
