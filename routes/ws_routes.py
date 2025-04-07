@@ -1,10 +1,12 @@
 # server/ws_routes.py
-from quart import Blueprint, websocket, request, jsonify
+
+from quart import Blueprint, websocket, request, jsonify, current_app
 import asyncio
 import json
 import logging
 import time
 import traceback
+from database.db_queries import get_unread_notifications_count
 
 ws_bp = Blueprint('ws_bp', __name__)
 
@@ -99,39 +101,32 @@ async def notifications_ws():
     except Exception as e:
         logging.error(f"❌ Error sending confirmation: {e}")
 
-    # إرسال عدد الإشعارات غير المقروءة فور الاتصال
-    try:
-        # استعلام عدد الإشعارات غير المقروءة من قاعدة البيانات
-        async with websocket.app.db_pool.acquire() as connection:
-            query = """
-                SELECT COUNT(*) AS unread_count
-                FROM user_notifications
-                WHERE telegram_id = $1 AND read_status = FALSE;
-            """
-            result = await connection.fetchrow(query, int(telegram_id))
-            unread_count = result["unread_count"] if result else 0
-
+    # إرسال عدد الإشعارات غير المقروءة فور الاتصال باستخدام دالة من db_queries.py
+    @copy_current_app_context
+    async def send_initial_unread_count():
+        async with current_app.db_pool.acquire() as connection:
+            unread_count = await get_unread_notifications_count(connection, int(telegram_id))
         await ws.send(json.dumps({
             "type": "unread_update",
             "data": {"count": unread_count}
         }))
+
+    try:
+        await send_initial_unread_count()
     except Exception as e:
         logging.error(f"❌ Error sending initial unread count: {e}")
 
     # إضافة نبض للحفاظ على الاتصال
     ping_task = None
     try:
-        # تعريف وظيفة النبض مع معالجة أخطاء الاتصال
         async def ping_client():
             ping_interval = 30  # إرسال نبض كل 30 ثانية
             missed_pings = 0
             max_missed_pings = 3  # أقصى عدد للنبضات المفقودة
-
             while True:
                 try:
                     # تحديث وقت آخر نشاط عند كل نبض
                     last_activity[telegram_id] = time.time()
-
                     await ws.send(json.dumps({"type": "ping", "timestamp": time.time()}))
                     await asyncio.sleep(ping_interval)
                 except asyncio.CancelledError:
@@ -143,32 +138,27 @@ async def notifications_ws():
                         logging.error(f"❌ Too many missed pings for {telegram_id}, closing connection")
                         break
                     await asyncio.sleep(ping_interval)
-
         # بدء مهمة النبض
         ping_task = asyncio.create_task(ping_client())
 
         # انتظار الرسائل من العميل
         while True:
             try:
-                data = await asyncio.wait_for(websocket.receive(),
-                                              timeout=120)  # إضافة مهلة زمنية لتجنب التوقف إلى أجل غير مسمى
+                data = await asyncio.wait_for(websocket.receive(), timeout=120)  # مهلة 120 ثانية
                 # تحديث وقت آخر نشاط عند استلام أي رسالة
                 last_activity[telegram_id] = time.time()
-
                 try:
                     msg_data = json.loads(data)
                     if msg_data.get("type") == "pong":
                         continue  # تجاهل رسائل الرد على النبض
-                    # معالجة الرسائل الأخرى
+                    # معالجة الرسائل الأخرى هنا إذا لزم الأمر
                 except json.JSONDecodeError:
                     logging.warning(f"Invalid JSON received: {data}")
-
             except asyncio.TimeoutError:
                 # لا نقوم بإغلاق الاتصال عند انتهاء المهلة، فقط التحقق من النشاط
-                if telegram_id in last_activity:
-                    if time.time() - last_activity[telegram_id] > SESSION_TIMEOUT:
-                        logging.info(f"🔌 Session timeout for {telegram_id}")
-                        break
+                if telegram_id in last_activity and time.time() - last_activity[telegram_id] > SESSION_TIMEOUT:
+                    logging.info(f"🔌 Session timeout for {telegram_id}")
+                    break
                 continue
             except asyncio.CancelledError:
                 raise
@@ -185,7 +175,6 @@ async def notifications_ws():
         # إلغاء مهمة النبض إذا كانت موجودة
         if ping_task:
             ping_task.cancel()
-
         # تنظيف الاتصال عند الإغلاق
         if telegram_id in active_connections:
             try:
@@ -196,7 +185,6 @@ async def notifications_ws():
                 pass
         logging.info(f"🔌 WebSocket connection closed for telegram_id: {telegram_id}")
 
-
 # وظيفة خدمية لإرسال رسالة إلى مستخدم معين عبر WebSocket
 async def broadcast_unread_count(telegram_id, unread_count):
     """
@@ -204,20 +192,14 @@ async def broadcast_unread_count(telegram_id, unread_count):
 
     :param telegram_id: معرف التلغرام للمستخدم
     :param unread_count: عدد الإشعارات غير المقروءة
-    :return: None
     """
     telegram_id_str = str(telegram_id)
-
     if telegram_id_str in active_connections:
         message = json.dumps({
             "type": "unread_update",
             "data": {"count": unread_count}
         })
-
-        tasks = []
-        for ws in active_connections[telegram_id_str]:
-            tasks.append(ws.send(message))
-
+        tasks = [ws.send(message) for ws in active_connections[telegram_id_str]]
         if tasks:
             try:
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -226,7 +208,6 @@ async def broadcast_unread_count(telegram_id, unread_count):
                 logging.error(f"❌ Failed to send unread count to {telegram_id}: {e}")
     else:
         logging.info(f"⚠️ No active connections for {telegram_id}")
-
 
 # وظيفة لإرسال إشعار للمستخدم
 async def broadcast_notification(telegram_id, notification_data):

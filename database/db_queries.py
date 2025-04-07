@@ -478,3 +478,19 @@ async def record_incoming_transaction(
         logging.info(f"✅ تم تسجيل المعاملة {txhash}")
     except Exception as e:
         logging.error(f"❌ فشل تسجيل المعاملة {txhash}: {str(e)}")
+
+async def get_unread_notifications_count(connection, telegram_id: int) -> int:
+    """
+    إرجاع عدد الإشعارات غير المقروءة للمستخدم.
+    """
+    try:
+        query = """
+            SELECT COUNT(*) AS unread_count
+            FROM user_notifications
+            WHERE telegram_id = $1 AND read_status = FALSE;
+        """
+        result = await connection.fetchrow(query, telegram_id)
+        return result["unread_count"] if result else 0
+    except Exception as e:
+        logging.error(f"Error fetching unread notifications for {telegram_id}: {e}")
+        return 0
