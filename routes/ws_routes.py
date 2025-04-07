@@ -102,7 +102,7 @@ async def notifications_ws():
     # إرسال عدد الإشعارات غير المقروءة فور الاتصال
     try:
         # استعلام عدد الإشعارات غير المقروءة من قاعدة البيانات
-        async with current_app.db_pool.acquire() as connection:
+        async with websocket.app.db_pool.acquire() as connection:
             query = """
                 SELECT COUNT(*) AS unread_count
                 FROM user_notifications
