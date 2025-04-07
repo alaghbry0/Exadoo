@@ -5,7 +5,7 @@ import sys
 
 
 async def connect_and_listen(telegram_id):
-    uri = f"ws://localhost:5000/ws/{telegram_id}"
+    uri = f"wss://exadoo-rxr9.onrender.com/ws/notifications/{telegram_id}"
 
     try:
         async with websockets.connect(uri) as websocket:
