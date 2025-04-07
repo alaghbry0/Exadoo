@@ -3,17 +3,73 @@ from quart import Blueprint, websocket, request, jsonify
 import asyncio
 import json
 import logging
+
+import time
 import traceback
 
 ws_bp = Blueprint('ws_bp', __name__)
 
-# قاموس لتخزين الاتصالات المفتوحة حسب telegram_id
-active_connections = {}
 
 # دالة للتحقق من صحة telegram_id
 async def validate_telegram_id(telegram_id):
     # في بيئة الإنتاج يمكن التحقق من API Telegram أو قاعدة البيانات
     return telegram_id is not None and telegram_id.strip() != '' and telegram_id.isdigit()
+
+
+# قاموس لتخزين الاتصالات المفتوحة حسب telegram_id
+active_connections = {}
+# تخزين آخر نشاط للمستخدم
+last_activity = {}
+# مدة انتهاء الجلسة (بالثواني)
+SESSION_TIMEOUT = 3600  # ساعة واحدة
+
+
+# دالة لتنظيف الاتصالات غير النشطة
+async def cleanup_inactive_connections():
+    while True:
+        try:
+            current_time = time.time()
+            inactive_ids = []
+
+            for telegram_id, last_time in list(last_activity.items()):
+                if current_time - last_time > SESSION_TIMEOUT:
+                    inactive_ids.append(telegram_id)
+
+            for telegram_id in inactive_ids:
+                if telegram_id in active_connections:
+                    for ws in active_connections[telegram_id]:
+                        try:
+                            await ws.close(1000, "Session timeout")
+                        except Exception:
+                            pass
+                    del active_connections[telegram_id]
+                if telegram_id in last_activity:
+                    del last_activity[telegram_id]
+
+                logging.info(f"🧹 Cleaned up inactive connection for {telegram_id}")
+
+        except Exception as e:
+            logging.error(f"❌ Error in cleanup task: {e}")
+
+        await asyncio.sleep(300)  # تشغيل كل 5 دقائق
+
+
+# بدء مهمة التنظيف
+cleanup_task = None
+
+
+@ws_bp.before_app_serving
+async def before_serving():
+    global cleanup_task
+    cleanup_task = asyncio.create_task(cleanup_inactive_connections())
+    logging.info("✅ Started WebSocket cleanup task")
+
+
+@ws_bp.after_app_serving
+async def after_serving():
+    if cleanup_task:
+        cleanup_task.cancel()
+    logging.info("🛑 Stopped WebSocket cleanup task")
 
 
 @ws_bp.websocket('/ws/notifications')
@@ -25,6 +81,9 @@ async def notifications_ws():
         return
 
     ws = websocket._get_current_object()
+
+    # تحديث وقت آخر نشاط
+    last_activity[telegram_id] = time.time()
 
     # إضافة الاتصال للقائمة
     if telegram_id not in active_connections:
@@ -63,32 +122,61 @@ async def notifications_ws():
     # إضافة نبض للحفاظ على الاتصال
     ping_task = None
     try:
-        # تعريف وظيفة النبض
+        # تعريف وظيفة النبض مع معالجة أخطاء الاتصال
         async def ping_client():
+            ping_interval = 30  # إرسال نبض كل 30 ثانية
+            missed_pings = 0
+            max_missed_pings = 3  # أقصى عدد للنبضات المفقودة
+
             while True:
-                await asyncio.sleep(30)  # إرسال نبض كل 30 ثانية
                 try:
-                    await ws.send(json.dumps({"type": "ping"}))
-                except Exception:
-                    break
+                    # تحديث وقت آخر نشاط عند كل نبض
+                    last_activity[telegram_id] = time.time()
+
+                    await ws.send(json.dumps({"type": "ping", "timestamp": time.time()}))
+                    await asyncio.sleep(ping_interval)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logging.warning(f"⚠️ Ping failed for {telegram_id}: {e}")
+                    missed_pings += 1
+                    if missed_pings >= max_missed_pings:
+                        logging.error(f"❌ Too many missed pings for {telegram_id}, closing connection")
+                        break
+                    await asyncio.sleep(ping_interval)
 
         # بدء مهمة النبض
         ping_task = asyncio.create_task(ping_client())
 
         # انتظار الرسائل من العميل
         while True:
-            data = await websocket.receive()
-            logging.info(f"🔄 Received data from {telegram_id}: {data}")
-
             try:
-                msg_data = json.loads(data)
-                if msg_data.get("type") == "pong":
-                    continue  # تجاهل رسائل الرد على النبض
-                # معالجة الرسائل الأخرى
-            except json.JSONDecodeError:
-                logging.warning(f"Invalid JSON received: {data}")
+                data = await asyncio.wait_for(websocket.receive(),
+                                              timeout=120)  # إضافة مهلة زمنية لتجنب التوقف إلى أجل غير مسمى
+                # تحديث وقت آخر نشاط عند استلام أي رسالة
+                last_activity[telegram_id] = time.time()
 
-            await asyncio.sleep(0.1)
+                try:
+                    msg_data = json.loads(data)
+                    if msg_data.get("type") == "pong":
+                        continue  # تجاهل رسائل الرد على النبض
+                    # معالجة الرسائل الأخرى
+                except json.JSONDecodeError:
+                    logging.warning(f"Invalid JSON received: {data}")
+
+            except asyncio.TimeoutError:
+                # لا نقوم بإغلاق الاتصال عند انتهاء المهلة، فقط التحقق من النشاط
+                if telegram_id in last_activity:
+                    if time.time() - last_activity[telegram_id] > SESSION_TIMEOUT:
+                        logging.info(f"🔌 Session timeout for {telegram_id}")
+                        break
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logging.error(f"❌ Error receiving message from {telegram_id}: {e}")
+                break
+
     except asyncio.CancelledError:
         logging.info(f"WebSocket task cancelled for {telegram_id}")
     except Exception as e:
