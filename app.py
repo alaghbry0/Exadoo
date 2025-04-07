@@ -158,5 +158,6 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     config = hypercorn.Config()
     config.bind = [f"0.0.0.0:{port}"]
+    config.worker_class = 'asyncio'
     config.startup_timeout = 60.0  # Increase startup timeout
     asyncio.run(hypercorn.asyncio.serve(app, config))
