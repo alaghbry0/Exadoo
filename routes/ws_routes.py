@@ -3,7 +3,6 @@ from quart import Blueprint, websocket, request, jsonify
 import asyncio
 import json
 import logging
-
 import time
 import traceback
 
