@@ -14,7 +14,7 @@ from server.redis_manager import redis_manager
 from asyncpg.exceptions import UniqueViolationError
 from config import DATABASE_CONFIG
 from datetime import datetime
-from routes.ws_routes import  active_connections, broadcast_notification
+from routes.ws_routes import  broadcast_notification
 
 # نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
 from utils.notifications import create_notification

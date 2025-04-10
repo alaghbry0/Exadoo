@@ -9,6 +9,7 @@ from database.db_queries import (
 )
 from utils.db_utils import add_user_to_channel
 
+
 # نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
 from utils.notifications import create_notification
 
@@ -245,7 +246,9 @@ async def subscribe():
                 is_public=False,
                 telegram_ids=[telegram_id]
             )
+            
 
+            
             # The create_notification function will automatically handle:
             # 1. Saving to the database
             # 2. Broadcasting to WebSocket
