@@ -14,6 +14,10 @@ from server.redis_manager import redis_manager
 from asyncpg.exceptions import UniqueViolationError
 from config import DATABASE_CONFIG
 from datetime import datetime
+from routes.ws_routes import  active_connections, broadcast_notification
+
+# نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
+from utils.notifications import create_notification
 
 
 # تحميل المتغيرات البيئية
@@ -210,7 +214,6 @@ async def parse_transactions(provider: LiteBalancer):
                     payment_token=payment_token_from_payload
                 )
 
-
             # المطابقة مع سجل الدفع المعلق والتحقق من الدفع وحساب الفروق
             async with current_app.db_pool.acquire() as conn:
                 logging.info(f"🔍 البحث عن دفعة معلقة باستخدام payment_token: {payment_token_from_payload}")
@@ -221,6 +224,7 @@ async def parse_transactions(provider: LiteBalancer):
 
                 db_payment_token = pending_payment['payment_token'].strip()
                 db_amount = float(pending_payment.get('amount', 0))
+                telegram_id = int(pending_payment['telegram_id'])
                 logging.info(f"🔍 الدفعة المعلقة الموجودة: payment_token: '{db_payment_token}', amount: {db_amount}")
                 if db_payment_token != payment_token_from_payload:
                     logging.warning(f"⚠️ عدم تطابق payment_token: DB '{db_payment_token}' vs payload '{payment_token_from_payload}' - تجاهل tx_hash: {tx_hash_hex}")
@@ -238,19 +242,67 @@ async def parse_transactions(provider: LiteBalancer):
                 acceptable_tolerance = Decimal('0.30')  # الفارق المسموح فيه للتجديد مع إشعار
                 silent_tolerance = Decimal('0.15')       # الفارق الذي لا يتم إرسال إشعار فيه
 
+                # متغيرات لإشعارات قاعدة البيانات
+                notification_type = None
+                notification_title = None
+                notification_message = None
+                extra_data = {}
+                
+                # متغيرات للإشعارات الفورية عبر WebSocket
+                ws_notification_type = None
+                ws_notification_data = {}
+
                 if difference < 0:
-                    # دفعة زائدة: إرسال إشعار مناسب مع رسالة تحذيرية
-                    await redis_manager.publish_event(
-                        f"payment_{pending_payment['payment_token']}",
-                        {
-                            'status': 'warning',
-                            'message': 'لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك حالاً.'
-                        }
+                    # دفعة زائدة: إنشاء إشعار مناسب مع رسالة تحذيرية
+                    notification_type = "payment_success"
+                    notification_title = "دفعة زائدة"
+                    notification_message = "لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك حالاً."
+                    extra_data = {
+                        "type": "payment_success",
+                        "payment_id": tx_hash_hex,
+                        "amount": str(jetton_amount),
+                        "expected_amount": str(expected_subscription_price),
+                        "difference": str(abs(difference))
+                    }
+                    
+                    # إعداد إشعار WebSocket
+                    ws_notification_type = "info"
+                    ws_notification_data = {
+                        "message": "لقد قمت بإرسال دفعة زائدة. يرجى التواصل مع الدعم لاسترداد الفرق. سيتم تجديد اشتراكك حالاً.",
+                        "invite_link": "https://t.me/ExaadoSupport"
+                    }
+                    
+                    # تحديث حالة الدفع إلى مكتملة
+                    updated_payment_data = await update_payment_with_txhash(
+                        conn,
+                        pending_payment['payment_token'],
+                        tx_hash_hex,
+                        Decimal(str(jetton_amount)),
+                        status="completed"
                     )
-                    await asyncio.sleep(3)
+                    
                 elif difference > acceptable_tolerance:
-                    # دفعة ناقصة خارج الفارق المسموح: تحديث سجل الدفع إلى failed مع تسجيل سبب الفشل
-                    error_message = "دفعة ناقصة "
+                    # دفعة ناقصة خارج الفارق المسموح: تحديث سجل الدفع إلى فاشل مع تسجيل سبب الفشل
+                    error_message = "دفعة ناقصة تجاوزت الحد المسموح به"
+                    notification_type = "payment_failed"
+                    notification_title = "فشل عملية الدفع"
+                    notification_message = "فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم."
+                    extra_data = {
+                        "type": "payment_failed",
+                        "payment_id": tx_hash_hex,
+                        "amount": str(jetton_amount),
+                        "expected_amount": str(expected_subscription_price),
+                        "difference": str(difference)
+                    }
+                    
+                    # إعداد إشعار WebSocket
+                    ws_notification_type = "failed"
+                    ws_notification_data = {
+                        "message": "فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.",
+                        "invite_link": "https://t.me/ExaadoSupport"
+                    }
+                    
+                    # تحديث حالة الدفع إلى فاشلة
                     updated_payment_data = await update_payment_with_txhash(
                         conn,
                         pending_payment['payment_token'],
@@ -259,50 +311,125 @@ async def parse_transactions(provider: LiteBalancer):
                         status="failed",
                         error_message=error_message
                     )
-                    await redis_manager.publish_event(
-                        f"payment_{pending_payment['payment_token']}",
-                        {
-                            'status': 'failed',
-                            'message': 'فشل تجديد الاشتراك لأن الدفعة التي أرسلتها أقل من المبلغ المطلوب، الرجاء التواصل مع الدعم.'
-                        }
-                    )
+                    
+                    # تخطي استدعاء API الاشتراك لأن الدفعة فاشلة
+                    logging.info(f"⚠️ تخطي تجديد الاشتراك بسبب دفعة ناقصة: {difference}")
+                    
+                    # إرسال الإشعارات وتخطي باقي المعالجة
+                    if notification_type:
+                        await create_notification(
+                            connection=conn,
+                            notification_type=notification_type,
+                            title=notification_title,
+                            message=notification_message,
+                            extra_data=extra_data,
+                            is_public=False,
+                            telegram_ids=[telegram_id]
+                        )
+                    
+                    if ws_notification_type:
+                        # إرسال إشعار فوري عبر WebSocket
+                        notification_sent = await broadcast_notification(
+                            telegram_id=telegram_id,
+                            notification_data=ws_notification_data,
+                            notification_type=ws_notification_type
+                        )
+                        if notification_sent:
+                            logging.info(f"✅ تم إرسال إشعار الدفع الفاشل مباشرة إلى {telegram_id}")
+                        else:
+                            logging.warning(f"⚠️ لم يتم إرسال إشعار الدفع الفاشل مباشرة إلى {telegram_id}")
+                    
                     continue
-                elif difference <= silent_tolerance:
-                    # دفعة ناقصة ضمن النطاق الصامت (<= 0.15): تجديد الاشتراك دون إرسال أي إشعار
-                    logging.info("✅ دفعة ضمن النطاق الصامت (<= 0.15): تجديد الاشتراك دون إشعار.")
-                    # لا نقوم بنشر أي حدث عبر redis_manager هنا
-                else:
-                    # الفرق بين 0.15 و0.30: تجديد الاشتراك مع نشر التحديث
-                    await redis_manager.publish_event(
-                        f"payment_{pending_payment['payment_token']}",
-                        {
-                            'status': 'warning',
-                            'message': 'المبلغ المدفوع أقل من المطلوب، سنقوم بتجديد اشتراكك هذه المرة فقط.'
-                        }
+                
+                elif silent_tolerance < difference <= acceptable_tolerance:
+                    # الفرق بين 0.15 و0.30: تجديد الاشتراك مع إشعار
+                    notification_type = "payment_success"
+                    notification_title = "دفعة ناقصة ضمن الحد المسموح"
+                    notification_message = "المبلغ المدفوع أقل من المطلوب، سنقوم بتجديد اشتراكك هذه المرة فقط."
+                    extra_data = {
+                        "type": "payment_success",
+                        "payment_id": tx_hash_hex,
+                        "amount": str(jetton_amount),
+                        "expected_amount": str(expected_subscription_price),
+                        "difference": str(difference)
+                    }
+                    
+                    # إعداد إشعار WebSocket
+                    ws_notification_type = "warning"
+                    ws_notification_data = {
+                        "message": "المبلغ المدفوع أقل من المطلوب، سنقوم بتجديد اشتراكك هذه المرة فقط."
+                    }
+                    
+                    # تحديث حالة الدفع إلى مكتملة
+                    updated_payment_data = await update_payment_with_txhash(
+                        conn,
+                        pending_payment['payment_token'],
+                        tx_hash_hex,
+                        Decimal(str(jetton_amount)),
+                        status="completed"
                     )
+                    
+                else:
+                    # دفعة ناقصة ضمن النطاق الصامت (<= 0.15) أو دفعة مناسبة: تجديد الاشتراك دون إشعار فوري
+                    notification_type = "payment_success"
+                    notification_title = "تمت عملية الدفع بنجاح"
+                    notification_message = "تمت عملية الدفع بنجاح"
+                    extra_data = {
+                        "type": "payment_success",
+                        "payment_id": tx_hash_hex,
+                        "amount": str(jetton_amount),
+                        "expected_amount": str(expected_subscription_price)
+                    }
+                    
+                    # لا نقوم بإرسال إشعار فوري عبر WebSocket
+                    ws_notification_type = None
+                    
+                    # تحديث حالة الدفع إلى مكتملة
+                    updated_payment_data = await update_payment_with_txhash(
+                        conn,
+                        pending_payment['payment_token'],
+                        tx_hash_hex,
+                        Decimal(str(jetton_amount)),
+                        status="completed"
+                    )
+                
+                # إنشاء الإشعار في قاعدة البيانات
+                if notification_type:
+                    await create_notification(
+                        connection=conn,
+                        notification_type=notification_type,
+                        title=notification_title,
+                        message=notification_message,
+                        extra_data=extra_data,
+                        is_public=False,
+                        telegram_ids=[telegram_id]
+                    )
+                
+                # إرسال إشعار فوري عبر WebSocket إذا كان مطلوبًا
+                if ws_notification_type:
+                    # إرسال الإشعار الفوري
+                    notification_sent = await broadcast_notification(
+                        telegram_id=telegram_id,
+                        notification_data=ws_notification_data,
+                        notification_type=ws_notification_type
+                    )
+                    if notification_sent:
+                        logging.info(f"✅ تم إرسال إشعار الدفع مباشرة إلى {telegram_id}")
+                    else:
+                        logging.warning(f"⚠️ لم يتم إرسال إشعار الدفع مباشرة إلى {telegram_id}")
 
-                logging.info(f"✅ تطابق بيانات الدفع. متابعة التحديث لـ payment_token: {pending_payment['payment_token']}")
-                tx_hash = tx_hash_hex
-                amount_received = Decimal(str(jetton_amount))
-                updated_payment_data = await update_payment_with_txhash(
-                    conn,
-                    pending_payment['payment_token'],
-                    tx_hash,
-                    amount_received,
-                    status="completed"  # تحديد الحالة المناسبة هنا
-                )
-                if updated_payment_data:
-                    logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_token: {pending_payment['payment_token']}، tx_hash: {tx_hash}")
+                # استدعاء API تجديد الاشتراك فقط للدفعات المكتملة
+                if updated_payment_data and updated_payment_data.get('status') == 'completed':
+                    logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل' لـ payment_token: {pending_payment['payment_token']}، tx_hash: {tx_hash_hex}")
                     async with aiohttp.ClientSession() as session:
                         headers = {
                             "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
                             "Content-Type": "application/json"
                         }
                         subscription_payload = {
-                            "telegram_id": int(pending_payment['telegram_id']),
+                            "telegram_id": telegram_id,
                             "subscription_plan_id": pending_payment['subscription_plan_id'],
-                            "payment_id": tx_hash,
-
+                            "payment_id": tx_hash_hex,
                             "payment_token": pending_payment['payment_token'],
                             "username": str(pending_payment['username']),
                             "full_name": str(pending_payment['full_name']),
@@ -313,6 +440,8 @@ async def parse_transactions(provider: LiteBalancer):
                                 if response.status == 200:
                                     subscribe_data = await response.json()
                                     logging.info(f"✅ تم استدعاء /api/subscribe بنجاح! الاستجابة: {subscribe_data}")
+                                    
+                                
                                 else:
                                     error_details = await response.text()
                                     logging.error(f"❌ فشل استدعاء /api/subscribe! الحالة: {response.status}, التفاصيل: {error_details}")
@@ -320,7 +449,7 @@ async def parse_transactions(provider: LiteBalancer):
                             logging.error(f"❌ استثناء أثناء استدعاء /api/subscribe: {str(e)}")
                 else:
                     logging.error(f"❌ فشل تحديث حالة الدفع في قاعدة البيانات لـ tx_hash: {pending_payment.get('tx_hash', 'N/A')}")
-            logging.info(f"📝 Transaction processed: tx_hash: {tx_hash_hex}, lt: {transaction.lt}")
+            logging.info(f"📝 تم معالجة المعاملة: tx_hash: {tx_hash_hex}, lt: {transaction.lt}")
 
     except Exception as e:
         logging.error(f"❌ خطأ أثناء معالجة المعاملات الدورية: {str(e)}", exc_info=True)

@@ -10,19 +10,19 @@ from database.db_queries import get_unread_notifications_count
 
 ws_bp = Blueprint('ws_bp', __name__)
 
-# قاموس لتخزين الاتصالات المفتوحة حسب telegram_id
+# Store active connections by telegram_id
 active_connections = {}
-# تخزين آخر نشاط للمستخدم
+# Store last activity timestamp
 last_activity = {}
-# مدة انتهاء الجلسة (بالثواني)
-SESSION_TIMEOUT = 3600  # ساعة واحدة
+# Session timeout in seconds
+SESSION_TIMEOUT = 3600  # 1 hour
 
-# دالة للتحقق من صحة telegram_id
+# Function to validate telegram_id
 async def validate_telegram_id(telegram_id):
-    # في بيئة الإنتاج يمكن التحقق من API Telegram أو قاعدة البيانات
+    # In production, you might validate against Telegram API or database
     return telegram_id is not None and telegram_id.strip() != '' and telegram_id.isdigit()
 
-# دالة لتنظيف الاتصالات غير النشطة
+# Task to clean up inactive connections
 async def cleanup_inactive_connections():
     while True:
         try:
@@ -44,9 +44,9 @@ async def cleanup_inactive_connections():
                 logging.info(f"🧹 Cleaned up inactive connection for {telegram_id}")
         except Exception as e:
             logging.error(f"❌ Error in cleanup task: {e}")
-        await asyncio.sleep(300)  # تشغيل كل 5 دقائق
+        await asyncio.sleep(300)  # Run every 5 minutes
 
-# بدء مهمة التنظيف
+# Start cleanup task
 cleanup_task = None
 
 @ws_bp.before_app_serving
@@ -61,8 +61,35 @@ async def after_serving():
         cleanup_task.cancel()
     logging.info("🛑 Stopped WebSocket cleanup task")
 
+# Mark all notifications as read for a user
+async def mark_all_notifications_read(telegram_id):
+    """
+    Mark all notifications as read for a specific user
 
-@ws_bp.websocket('/ws/notifications')
+    :param telegram_id: Telegram ID of the user
+    :return: Number of updated notifications
+    """
+    app = current_app._get_current_object()
+    async with app.db_pool.acquire() as connection:
+        update_query = """
+            UPDATE user_notifications
+            SET read_status = TRUE
+            WHERE telegram_id = $1 AND read_status = FALSE
+            RETURNING notification_id
+        """
+        updated_rows = await connection.fetch(update_query, int(telegram_id))
+        updated_count = len(updated_rows)
+        
+        # Get updated unread count
+        unread_count = await get_unread_notifications_count(connection, int(telegram_id))
+        
+        # Broadcast updated count to all active connections
+        await broadcast_unread_count(telegram_id, unread_count)
+        
+        logging.info(f"✅ Marked {updated_count} notifications as read for {telegram_id}")
+        return updated_count
+
+@ws_bp.websocket('/ws')
 async def notifications_ws():
     telegram_id = websocket.args.get('telegram_id')
     if not await validate_telegram_id(telegram_id):
@@ -72,16 +99,16 @@ async def notifications_ws():
 
     ws = websocket._get_current_object()
 
-    # تحديث وقت آخر نشاط
+    # Update last activity time
     last_activity[telegram_id] = time.time()
 
-    # إضافة الاتصال للقائمة
+    # Add connection to list
     if telegram_id not in active_connections:
         active_connections[telegram_id] = []
     active_connections[telegram_id].append(ws)
     logging.info(f"✅ WebSocket connection established for telegram_id: {telegram_id}")
 
-    # إرسال رسالة تأكيد الاتصال
+    # Send confirmation message
     try:
         await ws.send(json.dumps({
             "type": "connection_established",
@@ -90,9 +117,8 @@ async def notifications_ws():
     except Exception as e:
         logging.error(f"❌ Error sending confirmation: {e}")
 
-    # إرسال عدد الإشعارات غير المقروءة فور الاتصال باستخدام دالة من db_queries.py
+    # Send initial unread count
     async def send_initial_unread_count():
-        # التقاط نسخة من التطبيق
         app = current_app._get_current_object()
         async with app.db_pool.acquire() as connection:
             unread_count = await get_unread_notifications_count(connection, int(telegram_id))
@@ -106,16 +132,16 @@ async def notifications_ws():
     except Exception as e:
         logging.error(f"❌ Error sending initial unread count: {e}")
 
-    # إضافة نبض للحفاظ على الاتصال
+    # Add heartbeat to keep connection alive
     ping_task = None
     try:
         async def ping_client():
-            ping_interval = 30  # إرسال نبض كل 30 ثانية
+            ping_interval = 30  # Send ping every 30 seconds
             missed_pings = 0
-            max_missed_pings = 3  # أقصى عدد للنبضات المفقودة
+            max_missed_pings = 3  # Maximum number of missed pings
             while True:
                 try:
-                    # تحديث وقت آخر نشاط عند كل نبض
+                    # Update last activity time with each ping
                     last_activity[telegram_id] = time.time()
                     await ws.send(json.dumps({"type": "ping", "timestamp": time.time()}))
                     await asyncio.sleep(ping_interval)
@@ -128,20 +154,31 @@ async def notifications_ws():
                         logging.error(f"❌ Too many missed pings for {telegram_id}, closing connection")
                         break
                     await asyncio.sleep(ping_interval)
-        # بدء مهمة النبض
+        # Start ping task
         ping_task = asyncio.create_task(ping_client())
 
-        # انتظار الرسائل من العميل
+        # Wait for messages from client
         while True:
             try:
                 data = await asyncio.wait_for(websocket.receive(), timeout=120)
-                # تحديث وقت آخر نشاط عند استلام أي رسالة
+                # Update last activity time when receiving any message
                 last_activity[telegram_id] = time.time()
                 try:
                     msg_data = json.loads(data)
                     if msg_data.get("type") == "pong":
-                        continue  # تجاهل رسائل الرد على النبض
-                    # معالجة الرسائل الأخرى هنا إذا لزم الأمر
+                        continue  # Ignore ping response messages
+                    
+                    # Handle mark_as_read messages
+                    if msg_data.get("type") == "mark_as_read":
+                        # Mark all notifications as read for this user
+                        updated_count = await mark_all_notifications_read(telegram_id)
+                        # Confirm to client
+                        await ws.send(json.dumps({
+                            "type": "notifications_marked_read",
+                            "data": {"count": updated_count}
+                        }))
+                    
+                    # Handle other message types here
                 except json.JSONDecodeError:
                     logging.warning(f"Invalid JSON received: {data}")
             except asyncio.TimeoutError:
@@ -171,13 +208,13 @@ async def notifications_ws():
                 pass
         logging.info(f"🔌 WebSocket connection closed for telegram_id: {telegram_id}")
 
-# وظيفة خدمية لإرسال رسالة إلى مستخدم معين عبر WebSocket
+# Utility function to send a message to a specific user via WebSocket
 async def broadcast_unread_count(telegram_id, unread_count):
     """
-    إرسال تحديث لعدد الإشعارات غير المقروءة للمستخدم
+    Send an update of unread notifications count to the user
 
-    :param telegram_id: معرف التلغرام للمستخدم
-    :param unread_count: عدد الإشعارات غير المقروءة
+    :param telegram_id: Telegram ID of the user
+    :param unread_count: Number of unread notifications
     """
     telegram_id_str = str(telegram_id)
     if telegram_id_str in active_connections:
@@ -195,25 +232,26 @@ async def broadcast_unread_count(telegram_id, unread_count):
     else:
         logging.info(f"⚠️ No active connections for {telegram_id}")
 
-# وظيفة لإرسال إشعار للمستخدم
-async def broadcast_notification(telegram_id, notification_data):
+# Function to send notification to a user
+async def broadcast_notification(telegram_id, notification_data, notification_type):
     """
-    إرسال إشعار للمستخدم عبر WebSocket
+    Send a notification to the user via WebSocket
 
-    :param telegram_id: معرف التلغرام للمستخدم
-    :param notification_data: بيانات الإشعار (قاموس)
-    :return: bool - نجاح الإرسال
+    :param telegram_id: Telegram ID of the user
+    :param notification_data: Notification data (dictionary)
+    :param notification_type: Type of notification
+    :return: bool - success of sending
     """
     sent_successfully = False
     telegram_id_str = str(telegram_id)
 
     if telegram_id_str in active_connections:
         message = json.dumps({
-            "type": "notification",
+            "type": notification_type,
             "data": notification_data
         })
 
-        # استخدام asyncio.gather للإرسال المتوازي لجميع الاتصالات
+        # Use asyncio.gather for parallel sending to all connections
         tasks = []
         for ws in active_connections[telegram_id_str]:
             tasks.append(ws.send(message))
@@ -229,3 +267,29 @@ async def broadcast_notification(telegram_id, notification_data):
         logging.info(f"⚠️ No active connections for {telegram_id}")
 
     return sent_successfully
+
+# New function to broadcast new notification to a user
+async def broadcast_new_notification(telegram_id, notification):
+    """
+    Send a new notification to the user via WebSocket
+
+    :param telegram_id: Telegram ID of the user
+    :param notification: Notification object
+    :return: bool - success of sending
+    """
+    app = current_app._get_current_object()
+    async with app.db_pool.acquire() as connection:
+        # Get updated unread count
+        unread_count = await get_unread_notifications_count(connection, int(telegram_id))
+        
+        # First update the unread count
+        await broadcast_unread_count(telegram_id, unread_count)
+        
+        # Then send the notification itself
+        return await broadcast_notification(
+            telegram_id, 
+            notification, 
+            'new_notification'
+        )
+    
+

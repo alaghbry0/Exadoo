@@ -45,7 +45,8 @@ app = cors(app, allow_origin="*")
 
 # تسجيل Blueprints
 app.register_blueprint(sse_bp, url_prefix='/api')
-app.register_blueprint(notifications_bp)
+# عند تسجيل الـ Blueprint في التطبيق الرئيسي
+app.register_blueprint(notifications_bp, url_prefix="/api")
 app.register_blueprint(public_routes)
 app.register_blueprint(admin_routes)
 app.register_blueprint(auth_routes)
