@@ -10,7 +10,7 @@ from database.db_queries import record_payment, update_payment_with_txhash, fetc
 from pytoniq import LiteBalancer, begin_cell, Address
 from pytoniq.liteclient.client import LiteServerError
 from typing import Optional  # لإضافة تلميحات النوع
-from server.redis_manager import redis_manager
+
 from asyncpg.exceptions import UniqueViolationError
 from config import DATABASE_CONFIG
 from datetime import datetime
@@ -493,7 +493,7 @@ async def startup():
             logging.error(f"""
             ❌ فشل حرج بعد {timeout} ثانية:
             - db_pool موجود؟ {hasattr(current_app, 'db_pool')}
-            - حالة Redis: {await redis_manager.is_connected()}
+            
             """)
             raise RuntimeError("فشل التهيئة")
 

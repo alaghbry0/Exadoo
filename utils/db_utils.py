@@ -4,6 +4,7 @@ from aiogram.exceptions import TelegramAPIError
 from database.db_queries import add_user, get_user, add_scheduled_task, update_subscription
 from config import TELEGRAM_BOT_TOKEN
 import asyncio
+import time
 
 # تهيئة بوت تيليجرام
 telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -13,10 +14,10 @@ telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_pool):
     """
-    إضافة المستخدم إلى القناة أو توليد رابط دعوة إذا لم يكن موجودًا.
-    تُعيد الدالة قاموسًا يحتوي على:
+    إضافة المستخدم إلى القناة أو توليد رابط دعوة للمستخدم.
+    يُعيد الدالة قاموسًا يحتوي على:
       - success: حالة العملية (True/False)
-      - already_joined: إذا كان المستخدم موجود مسبقاً في القناة
+      - already_joined: (سيكون دائمًا False بعد إزالة الفحص)
       - invite_link: رابط الدعوة (إن تم توليده)
       - message: رسالة توضيحية
     """
@@ -33,26 +34,21 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
         channel_id = int(subscription_type['channel_id'])
         channel_name = subscription_type['name']
 
-        try:
-            member = await telegram_bot.get_chat_member(chat_id=channel_id, user_id=telegram_id)
-            if member.status in ['member', 'administrator', 'creator']:
-                logging.info(f"✅ المستخدم {telegram_id} موجود بالفعل في القناة {channel_id}.")
-                return {
-                    "success": True,
-                    "already_joined": True,
-                    "invite_link": None,
-                    "message": f"تم تجديد اشتراكك في قناة {channel_name} بنجاح!"
-                }
-        except TelegramAPIError:
-            logging.warning(f"⚠️ المستخدم {telegram_id} غير موجود في القناة {channel_id}.")
-
+        # إزالة الحظر إن وجد للتأكد من إمكانية الانضمام
         try:
             await telegram_bot.unban_chat_member(chat_id=channel_id, user_id=telegram_id)
         except TelegramAPIError:
             logging.warning(f"⚠️ لم يتمكن من إزالة الحظر عن المستخدم {telegram_id}.")
 
+        # حساب وقت انتهاء صلاحية رابط الدعوة: شهر كامل (30 يوم) من الآن
+        expire_date = int(time.time()) + (30 * 24 * 60 * 60)
+
+        # إنشاء رابط دعوة للمستخدم مع صلاحية محددة الزمن
         invite_link_obj = await telegram_bot.create_chat_invite_link(
-            chat_id=channel_id, member_limit=1
+            chat_id=channel_id,
+            creates_join_request=True,  # خيار يتطلب موافقة المسؤول عند الانضمام
+            name=f"اشتراك مستخدم {telegram_id}",  # اسم وصفي للرابط
+            expire_date=expire_date        # انتهاء الصلاحية بعد شهر
         )
         invite_link = invite_link_obj.invite_link
         logging.info(f"✅ تم إنشاء رابط الدعوة للمستخدم {telegram_id}: {invite_link}")
@@ -64,12 +60,11 @@ async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_po
             invite_link = str(invite_link)
         logging.info(f"Type of invite_link: {type(invite_link)} - Value: {invite_link}")
 
-        # لن نقوم بتحديث قاعدة البيانات لتخزين invite_link
         return {
             "success": True,
             "already_joined": False,
             "invite_link": invite_link,
-            "message": f"تم تفعيل اشتراكك بنجاح! يمكنك الانضمام إلى قناة {channel_name} عبر الرابط المقدم."
+            "message": f"تم تفعيل اشتراكك بنجاح! يمكنك الانضمام إلى قناة {channel_name} عبر الرابط المقدم. سيتم قبول طلب انضمامك من قبل مشرفي القناة."
         }
 
     except TelegramAPIError as e:

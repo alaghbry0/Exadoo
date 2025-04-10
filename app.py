@@ -23,8 +23,8 @@ from telegram_bot import start_bot, bot, telegram_bot_bp
 from chatbot.chatbot import chatbot_bp
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
-from server.sse_routes import sse_bp
-from server.redis_manager import redis_manager
+
+
 
 
 
@@ -44,7 +44,7 @@ app.bot_running = False  # Bot running state
 app = cors(app, allow_origin="*")
 
 # تسجيل Blueprints
-app.register_blueprint(sse_bp, url_prefix='/api')
+
 # عند تسجيل الـ Blueprint في التطبيق الرئيسي
 app.register_blueprint(notifications_bp, url_prefix="/api")
 app.register_blueprint(public_routes)
@@ -78,11 +78,7 @@ async def add_security_headers(response):
 async def initialize_app():
     """Initialize application connections"""
     try:
-        logging.info(f"🔄 محاولة الاتصال بـ {DATABASE_CONFIG['host']}:{DATABASE_CONFIG['port']}")
-        # Initialize Redis
-        logging.info("🔄 Connecting to Redis...")
-        await redis_manager.connect()
-        logging.info("✅ Redis connection established")
+        
 
 
         # Initialize PostgreSQL connection pool
@@ -118,12 +114,9 @@ async def initialize_app():
 async def close_resources():
     """Cleanup resources on shutdown"""
     try:
-        logging.info("🔄 Cleaning up resources...")
+        
 
-        # Close Redis connection
-        if hasattr(redis_manager, 'close'):
-            await redis_manager.close()
-            logging.info("✅ Redis connection closed")
+       
 
         # Close aiohttp session
         if app.aiohttp_session and not app.aiohttp_session.closed:

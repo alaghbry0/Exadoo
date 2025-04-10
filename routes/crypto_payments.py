@@ -14,7 +14,7 @@ from quart import Blueprint, request, jsonify, current_app
 from asyncpg.exceptions import UniqueViolationError
 
 # استيراد الدوال الخاصة بتوليد العناوين الفرعية من محفظة HD
-from hd_wallet import get_child_wallet
+from join_handler_test import get_child_wallet
 # استيراد دالة إعادة المحاولة (tenacity) لجلب بيانات BscScan
 from utils.retry import fetch_bscscan_data
 # استيراد دالة التحقق من التأكيدات باستخدام web3.py
