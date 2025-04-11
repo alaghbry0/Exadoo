@@ -11,7 +11,7 @@ from aiogram.filters import Command
 from dotenv import load_dotenv
 from quart import Blueprint, current_app  # ✅ استيراد `Blueprint` لاستخدامه في `app.py`
 from database.db_queries import get_subscription
-
+from quart import current_app
 
 
 
@@ -90,7 +90,7 @@ async def handle_join_request(join_request: ChatJoinRequest):
     logging.info(f"🔹 طلب انضمام جديد من المستخدم {user_id} (@{username} - {full_name}) إلى القناة {chat_id}")
 
     try:
-        async with db_pool.acquire() as connection:
+        async with current_app.db_pool.acquire() as connection:
             # البحث عن اشتراك نشط للمستخدم في هذه القناة
             subscription = await get_subscription(connection, user_id, chat_id)
 
@@ -116,8 +116,8 @@ async def handle_join_request(join_request: ChatJoinRequest):
                     try:
                         message_text = (
                             f"مرحباً {full_name}!✌️\n"
-                            f"تهانينا، تم قبول طلب انضمامك بنجاح إلى قناة {channel_name}.\n"
-                            "نتطلع لرؤيتك والتفاعل مع محتوى القناة."
+                            f"تهانينا، تم قبول طلب انضمامك بنجاح إلى قناة {channel_name}.🥳\n"
+                            "نتمنى لك تجربه رائعه."
                         )
                         await bot.send_message(user_id, message_text)
                         logging.info(f" تم إرسال رسالة ترحيبية للمستخدم {user_id}")
