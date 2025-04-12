@@ -16,7 +16,7 @@ from routes.notifications_routes import notifications_bp
 from routes.subscriptions_routs import public_routes
 from routes.telegram_payments import payment_bp
 from routes.ws_routes import ws_bp
-
+from routes.payment_status import payment_status_bp
 from routes.payment_confirmation import payment_confirmation_bp
 from routes.auth_routes import auth_routes
 from telegram_bot import start_bot, bot, telegram_bot_bp
@@ -50,6 +50,7 @@ app.register_blueprint(notifications_bp, url_prefix="/api")
 app.register_blueprint(public_routes)
 app.register_blueprint(admin_routes)
 app.register_blueprint(auth_routes)
+app.register_blueprint(payment_status_bp)
 app.register_blueprint(subscriptions_bp)
 app.register_blueprint(payment_bp)
 app.register_blueprint(user_bp)
