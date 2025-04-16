@@ -93,13 +93,13 @@ async def sse_stream():
 @sse_bp.route('/check-payment/<payment_token>')
 async def check_payment(payment_token):
     try:
-        # التحقق من وجود الدفعة في Redis أو قاعدة البيانات
+        
         payment_data = await redis_manager.redis.get(f'payment_{payment_token}')
 
         if payment_data:
             return jsonify(json.loads(payment_data)), 200
 
-        # إذا لم توجد في Redis، ابحث في قاعدة البيانات
+        
         async with current_app.db_pool.acquire() as conn:
             record = await conn.fetchrow('''
                 SELECT status, created_at 
