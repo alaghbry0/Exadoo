@@ -2,6 +2,8 @@ from quart import Blueprint, request, jsonify, current_app
 from chatbot.knowledge_base import KnowledgeBase
 import jwt
 import json
+from functools import wraps
+
 
 admin_chatbot_bp = Blueprint('admin_chatbot', __name__)
 knowledge_base = KnowledgeBase()
