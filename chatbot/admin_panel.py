@@ -7,6 +7,8 @@ from auth import get_current_user
 from config import SECRET_KEY
 import pytz
 
+
+
 admin_chatbot_bp = Blueprint('admin_chatbot', __name__)
 knowledge_base = KnowledgeBase()
 
@@ -66,36 +68,25 @@ async def get_settings():
 @admin_chatbot_bp.route('/settings', methods=['POST'])
 @role_required("admin")
 async def update_settings():
-    """تحديث إعدادات البوت"""
-    try:
-        data = await request.get_json()
-        required_fields = ['name', 'prompt_template', 'welcome_message', 'fallback_message']
+    data = await request.get_json()
+    # ... تحقق من الحقول المطلوبة
+    model_settings = data.get('model_settings', {'temperature': 0.7, 'max_tokens': 500})
+    model_settings_json = json.dumps(model_settings)   # 🚩 هنا
 
-        # التحقق من وجود الحقول المطلوبة
-        for field in required_fields:
-            if field not in data:
-                return jsonify({'error': f'الحقل {field} مطلوب'}), 400
-
-        # تحديث الإعدادات في قاعدة البيانات
-        async with current_app.db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO bot_settings 
-                (name, prompt_template, welcome_message, fallback_message, model_settings)
-                VALUES ($1, $2, $3, $4, $5)
-                """,
-                data['name'],
-                data['prompt_template'],
-                data['welcome_message'],
-                data['fallback_message'],
-                data.get('model_settings', {'temperature': 0.7, 'max_tokens': 500})
-            )
-
-            return jsonify({'status': 'success'})
-
-    except Exception as e:
-        current_app.logger.error(f"خطأ في تحديث إعدادات البوت: {str(e)}")
-        return jsonify({'error': 'حدث خطأ أثناء تحديث الإعدادات'}), 500
+    async with current_app.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO bot_settings 
+            (name, prompt_template, welcome_message, fallback_message, model_settings)
+            VALUES ($1, $2, $3, $4, $5::jsonb)
+            """,
+            data['name'],
+            data['prompt_template'],
+            data['welcome_message'],
+            data['fallback_message'],
+            model_settings_json
+        )
+    return jsonify({'status': 'success'})
 
 
 @admin_chatbot_bp.route('/knowledge', methods=['GET'])
