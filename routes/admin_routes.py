@@ -3,7 +3,6 @@ import json
 import logging
 from quart import Blueprint, request, jsonify, abort, current_app
 from config import DATABASE_CONFIG, SECRET_KEY
-import json
 from auth import get_current_user
 from datetime import datetime
 import pytz

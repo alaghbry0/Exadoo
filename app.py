@@ -21,10 +21,9 @@ from routes.payment_confirmation import payment_confirmation_bp
 from routes.auth_routes import auth_routes
 from telegram_bot import start_bot, bot, telegram_bot_bp
 from chatbot.chatbot import chatbot_bp
+from chatbot.admin_panel import admin_chatbot_bp
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
-
-
 
 
 
@@ -55,6 +54,7 @@ app.register_blueprint(subscriptions_bp)
 app.register_blueprint(payment_bp)
 app.register_blueprint(user_bp)
 app.register_blueprint(shop)
+app.register_blueprint(admin_chatbot_bp)
 app.register_blueprint(telegram_bot_bp)
 app.register_blueprint(chatbot_bp, url_prefix="/bot")
 app.register_blueprint(ws_bp)
