@@ -852,13 +852,14 @@ async def export_subscriptions():
 @role_required("owner")
 async def get_wallet_address():
     async with current_app.db_pool.acquire() as connection:
-        wallet = await connection.fetchrow("SELECT wallet_address FROM wallet ORDER BY id DESC LIMIT 1")
+        wallet = await connection.fetchrow("SELECT wallet_address, api_key FROM wallet ORDER BY id DESC LIMIT 1")
     if wallet:
-        return jsonify({"wallet_address": wallet["wallet_address"]}), 200
+        return jsonify({
+            "wallet_address": wallet["wallet_address"],
+            "api_key": wallet["api_key"]
+        }), 200
     else:
-        # إذا لم يكن هناك سجل، يمكن إرجاع قيمة فارغة أو رسالة مناسبة
-        return jsonify({"wallet_address": ""}), 200
-
+        return jsonify({"wallet_address": "", "api_key": ""}), 200
 
 
 @admin_routes.route("/wallet", methods=["POST"])
@@ -866,22 +867,21 @@ async def get_wallet_address():
 async def update_wallet_address():
     data = await request.get_json()
     wallet_address = data.get("wallet_address")
-    
-    if not wallet_address:
-        return jsonify({"error": "Wallet address is required"}), 400
+    api_key = data.get("api_key")
+
+    if not wallet_address or not api_key:
+        return jsonify({"error": "جميع الحقول مطلوبة"}), 400
 
     async with current_app.db_pool.acquire() as connection:
-        # نفترض أنه يوجد سجل واحد فقط لتخزين عنوان المحفظة
         wallet = await connection.fetchrow("SELECT id FROM wallet LIMIT 1")
         if wallet:
             await connection.execute(
-                "UPDATE wallet SET wallet_address = $1 WHERE id = $2", 
-                wallet_address, wallet["id"]
+                "UPDATE wallet SET wallet_address = $1, api_key = $2 WHERE id = $3",
+                wallet_address, api_key, wallet["id"]
             )
         else:
             await connection.execute(
-                "INSERT INTO wallet (wallet_address) VALUES ($1)", 
-                wallet_address
+                "INSERT INTO wallet (wallet_address, api_key) VALUES ($1, $2)",
+                wallet_address, api_key
             )
-    return jsonify({"message": "Wallet address updated successfully"}), 200
-
+    return jsonify({"message": "تم تحديث البيانات بنجاح"}), 200

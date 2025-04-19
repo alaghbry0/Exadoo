@@ -18,7 +18,8 @@ class DeepSeekService:
 
     async def get_response(self, prompt, settings=None):
         """الحصول على رد من DeepSeek API مع التخزين المؤقت"""
-        if not self.api_key:
+        api_key = await get_deepseek_api_key()
+        if not api_key:
             current_app.logger.error("مفتاح API للـ DeepSeek غير متوفر")
             return "عذرًا، لا يمكن الاتصال بخدمة الذكاء الاصطناعي حاليًا."
 
@@ -41,7 +42,7 @@ class DeepSeekService:
 
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
+            "Authorization": f"Bearer {api_key}"
         }
 
         # بناء الرسائل وإضافة سياق النظام إذا كان موجوداً في الإعدادات
@@ -167,6 +168,37 @@ class DeepSeekService:
             for i in range(items_to_remove):
                 del self.cache[sorted_items[i][0]]
 
+
+# في ai_service.py
+_api_key_cache = {
+    "api_key": None,
+    "timestamp": 0.0
+}
+API_KEY_CACHE_TTL = 300  # 5 دقائق
+
+
+async def get_deepseek_api_key() -> Optional[str]:
+    global _api_key_cache
+    now = asyncio.get_event_loop().time()
+
+    # إذا انتهت مدة التخزين المؤقت أو لا يوجد مفتاح
+    if _api_key_cache["api_key"] is None or now - _api_key_cache["timestamp"] > API_KEY_CACHE_TTL:
+        async with current_app.db_pool.acquire() as connection:
+            try:
+                record = await connection.fetchrow(
+                    "SELECT api_key FROM wallet ORDER BY id DESC LIMIT 1"
+                )
+                if not record or not record['api_key']:
+                    current_app.logger.error("❌ لا يوجد API Key مسجل في جدول المحفظة")
+                    return None
+
+                _api_key_cache["api_key"] = record['api_key']
+                _api_key_cache["timestamp"] = now
+                current_app.logger.info("تم تحديث API Key من قاعدة البيانات")
+            except Exception as e:
+                current_app.logger.error(f"خطأ في استرجاع API Key: {str(e)}")
+                return None
+    return _api_key_cache["api_key"]
 
 class AIModelManager:
     """إدارة نماذج الذكاء الاصطناعي المتعددة"""

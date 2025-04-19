@@ -195,7 +195,8 @@ async def _get_bot_settings():
                     {context}""",
                 'welcome_message': 'مرحباً بك! كيف يمكنني مساعدتك اليوم؟',
                 'fallback_message': 'آسف، لا يمكنني الإجابة على هذا السؤال. هل يمكنني مساعدتك بشيء آخر؟',
-                'model_settings': {'temperature': 0.1, 'max_tokens': 500}
+                'temperature': 0.1,
+                'max_tokens': 500
             }
 
         settings = dict(row)

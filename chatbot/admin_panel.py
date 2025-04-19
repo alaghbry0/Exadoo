@@ -57,7 +57,8 @@ async def get_settings():
                     'prompt_template': 'أنت مساعد دعم العملاء لشركة اكسادوا. {context}',
                     'welcome_message': 'مرحباً بك! كيف يمكنني مساعدتك اليوم؟',
                     'fallback_message': 'آسف، لا يمكنني الإجابة على هذا السؤال. هل يمكنني مساعدتك بشيء آخر؟',
-                    'model_settings': {'temperature': 0.7, 'max_tokens': 500}
+                    'temperature': 0.1,
+                    'max_tokens': 500
                 })
 
     except Exception as e:
@@ -69,25 +70,34 @@ async def get_settings():
 @role_required("admin")
 async def update_settings():
     data = await request.get_json()
-    # ... تحقق من الحقول المطلوبة
-    model_settings = data.get('model_settings', {'temperature': 0.7, 'max_tokens': 500})
-    model_settings_json = json.dumps(model_settings)   # 🚩 هنا
+
+    # التحقق من الحقول المطلوبة
+    required_fields = ['name', 'prompt_template', 'welcome_message', 'fallback_message']
+    for field in required_fields:
+        if field not in data:
+            return jsonify({'error': f'الحقل {field} مطلوب'}), 400
+
+    # إذا اخترت استخدام حقول منفصلة:
+    temperature = data.get('temperature', 0.1)
+    max_tokens = data.get('max_tokens', 500)
+    api_key = data.get('api_key', '')
 
     async with current_app.db_pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO bot_settings 
-            (name, prompt_template, welcome_message, fallback_message, model_settings)
-            VALUES ($1, $2, $3, $4, $5::jsonb)
+            (name, prompt_template, welcome_message, 
+             fallback_message, api_key, temperature, max_tokens)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             """,
             data['name'],
             data['prompt_template'],
             data['welcome_message'],
             data['fallback_message'],
-            model_settings_json
+            temperature,
+            max_tokens
         )
     return jsonify({'status': 'success'})
-
 
 @admin_chatbot_bp.route('/knowledge', methods=['GET'])
 @role_required("admin")
