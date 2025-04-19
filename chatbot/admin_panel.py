@@ -233,3 +233,23 @@ async def delete_knowledge_item(item_id):
     except Exception as e:
         current_app.logger.error(f"خطأ في حذف عنصر قاعدة المعرفة: {str(e)}")
         return jsonify({'error': 'حدث خطأ أثناء حذف العنصر'}), 500
+
+
+@admin_chatbot_bp.route('/rebuild-embeddings', methods=['POST'])
+@role_required("admin")
+async def rebuild_embeddings():
+    """إعادة بناء embeddings لكل قاعدة المعرفة"""
+    try:
+        # التحقق من مصادقة المستخدم (يمكن إضافة منطق المصادقة هنا)
+
+        # إعادة بناء embeddings
+        updated_count = await knowledge_base.rebuild_embeddings()
+
+        return jsonify({
+            'status': 'success',
+            'message': f'تم تحديث embeddings لـ {updated_count} عنصر.'
+        })
+
+    except Exception as e:
+        current_app.logger.error(f"خطأ في إعادة بناء embeddings: {str(e)}")
+        return jsonify({'error': 'حدث خطأ أثناء إعادة بناء embeddings'}), 500

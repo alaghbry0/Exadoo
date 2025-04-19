@@ -1,118 +1,96 @@
 from quart import current_app
-import json
+import re
+
 
 class ChatManager:
     @staticmethod
-    async def save_conversation(user_id, session_id, user_message, bot_response, knowledge_sources=None):
-        """حفظ المحادثة والرسائل في قاعدة البيانات"""
+    async def save_conversation(user_id, session_id, user_message, bot_response, knowledge_ids=None):
+        """حفظ المحادثة في قاعدة البيانات"""
         try:
+            # تنظيف المدخلات
+            user_id = ChatManager._sanitize_input(user_id)
+            session_id = ChatManager._sanitize_input(session_id)
+            user_message = ChatManager._sanitize_input(user_message)
+            bot_response = ChatManager._sanitize_input(bot_response)
+
             async with current_app.db_pool.acquire() as conn:
-                # التحقق مما إذا كانت المحادثة موجودة بالفعل
-                conversation = await conn.fetchrow(
+                row = await conn.fetchrow(
                     """
-                    SELECT id FROM chat_conversations 
-                    WHERE session_id = $1 
-                    ORDER BY started_at DESC LIMIT 1
+                    INSERT INTO conversations (user_id, session_id, user_message, bot_response, knowledge_ids)
+                    VALUES ($1, $2, $3, $4, $5)
+                    RETURNING id
                     """,
-                    session_id
+                    user_id, session_id, user_message, bot_response, knowledge_ids
                 )
-
-                if conversation:
-                    conversation_id = conversation['id']
-                    # تحديث وقت آخر نشاط للمحادثة
-                    await conn.execute(
-                        "UPDATE chat_conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = $1",
-                        conversation_id
-                    )
-                else:
-                    # إنشاء محادثة جديدة مع تحويل metadata إلى JSON string
-                    metadata_str = json.dumps({"source": "web"})
-                    conversation_id = await conn.fetchval(
-                        """
-                        INSERT INTO chat_conversations (user_id, session_id, metadata)
-                        VALUES ($1, $2, $3::jsonb)
-                        RETURNING id
-                        """,
-                        user_id, session_id, metadata_str
-                    )
-
-                # حفظ رسالة المستخدم
-                await conn.execute(
-                    """
-                    INSERT INTO chat_messages (conversation_id, is_user, content)
-                    VALUES ($1, $2, $3)
-                    """,
-                    conversation_id, True, user_message
-                )
-
-                # حفظ رد البوت
-                await conn.execute(
-                    """
-                    INSERT INTO chat_messages (conversation_id, is_user, content, knowledge_sources)
-                    VALUES ($1, $2, $3, $4)
-                    """,
-                    conversation_id, False, bot_response, knowledge_sources or []
-                )
-
-                return conversation_id
-
+                return row['id']
         except Exception as e:
             current_app.logger.error(f"خطأ في حفظ المحادثة: {str(e)}")
             raise
 
     @staticmethod
-    async def get_conversation_history(session_id, limit=50):
-        """استرجاع تاريخ المحادثة"""
-        try:
-            async with current_app.db_pool.acquire() as conn:
-                conversation = await conn.fetchrow(
-                    "SELECT id FROM chat_conversations WHERE session_id = $1",
-                    session_id
-                )
-
-                if not conversation:
-                    return []
-
-                conversation_id = conversation['id']
-
-                rows = await conn.fetch(
-                    """
-                    SELECT is_user, content, created_at
-                    FROM chat_messages
-                    WHERE conversation_id = $1
-                    ORDER BY created_at ASC
-                    LIMIT $2
-                    """,
-                    conversation_id, limit
-                )
-
-                history = []
-                for row in rows:
-                    history.append({
-                        'is_user': row['is_user'],
-                        'content': row['content'],
-                        'timestamp': row['created_at'].isoformat()
-                    })
-
-                return history
-
-        except Exception as e:
-            current_app.logger.error(f"خطأ في استرجاع تاريخ المحادثة: {str(e)}")
-            return []
-
-    @staticmethod
-    async def save_feedback(conversation_id, rating, feedback=''):
+    async def save_feedback(conversation_id, rating, feedback=None):
         """حفظ تقييم المستخدم للمحادثة"""
         try:
+            # تحويل معرف المحادثة إلى رقم لمنع حقن SQL
+            try:
+                conversation_id_int = int(conversation_id)
+            except (ValueError, TypeError):
+                raise ValueError("معرف المحادثة غير صالح")
+
+            # تنظيف المدخلات
+            feedback = ChatManager._sanitize_input(feedback) if feedback else None
+
+            # التحقق من صحة التقييم
+            try:
+                rating_int = int(rating)
+                if rating_int not in range(1, 6):  # تقييم من 1 إلى 5
+                    raise ValueError("التقييم يجب أن يكون بين 1 و 5")
+            except (ValueError, TypeError):
+                raise ValueError("التقييم غير صالح")
+
             async with current_app.db_pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO bot_performance (conversation_id, rating, feedback)
-                    VALUES ($1, $2, $3)
+                    UPDATE conversations
+                    SET rating = $1, feedback = $2
+                    WHERE id = $3
                     """,
-                    conversation_id, rating, feedback
+                    rating_int, feedback, conversation_id_int
                 )
                 return True
         except Exception as e:
             current_app.logger.error(f"خطأ في حفظ التقييم: {str(e)}")
             raise
+
+    @staticmethod
+    async def get_conversation_history(session_id, limit=5):
+        """الحصول على سجل المحادثات السابقة للمستخدم في الجلسة الحالية"""
+        try:
+            # تنظيف المدخلات
+            session_id = ChatManager._sanitize_input(session_id)
+
+            async with current_app.db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, user_message, bot_response, created_at
+                    FROM conversations
+                    WHERE session_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    """,
+                    session_id, limit
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            current_app.logger.error(f"خطأ في استرجاع سجل المحادثات: {str(e)}")
+            return []
+
+    @staticmethod
+    def _sanitize_input(text):
+        """تنظيف النص المدخل لمنع هجمات الحقن"""
+        if not text:
+            return text
+
+        # إزالة أي محاولات حقن SQL
+        text = re.sub(r'[\'"\\;]', '', text)
+        return text

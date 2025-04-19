@@ -135,3 +135,5 @@ wsproto==1.2.0
 x25519==0.0.2
 XlsxWriter==3.2.2
 yarl==1.18.3
+torch
+transformers
