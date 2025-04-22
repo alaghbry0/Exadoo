@@ -95,14 +95,14 @@ async def update_settings():
             """
             INSERT INTO bot_settings 
             (name, system_instructions, welcome_message, 
-             fallback_message, response_template,  temperature, max_tokens, faq_questions)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+             fallback_message,  temperature, max_tokens, faq_questions)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
             """,
             data['name'],
             data['system_instructions'],
             data['welcome_message'],
             data['fallback_message'],
-            data['response_template'],
+
 
 
             temperature,

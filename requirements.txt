@@ -139,3 +139,6 @@ torch
 transformers
 huggingface-hub
 pgvector
+langchain
+async-lru
+sentence-transformers
