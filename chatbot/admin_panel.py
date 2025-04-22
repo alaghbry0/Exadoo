@@ -1,13 +1,12 @@
 from quart import Blueprint, request, jsonify, current_app, abort
-from chatbot.knowledge_base import KnowledgeBase
 import jwt
 import json
 from functools import wraps
 from auth import get_current_user
 from config import SECRET_KEY
 import pytz
-
-
+from chatbot.knowledge_base import KnowledgeBase
+import time
 
 admin_chatbot_bp = Blueprint('admin_chatbot', __name__)
 knowledge_base = KnowledgeBase()
@@ -50,15 +49,19 @@ async def get_settings():
             row = await conn.fetchrow('SELECT * FROM bot_settings ORDER BY id DESC LIMIT 1')
 
             if row:
+                # تحويل النتيجة إلى dict وإرجاعها بشكل JSON
                 return jsonify(dict(row))
             else:
+                # القيم الافتراضية إذا لم توجد إعدادات محفوظة
                 return jsonify({
                     'name': 'دعم عملاء اكسادوا',
-                    'prompt_template': 'أنت مساعد دعم العملاء لشركة اكسادوا. {context}',
+                    'system_instructions': 'أنت مساعد دعم العملاء لشركة اكسادوا. {context}',
                     'welcome_message': 'مرحباً بك! كيف يمكنني مساعدتك اليوم؟',
                     'fallback_message': 'آسف، لا يمكنني الإجابة على هذا السؤال. هل يمكنني مساعدتك بشيء آخر؟',
                     'temperature': 0.1,
-                    'max_tokens': 500
+                    'max_tokens': 500,
+
+                    'faq_questions': []  # قائمة الأسئلة الشائعة افتراضيًا فارغة
                 })
 
     except Exception as e:
@@ -72,32 +75,42 @@ async def update_settings():
     data = await request.get_json()
 
     # التحقق من الحقول المطلوبة
-    required_fields = ['name', 'prompt_template', 'welcome_message', 'fallback_message']
+    required_fields = ['name', 'system_instructions', 'welcome_message', 'fallback_message']
     for field in required_fields:
         if field not in data:
             return jsonify({'error': f'الحقل {field} مطلوب'}), 400
 
-    # إذا اخترت استخدام حقول منفصلة:
+    # قراءة الحقول الاختيارية
     temperature = data.get('temperature', 0.1)
     max_tokens = data.get('max_tokens', 500)
-    api_key = data.get('api_key', '')
+
+
+    # قراءة قائمة الأسئلة الشائعة وإجبارها على أن تكون قائمة
+    faq_questions = data.get('faq_questions', [])
+    if not isinstance(faq_questions, list):
+        return jsonify({'error': 'الحقل faq_questions يجب أن يكون قائمة'}), 400
 
     async with current_app.db_pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO bot_settings 
-            (name, prompt_template, welcome_message, 
-             fallback_message, api_key, temperature, max_tokens)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (name, system_instructions, welcome_message, 
+             fallback_message, response_template,  temperature, max_tokens, faq_questions)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
             """,
             data['name'],
-            data['prompt_template'],
+            data['system_instructions'],
             data['welcome_message'],
             data['fallback_message'],
+            data['response_template'],
+
+
             temperature,
-            max_tokens
+            max_tokens,
+            json.dumps(faq_questions)  # تأكد من استيراد json أعلى الملف
         )
     return jsonify({'status': 'success'})
+
 
 @admin_chatbot_bp.route('/knowledge', methods=['GET'])
 @role_required("admin")
@@ -167,7 +180,15 @@ async def get_knowledge_item(item_id):
     """الحصول على عنصر محدد من قاعدة المعرفة"""
     try:
         async with current_app.db_pool.acquire() as conn:
-            row = await conn.fetchrow('SELECT * FROM knowledge_base WHERE id = $1', item_id)
+            row = await conn.fetchrow(
+                '''
+                SELECT id, title, content, category, tags,
+                       created_at, updated_at, embedding_updated_at
+                FROM knowledge_base
+                WHERE id = $1
+                ''',
+                item_id
+            )
 
             if row:
                 return jsonify(dict(row))
@@ -250,16 +271,49 @@ async def delete_knowledge_item(item_id):
 async def rebuild_embeddings():
     """إعادة بناء embeddings لكل قاعدة المعرفة"""
     try:
-        # التحقق من مصادقة المستخدم (يمكن إضافة منطق المصادقة هنا)
+        # إضافة خيار للتنفيذ في الخلفية
+        run_in_background = request.args.get('background', 'false').lower() == 'true'
 
-        # إعادة بناء embeddings
-        updated_count = await knowledge_base.rebuild_embeddings()
-
-        return jsonify({
-            'status': 'success',
-            'message': f'تم تحديث embeddings لـ {updated_count} عنصر.'
-        })
+        if run_in_background:
+            # تشغيل العملية في الخلفية
+            task = asyncio.create_task(KnowledgeBase.rebuild_embeddings())
+            current_app.background_tasks.append(task)
+            return jsonify({
+                'status': 'success',
+                'message': 'بدأت عملية إعادة بناء embeddings في الخلفية.'
+            })
+        else:
+            # تنفيذ العملية والانتظار لاكتمالها
+            updated_count = await KnowledgeBase.rebuild_embeddings()
+            return jsonify({
+                'status': 'success',
+                'message': f'تم تحديث embeddings لـ {updated_count} عنصر.'
+            })
 
     except Exception as e:
         current_app.logger.error(f"خطأ في إعادة بناء embeddings: {str(e)}")
         return jsonify({'error': 'حدث خطأ أثناء إعادة بناء embeddings'}), 500
+
+
+@admin_chatbot_bp.route('/search-test', methods=['GET'])
+@role_required("admin")
+async def search_test():
+    """اختبار البحث مع قياس الأداء"""
+    try:
+        query = request.args.get('q', '')
+        limit = int(request.args.get('limit', 5))
+
+        start_time = time.time()
+        results = await KnowledgeBase.search(query, limit, debug=True)
+        end_time = time.time()
+
+        return jsonify({
+            'status': 'success',
+            'time_ms': round((end_time - start_time) * 1000, 2),
+            'results_count': len(results),
+            'results': results
+        })
+
+    except Exception as e:
+        current_app.logger.error(f"خطأ في اختبار البحث: {str(e)}")
+        return jsonify({'error': 'حدث خطأ أثناء اختبار البحث'}), 500

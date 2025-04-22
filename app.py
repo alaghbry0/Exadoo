@@ -8,7 +8,7 @@ import aiohttp
 from pgvector.asyncpg import register_vector
 from quart import Quart
 from quart_cors import cors
-
+from chatbot.ai_service import AIModelManager
 from config import DATABASE_CONFIG
 from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
@@ -23,7 +23,7 @@ from routes.payment_confirmation import payment_confirmation_bp
 from routes.auth_routes import auth_routes
 from telegram_bot import start_bot, bot, telegram_bot_bp
 from chatbot.chatbot import chatbot_bp
-from chatbot.embedding_service import ArabertEmbeddingService
+from chatbot.embedding_service import ImprovedEmbeddingService
 from chatbot.admin_panel import admin_chatbot_bp
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
@@ -47,6 +47,11 @@ app.db_pool = None
 app.aiohttp_session = None
 app.bot = None
 app.bot_running = False
+
+# هنا نسجل خدمة الذكاء الاصطناعي
+
+app.ai_service = AIModelManager()
+
 
 app = cors(app, allow_origin="*")
 
@@ -96,12 +101,13 @@ async def initialize_app():
         app.aiohttp_session = aiohttp.ClientSession()
         logging.info("✅ aiohttp session initialized")
 
-        app.embedding_service = ArabertEmbeddingService()
+        app.embedding_service = ImprovedEmbeddingService()
         await app.embedding_service.initialize()
         logging.info("✅ Embedding service initialized")
 
         logging.info("🔄 Starting Telegram bot and scheduler...")
         app.bot = bot
+
         await start_scheduler(app.db_pool)
         if not app.bot_running:
             app.bot_running = True
