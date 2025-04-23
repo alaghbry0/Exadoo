@@ -31,21 +31,21 @@ class ImprovedEmbeddingService:
         """Initializes the SentenceTransformer model."""
         # لا حاجة للتنزيل اليدوي، SentenceTransformer يقوم بذلك
         try:
-            # تحقق من وجود مسار النماذج، قم بإنشائه إذا لم يكن موجودًا
-            if not os.path.exists(self.local_path):
-                 os.makedirs(self.local_path, exist_ok=True)
-                 current_app.logger.info(f"Created models directory: {self.local_path}")
+            # المسار النسبي داخل المشروع
+            model_path = os.path.join(os.path.dirname(__file__), self.local_path)
 
-            # حدد cache_folder لتوجيه التنزيل إذا لزم الأمر
-            self.model = SentenceTransformer(self.model_name, device=self.device, cache_folder=self.local_path)
-            # اختبار بسيط للتأكد من أن النموذج يعمل
-            _ = self.model.encode("test")
-            current_app.logger.info(
-                f"Model {self.model_name} initialized successfully on {self.device}"
-            )
+            if not os.path.exists(model_path):
+                # إذا لم يوجد النموذج محليًا، ننزله مباشرة من HuggingFace
+                self.model = SentenceTransformer(self.model_name, device=self.device)
+                self.model.save(model_path)
+                current_app.logger.info(f"Downloaded and saved model to {model_path}")
+            else:
+                # إذا وجد النموذج، نحمله محليًا
+                self.model = SentenceTransformer(model_path, device=self.device)
+
+            current_app.logger.info(f"Model loaded successfully from {model_path}")
         except Exception as e:
-            current_app.logger.error(f"Failed to initialize SentenceTransformer model: {e}", exc_info=True)
-            # يمكنك رفع الخطأ لمنع بدء تشغيل التطبيق بدون نموذج
+            current_app.logger.error(f"Model initialization failed: {str(e)}")
             raise
 
     @alru_cache(maxsize=2048) # زيادة حجم الكاش قد يكون مفيدًا
