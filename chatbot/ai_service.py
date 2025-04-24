@@ -2,7 +2,7 @@
 import aiohttp
 import os
 import json
-from quart import current_app
+from quart import current_app, Response
 import time
 import asyncio
 import numpy as np
@@ -21,19 +21,16 @@ class DeepSeekService:
         self.cache = {}
         self.cache_ttl = 3600
 
-    async def get_response(self, messages: List[Dict[str, str]], settings: dict = None) -> Dict[str, Any]:
+    async def stream_response(self, messages: List[Dict[str, str]], settings: dict = None):
         """
-        Get a response from DeepSeek API with:
-         - Caching
-         - API timeout
-         - Unified or temporary aiohttp session
-         - Fallback strategy with appropriate messages
+        Stream a response from DeepSeek API with Server-Sent Events (SSE)
         """
         # 1. Get API key
-        api_key = await get_deepseek_api_key()
+        api_key = self.api_key
         if not api_key:
             current_app.logger.error("DeepSeek API key not available")
-            return {"role": "assistant", "content": "عذرًا، لا يمكن الاتصال بخدمة الذكاء الاصطناعي حاليًا."}
+            yield {"role": "assistant", "content": "عذرًا، لا يمكن الاتصال بخدمة الذكاء الاصطناعي حاليًا."}
+            return
 
         # 2. Ensure valid settings
         if not isinstance(settings, dict):
@@ -56,14 +53,7 @@ class DeepSeekService:
             preserved_messages = user_assistant_messages[-10:]  # Keep last 10 exchanges
             messages = system_messages + preserved_messages
 
-        # 4. Generate cache key and check cache
-        cache_key = self._generate_cache_key(messages, temperature, max_tokens, model)
-        cached = self._get_from_cache(cache_key)
-        if cached:
-            current_app.logger.info("Retrieved response from cache")
-            return cached
-
-        # 5. Prepare headers and payload
+        # 4. Prepare headers and payload
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}"
@@ -73,7 +63,8 @@ class DeepSeekService:
             "model": model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens
+            "max_tokens": max_tokens,
+            "stream": True  # Important! Enable streaming
         }
 
         # Add function calling if provided
@@ -91,80 +82,129 @@ class DeepSeekService:
         if settings.get("kv_cache_id"):
             payload["kv_cache_id"] = settings.get("kv_cache_id")
 
-        # 6. Setup connection timeout
-        api_timeout = 30  # seconds
+        # 5. Setup connection timeout
+        api_timeout = 60  # Longer timeout for streaming responses
         start = time.time()
 
-        async def call_api(session):
-            async with session.post(
-                    self.api_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=api_timeout
-            ) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    current_app.logger.error(f"DeepSeek API error: {resp.status} – {text}")
-                    return None, resp.status, text
-                data = await resp.json()
-                assistant_message = data["choices"][0]["message"]
-
-                # Save KV cache ID if present
-                if "kv_cache_id" in data and settings.get("session_id"):
-                    try:
-                        from chatbot.chat_manager import ChatManager
-                        chat_manager = ChatManager()
-                        await chat_manager.update_kv_cache(settings.get("session_id"), data["kv_cache_id"])
-                    except Exception as e:
-                        current_app.logger.error(f"Error updating KV cache: {str(e)}")
-
-                return assistant_message, 200, None
-
         try:
-            # 7. Use elevated session or create temporary one
-            session = getattr(current_app, "aiohttp_session", None)
-            if session:
-                content, status, err = await call_api(session)
-            else:
-                async with aiohttp.ClientSession() as temp_sess:
-                    content, status, err = await call_api(temp_sess)
+            # 6. Setup session and streaming
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                        self.api_url,
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=api_timeout)
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        current_app.logger.error(f"DeepSeek API error: {resp.status} – {error_text}")
+                        yield {"role": "assistant", "content": "عذرًا، حدث خطأ في الاتصال بالخدمة."}
+                        return
 
-            # 8. Handle response
-            if status == 200 and content is not None:
-                elapsed = time.time() - start
-                current_app.logger.info(f"AI API response time: {elapsed:.2f}s")
-                self._store_in_cache(cache_key, content)
-                return content
-            else:
-                # Error in API response
-                # If asking about Exaado official page
-                low_content = " ".join([m.get("content", "") for m in messages]).lower()
-                if "صفحة" in low_content and "اكسادوا" in low_content and any(
-                        k in low_content for k in ("رسميه", "رسمية", "عنوان", "رابط")):
-                    return {"role": "assistant", "content": "صفحة اكسادوا الرسمية متاحة على الرابط: https://exaado.com"}
-                return {
-                    "role": "assistant",
-                    "content": "عذرًا، لم أتمكن من العثور على إجابة دقيقة. للحصول على مساعدة في اكسادوا، يمكنك زيارة https://exaado.com أو التواصل مع فريق الدعم."
-                }
+                    # Process streaming response
+                    current_chunk = {"role": "assistant", "content": ""}
+                    tool_calls_buffer = []
+                    tool_call_index = 0
+
+                    # Variable to track if we're inside a tool call
+                    in_tool_call = False
+                    current_tool_call = None
+
+                    # Read the response stream
+                    async for line in resp.content:
+                        line = line.decode('utf-8').strip()
+
+                        # Skip empty lines
+                        if not line:
+                            continue
+
+                        # Skip comments
+                        if line.startswith(':'):
+                            continue
+
+                        # Check for data line
+                        if line.startswith('data: '):
+                            data_str = line[6:]  # Remove 'data: ' prefix
+
+                            # Check for stream end
+                            if data_str == '[DONE]':
+                                break
+
+                            try:
+                                data = json.loads(data_str)
+
+                                # Extract delta and type
+                                if 'choices' in data and len(data['choices']) > 0:
+                                    choice = data['choices'][0]
+                                    delta = choice.get('delta', {})
+
+                                    # Handle normal content
+                                    if 'content' in delta and delta['content']:
+                                        current_chunk["content"] += delta['content']
+                                        # Send content chunk
+                                        yield {"content": delta['content']}
+
+                                    # Handle tool calls
+                                    if 'tool_calls' in delta:
+                                        for tool_call_delta in delta['tool_calls']:
+                                            tool_call_id = tool_call_delta.get('id')
+
+                                            # Check if this is a new tool call
+                                            if tool_call_id and not in_tool_call:
+                                                in_tool_call = True
+                                                current_tool_call = {
+                                                    "id": tool_call_id,
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": "",
+                                                        "arguments": ""
+                                                    }
+                                                }
+                                                tool_calls_buffer.append(current_tool_call)
+
+                                            # Add function name
+                                            if 'function' in tool_call_delta:
+                                                if 'name' in tool_call_delta['function']:
+                                                    current_tool_call['function']['name'] = tool_call_delta['function'][
+                                                        'name']
+
+                                                # Add function arguments
+                                                if 'arguments' in tool_call_delta['function']:
+                                                    current_tool_call['function']['arguments'] += \
+                                                    tool_call_delta['function']['arguments']
+
+                                    # If this is a new turn (delta has only role), yield any complete tool call
+                                    if 'role' in delta and len(delta) == 1 and in_tool_call:
+                                        in_tool_call = False
+                                        yield {"tool_calls": tool_calls_buffer}
+                                        tool_calls_buffer = []
+
+                                # Save KV cache ID if present
+                                if "kv_cache_id" in data and settings.get("session_id"):
+                                    try:
+                                        from chatbot.chat_manager import ChatManager
+                                        chat_manager = ChatManager()
+                                        await chat_manager.update_kv_cache(settings.get("session_id"),
+                                                                           data["kv_cache_id"])
+                                    except Exception as e:
+                                        current_app.logger.error(f"Error updating KV cache: {str(e)}")
+
+                            except json.JSONDecodeError as e:
+                                current_app.logger.error(f"Failed to parse SSE data: {e}")
+                                continue
+
+                    # Send any remaining tool calls
+                    if tool_calls_buffer:
+                        yield {"tool_calls": tool_calls_buffer}
 
         except asyncio.TimeoutError:
-            current_app.logger.error(f"DeepSeek API timeout after {api_timeout}s")
-            # Timeout case with question about official link
-            low_content = " ".join([m.get("content", "") for m in messages]).lower()
-            if "صفحة" in low_content and "اكسادوا" in low_content and any(
-                    k in low_content for k in ("رسميه", "رسمية", "عنوان", "رابط")):
-                return {"role": "assistant", "content": "صفحة اكسادوا الرسمية متاحة على الرابط: https://exaado.com"}
-            return {"role": "assistant",
-                    "content": "استغرق الرد وقتًا طويلاً. يمكنك زيارة موقع اكسادوا مباشرة على https://exaado.com."}
+            current_app.logger.error(f"DeepSeek API streaming timeout after {api_timeout}s")
+            yield {
+                "content": "استغرق الرد وقتًا طويلاً. يمكنك إعادة المحاولة أو زيارة موقع اكسادوا مباشرة على https://exaado.com."}
 
         except Exception as e:
-            current_app.logger.error(f"Error connecting to DeepSeek API: {e}")
-            # Try to handle common errors
-            if "صفحة" in " ".join([m.get("content", "") for m in messages]).lower() and "اكسادوا" in " ".join(
-                    [m.get("content", "") for m in messages]).lower():
-                return {"role": "assistant", "content": "صفحة اكسادوا الرسمية متاحة على الرابط: https://exaado.com"}
-            return {"role": "assistant",
-                    "content": "حدث خطأ أثناء الاتصال بخدمة الذكاء الاصطناعي. يمكنك زيارة موقع اكسادوا مباشرة على https://exaado.com."}
+            current_app.logger.error(f"Error in streaming response: {str(e)}", exc_info=True)
+            yield {"content": "حدث خطأ أثناء معالجة الطلب. يرجى المحاولة مرة أخرى."}
 
     async def get_chat_prefix_completion(self, messages: List[Dict[str, Any]], settings: Optional[Dict] = None) -> \
     Optional[Dict[str, Any]]:
@@ -176,7 +216,7 @@ class DeepSeekService:
             settings = {}
 
         # 1. Get API key
-        api_key = await get_deepseek_api_key()  # افترض أن هذه الدالة موجودة وتعمل
+        api_key = self.api_key  # افترض أن هذه الدالة موجودة وتعمل
         if not api_key:
             current_app.logger.error("DeepSeek API key not available for prefix completion")
             return None
@@ -384,3 +424,149 @@ class AIModelManager:
 
         model_instance = self.models[model_name]
         return await model_instance.get_response(prompt, settings)
+
+
+    async def get_response(self, messages: List[Dict[str, str]], settings: dict = None) -> Dict[str, Any]:
+        """
+        Get a response from DeepSeek API with:
+         - Caching
+         - API timeout
+         - Unified or temporary aiohttp session
+         - Fallback strategy with appropriate messages
+        """
+        # 1. Get API key
+        api_key = await get_deepseek_api_key()
+        if not api_key:
+            current_app.logger.error("DeepSeek API key not available")
+            return {"role": "assistant", "content": "عذرًا، لا يمكن الاتصال بخدمة الذكاء الاصطناعي حاليًا."}
+
+        # 2. Ensure valid settings
+        if not isinstance(settings, dict):
+            settings = {}
+
+        # Update model parameters
+        temperature = float(settings.get("temperature", 0.1))
+        max_tokens = int(settings.get("max_tokens", 500))
+        model = settings.get("model", self.default_model)
+
+        # 3. Check for excessive length in messages
+        total_length = sum(len(msg.get("content", "")) for msg in messages)
+        if total_length > 32000:  # Typical context window limit
+            current_app.logger.info("Total messages too large, trimming")
+            # Trim user messages while preserving system messages
+            system_messages = [m for m in messages if m.get("role") == "system"]
+            user_assistant_messages = [m for m in messages if m.get("role") != "system"]
+
+            # Keep most recent messages
+            preserved_messages = user_assistant_messages[-10:]  # Keep last 10 exchanges
+            messages = system_messages + preserved_messages
+
+        # 4. Generate cache key and check cache
+        cache_key = self._generate_cache_key(messages, temperature, max_tokens, model)
+        cached = self._get_from_cache(cache_key)
+        if cached:
+            current_app.logger.info("Retrieved response from cache")
+            return cached
+
+        # 5. Prepare headers and payload
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+
+        # Add function calling if provided
+        if settings.get("tools"):
+            payload["tools"] = settings.get("tools")
+
+        if settings.get("tool_choice"):
+            payload["tool_choice"] = settings.get("tool_choice")
+
+        # Add reasoning_step if enabled
+        if settings.get("reasoning_enabled"):
+            payload["reasoning_step"] = settings.get("reasoning_steps", 3)
+
+        # Add KV cache if available
+        if settings.get("kv_cache_id"):
+            payload["kv_cache_id"] = settings.get("kv_cache_id")
+
+        # 6. Setup connection timeout
+        api_timeout = 30  # seconds
+        start = time.time()
+
+        async def call_api(session):
+            async with session.post(
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=api_timeout
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    current_app.logger.error(f"DeepSeek API error: {resp.status} – {text}")
+                    return None, resp.status, text
+                data = await resp.json()
+                assistant_message = data["choices"][0]["message"]
+
+                # Save KV cache ID if present
+                if "kv_cache_id" in data and settings.get("session_id"):
+                    try:
+                        from chatbot.chat_manager import ChatManager
+                        chat_manager = ChatManager()
+                        await chat_manager.update_kv_cache(settings.get("session_id"), data["kv_cache_id"])
+                    except Exception as e:
+                        current_app.logger.error(f"Error updating KV cache: {str(e)}")
+
+                return assistant_message, 200, None
+
+        try:
+            # 7. Use elevated session or create temporary one
+            session = getattr(current_app, "aiohttp_session", None)
+            if session:
+                content, status, err = await call_api(session)
+            else:
+                async with aiohttp.ClientSession() as temp_sess:
+                    content, status, err = await call_api(temp_sess)
+
+            # 8. Handle response
+            if status == 200 and content is not None:
+                elapsed = time.time() - start
+                current_app.logger.info(f"AI API response time: {elapsed:.2f}s")
+                self._store_in_cache(cache_key, content)
+                return content
+            else:
+                # Error in API response
+                # If asking about Exaado official page
+                low_content = " ".join([m.get("content", "") for m in messages]).lower()
+                if "صفحة" in low_content and "اكسادوا" in low_content and any(
+                        k in low_content for k in ("رسميه", "رسمية", "عنوان", "رابط")):
+                    return {"role": "assistant", "content": "صفحة اكسادوا الرسمية متاحة على الرابط: https://exaado.com"}
+                return {
+                    "role": "assistant",
+                    "content": "عذرًا، لم أتمكن من العثور على إجابة دقيقة. للحصول على مساعدة في اكسادوا، يمكنك زيارة https://exaado.com أو التواصل مع فريق الدعم."
+                }
+
+        except asyncio.TimeoutError:
+            current_app.logger.error(f"DeepSeek API timeout after {api_timeout}s")
+            # Timeout case with question about official link
+            low_content = " ".join([m.get("content", "") for m in messages]).lower()
+            if "صفحة" in low_content and "اكسادوا" in low_content and any(
+                    k in low_content for k in ("رسميه", "رسمية", "عنوان", "رابط")):
+                return {"role": "assistant", "content": "صفحة اكسادوا الرسمية متاحة على الرابط: https://exaado.com"}
+            return {"role": "assistant",
+                    "content": "استغرق الرد وقتًا طويلاً. يمكنك زيارة موقع اكسادوا مباشرة على https://exaado.com."}
+
+        except Exception as e:
+            current_app.logger.error(f"Error connecting to DeepSeek API: {e}")
+            # Try to handle common errors
+            if "صفحة" in " ".join([m.get("content", "") for m in messages]).lower() and "اكسادوا" in " ".join(
+                    [m.get("content", "") for m in messages]).lower():
+                return {"role": "assistant", "content": "صفحة اكسادوا الرسمية متاحة على الرابط: https://exaado.com"}
+            return {"role": "assistant",
+                    "content": "حدث خطأ أثناء الاتصال بخدمة الذكاء الاصطناعي. يمكنك زيارة موقع اكسادوا مباشرة على https://exaado.com."}

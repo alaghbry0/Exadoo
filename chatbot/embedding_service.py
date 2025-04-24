@@ -9,7 +9,7 @@ from quart import current_app
 # from functools import lru_cache # lru_cache غير متوافق مع async
 from async_lru import alru_cache
 from typing import List, Optional
-
+import logging
 
 
 
@@ -25,7 +25,7 @@ class ImprovedEmbeddingService:
 
         # يمكنك جعل حجم الدفعة قابلاً للتكوين
         self.batch_size = 64 # حجم الدفعة الداخلية لـ sentence-transformer (اضبطه بناءً على ذاكرة GPU/CPU)
-        current_app.logger.info(f"EmbeddingService will use device: {self.device}")
+        logging.getLogger(__name__).info(f"EmbeddingService will use device: {self.device}")
 
     async def initialize(self):
         """Initializes the SentenceTransformer model."""

@@ -3,36 +3,52 @@ import re
 import asyncio
 from urllib.parse import urlparse
 import time
-import json
 from typing import List, Dict, Any, Optional, Tuple
-from quart import current_app # تأكد من وجود هذا الاستيراد
-from collections import defaultdict # لاستخدامها في RRF لاحقاً
-import numpy as np # لاستخدامها في RRF
+from collections import defaultdict
+import logging
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# تهيئة المقسم (يمكنك تعديل chunk_size و chunk_overlap حسب الحاجة)
-# استخدم فواصل مناسبة للغة العربية إذا لزم الأمر
+# تهيئة Logger لهذا الملف
+logger = logging.getLogger(__name__)
+
+# تهيئة المقسم النصي
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
     chunk_overlap=50,
     length_function=len,
-    is_separator_regex=False,
-    # يمكنك إضافة فواصل أكثر تحديدًا هنا separators=["\n\n", "\n", " ", ""]
+    is_separator_regex=False
 )
 
-def split_text_into_chunks_langchain(text: str) -> List[str]:
-    """يقسم النص باستخدام Langchain RecursiveCharacterTextSplitter."""
-    if not text:
-        return []
-    # يقوم Langchain بتقسيم النص إلى كائنات Document، نحن نريد النصوص فقط
-    # documents = text_splitter.create_documents([text]) # طريقة بديلة
-    # return [doc.page_content for doc in documents]
-    return text_splitter.split_text(text)
 
 class KnowledgeBase:
+    def __init__(self, app=None):
+        self.app = None
+        self.logger = logging.getLogger(__name__)
+        self.db_pool = None
+        self.embedding_service = None
+        self.ai_service = None
 
-    @staticmethod
-    async def search(query: str, limit: int = 5, k_rrf: int = 60, debug=False):
+        if app:
+            self.init_app(app)
+
+    def init_app(self, app):
+        """تهيئة مع التطبيق"""
+        try:
+            self.app = app
+            self.db_pool = app.db_pool
+            self.embedding_service = app.embedding_service
+            # تأكد من تعيين ai_service بشكل صحيح
+            if hasattr(app, 'ai_service'):
+                self.ai_service = app.ai_service
+            elif hasattr(app, 'ai_manager'):
+                self.ai_service = app.ai_manager
+            self.logger.info("✅ KnowledgeBase initialized with app context")
+        except AttributeError as e:
+            self.logger.critical(f"Failed to initialize KnowledgeBase: {str(e)}")
+            raise
+
+
+    async def search(self, query: str, limit: int = 5, k_rrf: int = 60, debug=False):
         """
         Performs hybrid search using Vector (Chunks), Text (FTS+Snippets+Tags),
         and URL search, then merges results using Reciprocal Rank Fusion (RRF).
@@ -40,26 +56,26 @@ class KnowledgeBase:
         start_time = time.time()
 
         # 1. Optimize Query
-        optimized_query, keywords_list = await KnowledgeBase.optimize_search_query(query)
+        optimized_query, keywords_list = await self.optimize_search_query(query)
         if debug:
-            current_app.logger.info(f"Original query: {query}")
-            current_app.logger.info(f"Optimized query for search: {optimized_query}")
-            current_app.logger.info(f"Keywords for tag/text search: {keywords_list}")
+            self.logger.info(f"Original query: {query}")
+            self.logger.info(f"Optimized query for search: {optimized_query}")
+            self.logger.info(f"Keywords for tag/text search: {keywords_list}")
 
         q = optimized_query
         if not q: return []
 
         # 2. Extract URLs
-        urls = KnowledgeBase._extract_urls(query)
+        urls = self._extract_urls(query)
         has_url = len(urls) > 0
 
         # 3. Execute Searches in Parallel
         search_tasks = [
-            KnowledgeBase._vector_search(q, limit * 3),  # جلب نتائج أكثر للدمج
-            KnowledgeBase._text_search(q, keywords_list, limit * 3),  # جلب نتائج أكثر للدمج
+            self._vector_search(q, limit * 3),  # جلب نتائج أكثر للدمج
+            self._text_search(q, keywords_list, limit * 3),  # جلب نتائج أكثر للدمج
         ]
         if has_url:
-            search_tasks.append(KnowledgeBase._url_search(urls, limit))
+            search_tasks.append(self._url_search(urls, limit))
 
         results_lists = await asyncio.gather(*search_tasks)
         vector_results = results_lists[0]
@@ -67,9 +83,9 @@ class KnowledgeBase:
         url_results = results_lists[2] if has_url else []
 
         if debug:
-            current_app.logger.info(f"Vector search raw results: {len(vector_results)}")
-            current_app.logger.info(f"Text search raw results: {len(text_results)}")
-            current_app.logger.info(f"URL search raw results: {len(url_results)}")
+            self.logger.info(f"Vector search raw results: {len(vector_results)}")
+            self.logger.info(f"Text search raw results: {len(text_results)}")
+            self.logger.info(f"URL search raw results: {len(url_results)}")
 
         # 4. Apply Reciprocal Rank Fusion (RRF)
         rrf_scores = defaultdict(float)
@@ -141,14 +157,12 @@ class KnowledgeBase:
 
         if debug:
             end_time = time.time()
-            current_app.logger.info(f"Hybrid search with RRF completed in {end_time - start_time:.3f} seconds")
-            current_app.logger.info(f"Returning {len(final_results)} results after RRF merging.")
-            # current_app.logger.info(f"Final RRF results: {final_results}")
+            self.logger.info(f"Hybrid search with RRF completed in {end_time - start_time:.3f} seconds")
+            self.logger.info(f"Returning {len(final_results)} results after RRF merging.")
 
         return final_results
 
-    @staticmethod
-    async def optimize_search_query(user_query: str) -> Tuple[str, List[str]]: # تغيير نوع الإرجاع
+    async def optimize_search_query(self, user_query: str) -> Tuple[str, List[str]]:
         """
         Optimize search query using Chat Prefix Completion.
         Extracts keywords, cleans them, and returns both a space-separated
@@ -158,14 +172,11 @@ class KnowledgeBase:
             return user_query, []
 
         try:
-            ai_manager = current_app.ai_service
-            if not ai_manager:
-                current_app.logger.warning("AI service manager not available")
-                return user_query, []
-
-            deepseek_service = ai_manager.models.get("deepseek")
+            # تعديل هنا: التعامل مع ai_service مباشرة بدلاً من محاولة الوصول إلى models
+            # يبدو أن self.ai_service هو فعلاً كائن DeepSeekService وليس AIModelManager
+            deepseek_service = self.ai_service
             if not deepseek_service or not hasattr(deepseek_service, 'get_chat_prefix_completion'):
-                current_app.logger.warning("DeepSeek service or prefix completion not available")
+                self.logger.warning("DeepSeek service or prefix completion not available")
                 return user_query, []
 
             messages_for_prefix = [
@@ -216,21 +227,20 @@ class KnowledgeBase:
                 return user_query, []
 
         except Exception as e:
-            current_app.logger.error(f"Error optimizing search query: {str(e)}")
+            self.logger.error(f"Error optimizing search query: {str(e)}")
             import traceback
-            current_app.logger.error(traceback.format_exc())
+            self.logger.error(traceback.format_exc())
             return user_query, []
 
-    @staticmethod
-    async def _vector_search(query: str, limit: int):
+    async def _vector_search(self, query: str, limit: int):
         """
         Perform vector-based semantic search on content chunks.
         Returns relevant chunks along with parent document info.
         """
         if not query: return []
         try:
-            query_embedding = await current_app.embedding_service.get_embedding(query)
-            async with current_app.db_pool.acquire() as conn:
+            query_embedding = await self.embedding_service.get_embedding(query)
+            async with self.db_pool.acquire() as conn:
                 # البحث في جدول الأجزاء knowledge_chunks
                 # والانضمام إلى knowledge_base لجلب العنوان والمعلومات الأخرى
                 # استخدام البحث التقريبي الأقرب (ANN) باستخدام <->
@@ -275,14 +285,12 @@ class KnowledgeBase:
                 return final_vector_results
 
         except Exception as e:
-            current_app.logger.error(f"Error in vector chunk search: {str(e)}")
+            self.logger.error(f"Error in vector chunk search: {str(e)}")
             import traceback
-            current_app.logger.error(traceback.format_exc())
+            self.logger.error(traceback.format_exc())
             return []
 
-
-    @staticmethod
-    async def _text_search(query: str, keywords: List[str], limit: int):
+    async def _text_search(self, query: str, keywords: List[str], limit: int):
         """
         Perform enhanced text-based search using FTS, snippets, and tag matching.
         Uses pre-calculated tsvector columns and ts_headline.
@@ -306,7 +314,7 @@ class KnowledgeBase:
             if not tags_array:
                 tags_array = ["___NO_VALID_KEYWORDS___"]  # قيمة غير محتملة
 
-            async with current_app.db_pool.acquire() as conn:
+            async with self.db_pool.acquire() as conn:
                 # استخدام الأعمدة المفهرسة title_tsv, content_tsv
                 # استخدام ts_headline لاستخراج المقتطفات من content
                 # استخدام ts_rank لتقييم الصلة
@@ -353,13 +361,12 @@ class KnowledgeBase:
                 # إرجاع id المستند الأصلي (kb_id) لتتوافق مع مخرجات vector_search
                 return [{"kb_id": r["id"], **dict(r)} for r in rows]  # إضافة kb_id
         except Exception as e:
-            current_app.logger.error(f"Error in text search: {str(e)}")
+            self.logger.error(f"Error in text search: {str(e)}")
             import traceback
-            current_app.logger.error(traceback.format_exc())
+            self.logger.error(traceback.format_exc())
             return []
 
-    @staticmethod
-    async def _url_search(urls, limit):
+    async def _url_search(self, urls, limit):
         """Search for content containing specific URLs"""
         if not urls:
             return []
@@ -373,12 +380,24 @@ class KnowledgeBase:
                     WHERE {where_clauses}
                     LIMIT ${len(url_patterns) + 1}
                 """
-            async with current_app.db_pool.acquire() as conn:
+            async with self.db_pool.acquire() as conn:
                 rows = await conn.fetch(query, *url_patterns, limit)
                 return [dict(r) for r in rows]
         except Exception as e:
-            current_app.logger.error(f"Error in URL search: {str(e)}")
+            self.logger.error(f"Error in URL search: {str(e)}")
             return []
+
+
+
+    @staticmethod
+    def _extract_urls(text: str) -> List[str]:
+        """Extract URLs from text"""
+        return re.findall(r"https?://[\w./-]+", text)
+
+
+
+
+
 
     @staticmethod
     async def add_item(title: str, content: str, category: Optional[str] = None, tags: Optional[List[str]] = None):
@@ -635,12 +654,6 @@ class KnowledgeBase:
 
         return results
 
-    @staticmethod
-    def _extract_urls(text):
-        """Extract URLs from text"""
-        if not text: return []
-        url_pattern = r'https?://[^\s]+'
-        return re.findall(url_pattern, text)
 
     @staticmethod
     def _preprocess_query(q):
@@ -832,8 +845,11 @@ class KnowledgeBase:
             f"Finished rebuild_embeddings. Processed {total_kb_items_processed}/{total_kb_items} KB items, generated and inserted {total_chunks_processed} chunks in {total_time:.2f} seconds.")
         return total_chunks_processed
 
-    @staticmethod
-    def _sanitize_input(text):
-        if not text:
-            return text
-        return re.sub(r"[\'\"\\;]", "", text)
+knowledge_base = KnowledgeBase()
+
+
+def split_text_into_chunks_langchain(text: str) -> List[str]:
+    """يقسم النص باستخدام Langchain RecursiveCharacterTextSplitter."""
+    if not text:
+        return []
+    return text_splitter.split_text(text)

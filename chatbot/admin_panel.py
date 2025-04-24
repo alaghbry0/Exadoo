@@ -61,7 +61,7 @@ async def get_settings():
                     'temperature': 0.1,
                     'max_tokens': 500,
 
-                    'faq_questions': []  # قائمة الأسئلة الشائعة افتراضيًا فارغة
+                    'faq_questions': []  
                 })
 
     except Exception as e:
@@ -107,7 +107,7 @@ async def update_settings():
 
             temperature,
             max_tokens,
-            json.dumps(faq_questions)  # تأكد من استيراد json أعلى الملف
+            json.dumps(faq_questions) 
         )
     return jsonify({'status': 'success'})
 

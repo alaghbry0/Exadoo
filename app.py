@@ -1,6 +1,7 @@
 import asyncpg
 import logging
 import os
+
 import asyncio
 import hypercorn.config
 import hypercorn.asyncio
@@ -8,7 +9,7 @@ import aiohttp
 from pgvector.asyncpg import register_vector
 from quart import Quart
 from quart_cors import cors
-from chatbot.ai_service import AIModelManager
+from chatbot.ai_service import DeepSeekService
 from config import DATABASE_CONFIG
 from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
@@ -23,6 +24,8 @@ from routes.payment_confirmation import payment_confirmation_bp
 from routes.auth_routes import auth_routes
 from telegram_bot import start_bot, bot, telegram_bot_bp
 from chatbot.chatbot import chatbot_bp
+from chatbot.knowledge_base import knowledge_base
+from chatbot.chat_manager import ChatManager
 from chatbot.embedding_service import ImprovedEmbeddingService
 from chatbot.admin_panel import admin_chatbot_bp
 from utils.scheduler import start_scheduler
@@ -47,13 +50,15 @@ app.db_pool = None
 app.aiohttp_session = None
 app.bot = None
 app.bot_running = False
-
+logging.basicConfig(level=logging.INFO)
 # هنا نسجل خدمة الذكاء الاصطناعي
 
-app.ai_service = AIModelManager()
 
-
+app.chat_manager = ChatManager(app)
+app.kb           = knowledge_base
 app = cors(app, allow_origin="*")
+
+
 
 # تسجيل Blueprints
 app.register_blueprint(notifications_bp, url_prefix="/api")
@@ -101,10 +106,26 @@ async def initialize_app():
         app.aiohttp_session = aiohttp.ClientSession()
         logging.info("✅ aiohttp session initialized")
 
+
+
+        # حقن chat_manager من جديد
+        app.chat_manager.init_app(app)
+
+        # حقن ai_service داخل الـ KB
+        app.ai_service = DeepSeekService()
+
+        knowledge_base.ai_service = app.ai_service
+
+        # 1. تهيئة الخدمة التضمينية أولاً
         app.embedding_service = ImprovedEmbeddingService()
         await app.embedding_service.initialize()
         logging.info("✅ Embedding service initialized")
 
+        # 2. تهيئة KnowledgeBase بعد ضمان وجود الخدمة التضمينية
+        knowledge_base.init_app(app)
+        logging.info("✅ KnowledgeBase initialized")
+
+        # 3. تهيئة باقي المكونات
         logging.info("🔄 Starting Telegram bot and scheduler...")
         app.bot = bot
 
