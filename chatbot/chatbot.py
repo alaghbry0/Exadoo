@@ -12,10 +12,14 @@ HISTORY_LIMIT = 10
 CACHE_TTL = 300  # ثواني
 MAX_KNOWLEDGE_ITEMS = 5
 
-@chatbot_bp.route('/chat/stream', methods=['POST'])
+@chatbot_bp.route('/chat/stream', methods=['POST', 'OPTIONS'])
 async def chat_stream():
     """Stream response from AI service to the client using SSE"""
+    if request.method == 'OPTIONS':
+        # عودة مع رؤوس CORS فقط
+        return '', 200, _sse_headers()
     try:
+        
         data = await request.get_json()
         if not data:
             return _error_event('Invalid data'), 400, _sse_headers()
@@ -137,7 +141,10 @@ def _sse_headers():
     return {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type'
     }
 
 
