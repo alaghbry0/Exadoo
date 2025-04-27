@@ -83,7 +83,7 @@ class DeepSeekService:
             payload["kv_cache_id"] = settings.get("kv_cache_id")
 
         # 5. Setup connection timeout
-        api_timeout = 60  # Longer timeout for streaming responses
+        api_timeout = 120  # Longer timeout for streaming responses
         start = time.time()
 
         try:

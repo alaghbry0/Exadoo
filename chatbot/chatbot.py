@@ -1,5 +1,5 @@
 # chatbot.py
-from quart import Blueprint, request, current_app
+from quart import Blueprint, request, current_app, jsonify
 import asyncio
 import uuid
 import re
@@ -513,24 +513,47 @@ async def get_welcome_message():
     """إرسال الرسالة الترحيبية والأسئلة الشائعة عند فتح الدردشة"""
     try:
         start_time = time.time()
-        bot_settings = await _get_bot_settings()
+        # جلب أحدث إعدادات البوت مباشرة من قاعدة البيانات
+        async with current_app.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                  welcome_message,
+                  faq_questions
+                FROM bot_settings
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
 
+        if row:
+            welcome_message = row['welcome_message']
+            faq_questions = row['faq_questions']
+        else:
+            # قيم افتراضية في حال عدم وجود سجل
+            welcome_message = 'مرحباً بك! كيف يمكنني مساعدتك اليوم؟'
+            faq_questions = [
+                'كيف يمكنني تتبع حالة طلبي؟',
+                'ما هي طرق الدفع المتاحة؟',
+                'كيفية إرجاع منتج؟',
+                'ما هي مدة التوصيل المتوقعة؟'
+            ]
+
+        # تحضير الاستجابة
         response = {
-            'welcome_message': bot_settings['welcome_message'],
-            'faq_questions': bot_settings['faq_questions']
+            'welcome_message': welcome_message,
+            'faq_questions': faq_questions
         }
 
-        # قياس الأداء (اختياري)
+        # قياس الأداء (عند تفعيل الـ debug)
         if current_app.debug:
-            end_time = time.time()
-            response['debug'] = {
-                'execution_time_ms': round((end_time - start_time) * 1000, 2)
-            }
+            elapsed_ms = round((time.time() - start_time) * 1000, 2)
+            response['debug'] = {'execution_time_ms': elapsed_ms}
 
         return jsonify(response)
 
     except Exception as e:
-        current_app.logger.error(f"خطأ في استرجاع الترحيب: {str(e)}")
+        current_app.logger.error(f"خطأ في استرجاع الترحيب: {e}")
         return jsonify({'error': 'حدث خطأ أثناء جلب البيانات الترحيبية'}), 500
 
 
