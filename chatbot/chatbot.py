@@ -12,6 +12,7 @@ HISTORY_LIMIT = 10
 CACHE_TTL = 300  # ثواني
 MAX_KNOWLEDGE_ITEMS = 5
 
+
 @chatbot_bp.route('/chat/stream', methods=['POST', 'OPTIONS'])
 async def chat_stream():
     """Stream response from AI service to the client using SSE"""
@@ -19,26 +20,26 @@ async def chat_stream():
         # عودة مع رؤوس CORS فقط
         return '', 200, _sse_headers()
     try:
-        
+
         data = await request.get_json()
         if not data:
             return _error_event('Invalid data'), 400, _sse_headers()
 
         # Extract & sanitize
         user_message = data.get('message')
-        session_id   = _sanitize_input(data.get('session_id', str(uuid.uuid4())))
-        user_id      = _sanitize_input(data.get('user_id', 'anonymous'))
+        session_id = _sanitize_input(data.get('session_id', str(uuid.uuid4())))
+        user_id = _sanitize_input(data.get('user_id', 'anonymous'))
         search_limit = data.get('search_limit', MAX_KNOWLEDGE_ITEMS)
-        debug_mode   = data.get('debug', False)
+        debug_mode = data.get('debug', False)
 
         if not user_message or not isinstance(user_message, str):
             return _error_event('Valid message is required'), 400, _sse_headers()
         user_message = _sanitize_input(user_message)
 
         # injected services
-        ai_service   = current_app.ai_service
+        ai_service = current_app.ai_service
         chat_manager = current_app.chat_manager
-        kb           = current_app.kb
+        kb = current_app.kb
 
         async def stream_response():
             start_time = time.time()
@@ -46,7 +47,7 @@ async def chat_stream():
             bot_settings = await _get_bot_settings()
 
             # parallel tasks: search & history
-            knowledge_task    = asyncio.create_task(
+            knowledge_task = asyncio.create_task(
                 kb.search(user_message, limit=search_limit, debug=debug_mode)
             )
             conversation_task = asyncio.create_task(
@@ -56,7 +57,34 @@ async def chat_stream():
                 knowledge_task, conversation_task
             )
 
-            history     = conversation_data.get('history', [])
+            history = conversation_data.get('history', [])
+
+            valid_history = []
+            for msg in history:
+                if isinstance(msg, dict) and 'role' in msg and 'content' in msg:
+                    valid_history.append({
+                        'role': str(msg['role']),
+                        'content': str(msg['content'])
+                    })
+                else:
+                    current_app.logger.warning(f"Invalid message format in history: {msg}")
+
+            # الحصول على الإعدادات
+            system_prompt = bot_settings.get('system_instructions', '')
+            context = "\n\n".join(
+                f"### Source {i + 1}: {item['title']}\n{item['snippet'][:500]}..."
+                for i, item in enumerate(relevant_knowledge)
+            ) if relevant_knowledge else ""
+
+            # بناء الرسائل بشكل صحيح
+            messages = [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'system', 'content': f"Use the following information:\n---\n{context}\n---"}
+            ]
+            messages.extend(valid_history)
+            messages.append({'role': 'user', 'content': user_message})
+
+
             kv_cache_id = conversation_data.get('kv_cache_id')
 
             # debug info
@@ -74,36 +102,22 @@ async def chat_stream():
                 yield f"event: end\ndata: {json.dumps({'session_id': session_id})}\n\n"
                 return
 
-            # build messages
-            system_prompt = bot_settings.get('system_instructions', '')
-            messages = [{'role': 'system', 'content': system_prompt}]
-
-            context = "\n\n".join(
-                f"### Source {i+1}: {item['title']}\n{item['snippet'][:500]}..."
-                for i, item in enumerate(relevant_knowledge)
-            )
-            messages.append({
-                'role': 'system',
-                'content': f"Use the following information:\n---\n{context}\n---"
-            })
-            messages.extend(history)
-            messages.append({'role': 'user', 'content': user_message})
-
             tools = _define_tools()
             full_resp = ''
 
-            # stream AI chunks
+            # Pass chat_manager in settings
             async for chunk in ai_service.stream_response(
-                messages=messages,
-                settings={
-                    'temperature':      bot_settings.get('temperature', 0.1),
-                    'max_tokens':       bot_settings.get('max_tokens', 500),
-                    'session_id':       session_id,
-                    'kv_cache_id':      kv_cache_id,
-                    'tools':            tools,
-                    'reasoning_enabled':bot_settings.get('reasoning_enabled', False),
-                    'reasoning_steps':  bot_settings.get('reasoning_steps', 3)
-                }
+                    messages=messages,
+                    settings={
+                        'temperature': bot_settings.get('temperature', 0.1),
+                        'max_tokens': bot_settings.get('max_tokens', 500),
+                        'session_id': session_id,
+                        'kv_cache_id': kv_cache_id,
+                        'tools': tools,
+                        'reasoning_enabled': bot_settings.get('reasoning_enabled', False),
+                        'reasoning_steps': bot_settings.get('reasoning_steps', 3),
+                        'chat_manager': chat_manager  # Add chat_manager reference here
+                    }
             ):
                 if chunk.get('content'):
                     full_resp += chunk['content']
@@ -134,8 +148,6 @@ async def chat_stream():
         current_app.logger.error(f"Error in chat_stream: {e}", exc_info=True)
         return _error_event(str(e)), 500, _sse_headers()
 
-
-# Helpers
 
 def _sse_headers():
     return {
@@ -239,22 +251,8 @@ async def _execute_tool_call(function_name: str, args: dict, session_id: str) ->
         return {'error':str(e)}
 
 async def _get_bot_settings() -> dict:
-    """Retrieve bot settings with caching, safe outside app context"""
     default_settings = {
-        'name': 'دعم عملاء اكسادوا',
-        'system_instructions': """أنت مساعد دعم العملاء لشركة اكسادوا. اتبع هذه الإرشادات:
-    1. استخدم المعلومات المقدمة فقط مع الإشارة للمصادر
-    2. قدم إجابات مختصرة ومركزة
-    3. استخدم تنسيق Markdown للتنظيم
-    4. عند عدم التأكد، اطلب توضيحاً أو صعد إلى الدعم البشري""",
-        'welcome_message': 'مرحباً بك! كيف يمكنني مساعدتك اليوم؟',
-        'faq_questions': [
-            "كيف يمكنني تتبع حالة طلبي؟",
-            "ما هي طرق الدفع المتاحة؟",
-            "كيفية إرجاع منتج؟",
-            "ما هي مدة التوصيل المتوقعة؟"
-        ],
-        'fallback_message': 'آسف، لا يمكنني الإجابة على هذا السؤال. هل يمكنني مساعدتك بشيء آخر؟',
+        'system_instructions': """أنت مساعد دعم العملاء لشركة اكسادوا. اتبع هذه الإرشادات...""",
         'temperature': 0.1,
         'max_tokens': 500,
         'reasoning_enabled': True,
@@ -269,7 +267,13 @@ async def _get_bot_settings() -> dict:
                 return cached
         # fetch from DB
         async with app.db_pool.acquire() as conn:
-            row = await conn.fetchrow('SELECT * FROM bot_settings ORDER BY id DESC LIMIT 1')
+            row = await conn.fetchrow('''
+                SELECT system_instructions, temperature, 
+                       max_tokens, reasoning_enabled, reasoning_steps
+                FROM bot_settings 
+                ORDER BY id DESC LIMIT 1
+            ''')
+
         if not row:
             app.bot_settings_cache = (default_settings, time.time())
             return default_settings

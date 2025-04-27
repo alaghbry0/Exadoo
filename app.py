@@ -1,7 +1,8 @@
+#app.py
+
 import asyncpg
 import logging
 import os
-
 import asyncio
 import hypercorn.config
 import hypercorn.asyncio
@@ -58,7 +59,10 @@ app.chat_manager = ChatManager(app)
 app.kb           = knowledge_base
 app = cors(app, allow_origin="*")
 
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # تسجيل Blueprints
 app.register_blueprint(notifications_bp, url_prefix="/api")
@@ -106,24 +110,22 @@ async def initialize_app():
         app.aiohttp_session = aiohttp.ClientSession()
         logging.info("✅ aiohttp session initialized")
 
-
-
-        # حقن chat_manager من جديد
-        app.chat_manager.init_app(app)
-
-        # حقن ai_service داخل الـ KB
+        logging.info("🔄 Initializing AI service...")
         app.ai_service = DeepSeekService()
-
-        knowledge_base.ai_service = app.ai_service
+        logging.info("✅ AI service initialized")
 
         # 1. تهيئة الخدمة التضمينية أولاً
+        logging.info("🔄 Initializing Embedding service...")
         app.embedding_service = ImprovedEmbeddingService()
         await app.embedding_service.initialize()
         logging.info("✅ Embedding service initialized")
 
-        # 2. تهيئة KnowledgeBase بعد ضمان وجود الخدمة التضمينية
+        # 2. تهيئة KnowledgeBase بعد وجود embedding_service
         knowledge_base.init_app(app)
         logging.info("✅ KnowledgeBase initialized")
+
+        # 3. تهيئة ChatManager
+        app.chat_manager.init_app(app)
 
         # 3. تهيئة باقي المكونات
         logging.info("🔄 Starting Telegram bot and scheduler...")
@@ -163,7 +165,17 @@ async def close_resources():
 # تشغيل التهيئة قبل البدء في استقبال الطلبات
 @app.before_serving
 async def setup():
-    await initialize_app()
+    try:
+        await initialize_app()
+        # التحقق من التهيئة النهائية
+        logging.info("Final initialization check:")
+        logging.info(f"AI Service initialized: {hasattr(app, 'ai_service')}")
+        logging.info(f"Embedding Service: {hasattr(app, 'embedding_service')}")
+        logging.info(f"KnowledgeBase AI ref: {knowledge_base.ai_service is not None}")
+        logging.info(f"ChatManager initialized: {app.chat_manager is not None}")
+    except Exception as e:
+        logging.critical(f"Initialization failed: {e}")
+        raise
 
 # نقطة فحص صحية
 @app.route("/")

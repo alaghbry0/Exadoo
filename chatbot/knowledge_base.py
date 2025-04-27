@@ -21,29 +21,35 @@ text_splitter = RecursiveCharacterTextSplitter(
 
 
 class KnowledgeBase:
+    # في knowledge_base.py
     def __init__(self, app=None):
         self.app = None
         self.logger = logging.getLogger(__name__)
         self.db_pool = None
         self.embedding_service = None
-        self.ai_service = None
+        self.ai_service = None  # إضافة قيمة افتراضية
 
         if app:
             self.init_app(app)
 
     def init_app(self, app):
-        """تهيئة مع التطبيق"""
         try:
             self.app = app
             self.db_pool = app.db_pool
+
+            # التحقق من وجود embedding_service
+            if not hasattr(app, 'embedding_service'):
+                raise AttributeError("app has no attribute 'embedding_service'")
             self.embedding_service = app.embedding_service
-            # تأكد من تعيين ai_service بشكل صحيح
+
+            # التحقق من وجود ai_service
             if hasattr(app, 'ai_service'):
                 self.ai_service = app.ai_service
-            elif hasattr(app, 'ai_manager'):
-                self.ai_service = app.ai_manager
+            else:
+                self.logger.warning("No ai_service found in app!")
+
             self.logger.info("✅ KnowledgeBase initialized with app context")
-        except AttributeError as e:
+        except Exception as e:
             self.logger.critical(f"Failed to initialize KnowledgeBase: {str(e)}")
             raise
 
@@ -167,10 +173,12 @@ class KnowledgeBase:
             return user_query, []
 
         try:
-            deepseek_service = self.ai_service
-            if not deepseek_service or not hasattr(deepseek_service, 'get_chat_prefix_completion'):
+            # تأكد من وجود خدمة AI قبل المتابعة
+            if not self.ai_service or not hasattr(self.ai_service, 'get_chat_prefix_completion'):
                 self.logger.warning("DeepSeek service or prefix completion not available")
                 return user_query, []
+
+            deepseek_service = self.ai_service
 
             messages_for_prefix = [
                 {"role": "user",
@@ -219,10 +227,15 @@ class KnowledgeBase:
             else:
                 return user_query, []
 
+
         except Exception as e:
+
             self.logger.error(f"Error optimizing search query: {str(e)}")
+
             import traceback
+
             self.logger.error(traceback.format_exc())
+
             return user_query, []
 
     async def _vector_search(self, query: str, limit: int):

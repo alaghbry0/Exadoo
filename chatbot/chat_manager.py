@@ -112,11 +112,13 @@ class ChatManager:
                 knowledge_ids = []
 
             # Ensure tool_calls is properly handled
-            tool_calls_jsonb = tool_calls
-            if isinstance(bot_response, dict):
-                if "tool_calls" in bot_response and not tool_calls:
-                    tool_calls_jsonb = bot_response["tool_calls"]
-                bot_response = bot_response.get("content", "")
+            if tool_calls is not None:
+                if isinstance(tool_calls, list):
+                    tool_calls_jsonb = json.dumps(tool_calls)  # تحويل القائمة إلى نص JSON
+                else:
+                    tool_calls_jsonb = tool_calls
+            else:
+                tool_calls_jsonb = None
 
             async with self.db_pool.acquire() as conn:
                 row = await conn.fetchrow(

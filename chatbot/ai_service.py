@@ -1,25 +1,22 @@
-# ai_service.py
+# ai_service.py - Modified version
 import aiohttp
 import os
 import json
-from quart import current_app, Response
 import time
 import asyncio
-import numpy as np
-import re
+import logging
 from typing import Dict, Any, List, Optional
-
 
 class DeepSeekService:
     def __init__(self):
         self.api_key = os.getenv("DEEPSEEK_API_KEY", "")
-        # يمكن الاحتفاظ بالـ URL الأساسي لـ v1 هنا
         self.api_url = "https://api.deepseek.com/v1/chat/completions"
-        # URL خاص بالبيتا لميزة إكمال البادئة
         self.api_url_beta = "https://api.deepseek.com/beta/chat/completions"
         self.default_model = "deepseek-chat"
         self.cache = {}
         self.cache_ttl = 3600
+        # Create a dedicated logger for this class
+        self.logger = logging.getLogger(__name__)
 
     async def stream_response(self, messages: List[Dict[str, str]], settings: dict = None):
         """
@@ -28,7 +25,7 @@ class DeepSeekService:
         # 1. Get API key
         api_key = self.api_key
         if not api_key:
-            current_app.logger.error("DeepSeek API key not available")
+            self.logger.error("DeepSeek API key not available")
             yield {"role": "assistant", "content": "عذرًا، لا يمكن الاتصال بخدمة الذكاء الاصطناعي حاليًا."}
             return
 
@@ -44,7 +41,7 @@ class DeepSeekService:
         # 3. Check for excessive length in messages
         total_length = sum(len(msg.get("content", "")) for msg in messages)
         if total_length > 32000:  # Typical context window limit
-            current_app.logger.info("Total messages too large, trimming")
+            self.logger.info("Total messages too large, trimming")
             # Trim user messages while preserving system messages
             system_messages = [m for m in messages if m.get("role") == "system"]
             user_assistant_messages = [m for m in messages if m.get("role") != "system"]
@@ -97,7 +94,7 @@ class DeepSeekService:
                 ) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
-                        current_app.logger.error(f"DeepSeek API error: {resp.status} – {error_text}")
+                        self.logger.error(f"DeepSeek API error: {resp.status} – {error_text}")
                         yield {"role": "assistant", "content": "عذرًا، حدث خطأ في الاتصال بالخدمة."}
                         return
 
@@ -182,28 +179,36 @@ class DeepSeekService:
                                 # Save KV cache ID if present
                                 if "kv_cache_id" in data and settings.get("session_id"):
                                     try:
-                                        from chatbot.chat_manager import ChatManager
-                                        chat_manager = ChatManager()
-                                        await chat_manager.update_kv_cache(settings.get("session_id"),
-                                                                           data["kv_cache_id"])
+                                        # Get chat_manager from settings instead of importing
+                                        chat_manager = settings.get("chat_manager")
+                                        if chat_manager:
+                                            await chat_manager.update_kv_cache(settings.get("session_id"),
+                                                                         data["kv_cache_id"])
                                     except Exception as e:
-                                        current_app.logger.error(f"Error updating KV cache: {str(e)}")
+                                        self.logger.error(f"Error updating KV cache: {str(e)}")
 
                             except json.JSONDecodeError as e:
-                                current_app.logger.error(f"Failed to parse SSE data: {e}")
+                                self.logger.error(f"Failed to parse SSE data: {e}")
                                 continue
 
                     # Send any remaining tool calls
                     if tool_calls_buffer:
                         yield {"tool_calls": tool_calls_buffer}
+                        tool_calls_buffer = []
+                        current_tool_call = None
+                        in_tool_call = False
+
+                    # التأكد من إرسال أي بيانات متبقية
+                    if tool_calls_buffer:
+                        yield {"tool_calls": tool_calls_buffer}
 
         except asyncio.TimeoutError:
-            current_app.logger.error(f"DeepSeek API streaming timeout after {api_timeout}s")
+            self.logger.error(f"DeepSeek API streaming timeout after {api_timeout}s")
             yield {
                 "content": "استغرق الرد وقتًا طويلاً. يمكنك إعادة المحاولة أو زيارة موقع اكسادوا مباشرة على https://exaado.com."}
 
         except Exception as e:
-            current_app.logger.error(f"Error in streaming response: {str(e)}", exc_info=True)
+            self.logger.error(f"Error in streaming response: {str(e)}", exc_info=True)
             yield {"content": "حدث خطأ أثناء معالجة الطلب. يرجى المحاولة مرة أخرى."}
 
     async def get_chat_prefix_completion(self, messages: List[Dict[str, Any]], settings: Optional[Dict] = None) -> \
@@ -212,30 +217,23 @@ class DeepSeekService:
         Get a completion using Chat Prefix Completion (Beta).
         Follows the Chat Completion API structure.
         """
-        import logging
-        logger = logging.getLogger(__name__)
-
         if not settings:
             settings = {}
 
         # 1. Get API key
         api_key = self.api_key
         if not api_key:
-            logger.error("DeepSeek API key not available for prefix completion")
+            self.logger.error("DeepSeek API key not available for prefix completion")
             return None
 
         # 2. Validate input 'messages' based on documentation
         if not messages or not isinstance(messages, list):
-            current_app.logger.error("Invalid 'messages' format for prefix completion.")
+            self.logger.error("Invalid 'messages' format for prefix completion.")
             return None
+
         last_message = messages[-1]
         if last_message.get("role") != "assistant" or not last_message.get("prefix"):
-            current_app.logger.error("Last message must be 'assistant' role with 'prefix: True' for prefix completion.")
-            # يمكنك محاولة تصحيحها تلقائياً أو إرجاع خطأ
-            # للتصحيح التلقائي:
-            # last_message['role'] = 'assistant'
-            # last_message['prefix'] = True
-            # ولكن الأفضل أن يتم تمريرها بشكل صحيح من البداية
+            self.logger.error("Last message must be 'assistant' role with 'prefix: True' for prefix completion.")
             return None
 
         # 3. Prepare headers and payload
@@ -246,10 +244,9 @@ class DeepSeekService:
 
         payload = {
             "model": settings.get("model", self.default_model),
-            "messages": messages,  # استخدام قائمة الرسائل مباشرة
+            "messages": messages,
             "temperature": settings.get("temperature", 0.1),
             "max_tokens": settings.get("max_tokens", 100),
-            # أضف 'stop' إذا كانت موجودة في settings
         }
         if "stop" in settings:
             payload["stop"] = settings.get("stop")
@@ -260,56 +257,49 @@ class DeepSeekService:
 
         # 5. Define API call function (using Beta URL)
         async def call_beta_api(session):
-            # استخدم self.api_url_beta هنا
             async with session.post(
-                    self.api_url_beta,  # <-- URL البيتا
+                    self.api_url_beta,
                     headers=headers,
                     json=payload,
                     timeout=api_timeout
             ) as resp:
                 text = await resp.text()
                 if resp.status != 200:
-                    current_app.logger.error(f"DeepSeek Beta API error: {resp.status} – {text}")
+                    self.logger.error(f"DeepSeek Beta API error: {resp.status} – {text}")
                     return None, resp.status, text
                 try:
                     data = await resp.json()
-                    # التحقق من وجود المفاتيح قبل الوصول إليها
                     if "choices" in data and data["choices"] and "message" in data["choices"][0]:
                         assistant_message = data["choices"][0]["message"]
                         return assistant_message, 200, None
                     else:
-                        current_app.logger.error(f"Unexpected response structure from Beta API: {data}")
+                        self.logger.error(f"Unexpected response structure from Beta API: {data}")
                         return None, resp.status, "Unexpected response structure"
                 except json.JSONDecodeError:
-                    current_app.logger.error(f"Failed to decode JSON from Beta API: {text}")
+                    self.logger.error(f"Failed to decode JSON from Beta API: {text}")
                     return None, resp.status, "Invalid JSON response"
 
         # 6. Execute API call
         try:
-            session = getattr(current_app, "aiohttp_session", None)
-            if session:
-                content, status, err = await call_beta_api(session)
-            else:
-                async with aiohttp.ClientSession() as temp_sess:
-                    content, status, err = await call_beta_api(temp_sess)
+            async with aiohttp.ClientSession() as temp_sess:
+                content, status, err = await call_beta_api(temp_sess)
 
             # 7. Handle response
             if status == 200 and content is not None:
                 elapsed = time.time() - start
-                current_app.logger.info(f"AI Beta API response time: {elapsed:.2f}s")
-                # لا حاجة للكاش هنا عادةً لإكمال البادئة، أو يمكن إضافته إذا لزم الأمر
-                return content  # إرجاع رسالة المساعد المكتملة (قاموس)
+                self.logger.info(f"AI Beta API response time: {elapsed:.2f}s")
+                return content
             else:
-                current_app.logger.error(f"Failed to get prefix completion. Status: {status}, Error: {err}")
+                self.logger.error(f"Failed to get prefix completion. Status: {status}, Error: {err}")
                 return None
 
         except asyncio.TimeoutError:
-            current_app.logger.error(f"DeepSeek Beta API timeout after {api_timeout}s")
+            self.logger.error(f"DeepSeek Beta API timeout after {api_timeout}s")
             return None
         except Exception as e:
-            current_app.logger.error(f"Error connecting to DeepSeek Beta API: {e}")
+            self.logger.error(f"Error connecting to DeepSeek Beta API: {e}")
             import traceback
-            current_app.logger.error(traceback.format_exc())
+            self.logger.error(traceback.format_exc())
             return None
 
     def _generate_cache_key(self, messages, temperature, max_tokens, model):
