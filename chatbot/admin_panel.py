@@ -100,33 +100,35 @@ async def update_settings():
     temperature = data.get('temperature', 0.1)
     max_tokens = data.get('max_tokens', 500)
 
-
-    # قراءة قائمة الأسئلة الشائعة وإجبارها على أن تكون قائمة
+    # معالجة faq_questions إذا كانت سلسلة
     faq_questions = data.get('faq_questions', [])
+    
+    if isinstance(faq_questions, str):
+        try:
+            faq_questions = json.loads(faq_questions.replace("'", "\""))  # إصلاح للعلامات
+        except json.JSONDecodeError:
+            return jsonify({'error': 'تنسيق الأسئلة الشائعة غير صحيح'}), 400
+
     if not isinstance(faq_questions, list):
-        return jsonify({'error': 'الحقل faq_questions يجب أن يكون قائمة'}), 400
+        return jsonify({'error': 'يجب أن تكون الأسئلة الشائعة في شكل قائمة'}), 400
 
     async with current_app.db_pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO bot_settings 
             (name, system_instructions, welcome_message, 
-             fallback_message,  temperature, max_tokens, faq_questions)
+             fallback_message, temperature, max_tokens, faq_questions)
             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
             """,
             data['name'],
             data['system_instructions'],
             data['welcome_message'],
             data['fallback_message'],
-
-
-
             temperature,
             max_tokens,
-            json.dumps(faq_questions) 
+            json.dumps(faq_questions)
         )
     return jsonify({'status': 'success'})
-
 
 @admin_chatbot_bp.route('/knowledge', methods=['GET'])
 @role_required("admin")
