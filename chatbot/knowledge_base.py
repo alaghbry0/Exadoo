@@ -163,17 +163,10 @@ class KnowledgeBase:
         return final_results
 
     async def optimize_search_query(self, user_query: str) -> Tuple[str, List[str]]:
-        """
-        Optimize search query using Chat Prefix Completion.
-        Extracts keywords, cleans them, and returns both a space-separated
-        query string and a list of unique keywords.
-        """
         if not user_query or len(user_query.strip()) < 3:
             return user_query, []
 
         try:
-            # تعديل هنا: التعامل مع ai_service مباشرة بدلاً من محاولة الوصول إلى models
-            # يبدو أن self.ai_service هو فعلاً كائن DeepSeekService وليس AIModelManager
             deepseek_service = self.ai_service
             if not deepseek_service or not hasattr(deepseek_service, 'get_chat_prefix_completion'):
                 self.logger.warning("DeepSeek service or prefix completion not available")

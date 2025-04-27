@@ -107,6 +107,11 @@ class ChatManager:
         Returns the conversation record ID.
         """
         try:
+            # Convert knowledge_ids to a list if it's not
+            if knowledge_ids is None:
+                knowledge_ids = []
+
+            # Ensure tool_calls is properly handled
             tool_calls_jsonb = tool_calls
             if isinstance(bot_response, dict):
                 if "tool_calls" in bot_response and not tool_calls:

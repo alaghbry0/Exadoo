@@ -212,13 +212,16 @@ class DeepSeekService:
         Get a completion using Chat Prefix Completion (Beta).
         Follows the Chat Completion API structure.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         if not settings:
             settings = {}
 
         # 1. Get API key
-        api_key = self.api_key  # افترض أن هذه الدالة موجودة وتعمل
+        api_key = self.api_key
         if not api_key:
-            current_app.logger.error("DeepSeek API key not available for prefix completion")
+            logger.error("DeepSeek API key not available for prefix completion")
             return None
 
         # 2. Validate input 'messages' based on documentation
