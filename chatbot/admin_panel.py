@@ -46,26 +46,42 @@ async def get_settings():
     """الحصول على إعدادات البوت الحالية"""
     try:
         async with current_app.db_pool.acquire() as conn:
-            row = await conn.fetchrow('SELECT * FROM bot_settings ORDER BY id DESC LIMIT 1')
+            row = await conn.fetchrow(
+                """
+                SELECT
+                  name,
+                  system_instructions,
+                  welcome_message,
+                  fallback_message,
+                  temperature,
+                  max_tokens,
+                  faq_questions,
+                  response_template
+                FROM bot_settings
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
 
-            if row:
-                # تحويل النتيجة إلى dict وإرجاعها بشكل JSON
-                return jsonify(dict(row))
-            else:
-                # القيم الافتراضية إذا لم توجد إعدادات محفوظة
-                return jsonify({
-                    'name': 'دعم عملاء اكسادوا',
-                    'system_instructions': 'أنت مساعد دعم العملاء لشركة اكسادوا. {context}',
-                    'welcome_message': 'مرحباً بك! كيف يمكنني مساعدتك اليوم؟',
-                    'fallback_message': 'آسف، لا يمكنني الإجابة على هذا السؤال. هل يمكنني مساعدتك بشيء آخر؟',
-                    'temperature': 0.1,
-                    'max_tokens': 500,
+        if row:
+            settings = dict(row)
+        else:
+            # قيم افتراضية إذا لم توجد إعدادات
+            settings = {
+                'name': 'دعم عملاء اكسادوا',
+                'system_instructions': 'أنت مساعد دعم العملاء لشركة اكسادوا. {context}',
+                'welcome_message': 'مرحباً بك! كيف يمكنني مساعدتك اليوم؟',
+                'fallback_message': 'آسف، لا يمكنني الإجابة على هذا السؤال. هل يمكنني مساعدتك بشيء آخر؟',
+                'temperature': 0.1,
+                'max_tokens': 500,
+                'faq_questions': [],
+                'response_template': ''
+            }
 
-                    'faq_questions': []  
-                })
+        return jsonify(settings)
 
     except Exception as e:
-        current_app.logger.error(f"خطأ في الحصول على إعدادات البوت: {str(e)}")
+        current_app.logger.error(f"خطأ في الحصول على إعدادات البوت: {e}")
         return jsonify({'error': 'حدث خطأ أثناء استرجاع الإعدادات'}), 500
 
 
