@@ -885,3 +885,76 @@ async def update_wallet_address():
                 wallet_address, api_key
             )
     return jsonify({"message": "تم تحديث البيانات بنجاح"}), 200
+
+
+@admin_routes.route("/admin/reminder-settings", methods=["GET"])
+@role_required("admin")
+async def get_reminder_settings():
+    """الحصول على إعدادات التذكير الحالية"""
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            settings = await connection.fetchrow(
+                "SELECT first_reminder, second_reminder FROM reminder_settings LIMIT 1"
+            )
+
+            if not settings:
+                return jsonify({"error": "الإعدادات غير موجودة"}), 404
+
+            return jsonify({
+                "first_reminder": settings["first_reminder"],
+                "second_reminder": settings["second_reminder"]
+            }), 200
+
+    except Exception as e:
+        logging.error(f"Error getting reminder settings: {str(e)}")
+        return jsonify({"error": "حدث خطأ أثناء جلب الإعدادات"}), 500
+
+
+@admin_routes.route("/reminder-settings", methods=["POST"])
+@role_required("admin")
+async def update_reminder_settings():
+    """تحديث إعدادات التذكير"""
+    try:
+        data = await request.get_json()
+        first_reminder = data.get("first_reminder")
+        second_reminder = data.get("second_reminder")
+
+        # التحقق من صحة البيانات
+        if None in (first_reminder, second_reminder):
+            return jsonify({"error": "جميع الحقول مطلوبة"}), 400
+
+        try:
+            first_reminder = int(first_reminder)
+            second_reminder = int(second_reminder)
+        except ValueError:
+            return jsonify({"error": "القيم يجب أن تكون أرقام صحيحة"}), 400
+
+        async with current_app.db_pool.acquire() as connection:
+            # التحقق من وجود إعدادات سابقة
+            existing_settings = await connection.fetchrow(
+                "SELECT id FROM reminder_settings LIMIT 1"
+            )
+
+            if existing_settings:
+                await connection.execute(
+                    """UPDATE reminder_settings 
+                    SET first_reminder = $1, second_reminder = $2 
+                    WHERE id = $3""",
+                    first_reminder, second_reminder, existing_settings["id"]
+                )
+                action = "تم التحديث"
+            else:
+                await connection.execute(
+                    """INSERT INTO reminder_settings 
+                    (first_reminder, second_reminder) 
+                    VALUES ($1, $2)""",
+                    first_reminder, second_reminder
+                )
+                action = "تم الإضافة"
+
+            logging.info(f"✅ {action} لإعدادات التذكير: {first_reminder}h, {second_reminder}h")
+            return jsonify({"message": f"{action} بنجاح"}), 200
+
+    except Exception as e:
+        logging.error(f"Error updating reminder settings: {str(e)}")
+        return jsonify({"error": "حدث خطأ أثناء تحديث الإعدادات"}), 500

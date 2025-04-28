@@ -167,9 +167,21 @@ async def subscribe():
             invite_link = channel_result.get("invite_link")
 
             # Schedule reminders
+            reminder_settings = await connection.fetchrow(
+                "SELECT first_reminder, second_reminder FROM reminder_settings LIMIT 1"
+            )
+            if not reminder_settings:
+                logging.error("❌ No reminder settings found, using default values")
+                first_reminder_hours = 24
+                second_reminder_hours = 1
+            else:
+                first_reminder_hours = reminder_settings["first_reminder"]
+                second_reminder_hours = reminder_settings["second_reminder"]
+
+            # 2) جدول التذكيرات:
             reminders = [
-                ("first_reminder", new_expiry - timedelta(minutes=30 if IS_DEVELOPMENT else 1440)),
-                ("second_reminder", new_expiry - timedelta(minutes=15 if IS_DEVELOPMENT else 60)),
+                ("first_reminder", new_expiry - timedelta(hours=first_reminder_hours)),
+                ("second_reminder", new_expiry - timedelta(hours=second_reminder_hours)),
                 ("remove_user", new_expiry),
             ]
             for task_type, execute_time in reminders:
