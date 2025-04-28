@@ -910,51 +910,71 @@ async def get_reminder_settings():
         return jsonify({"error": "حدث خطأ أثناء جلب الإعدادات"}), 500
 
 
-@admin_routes.route("/reminder-settings", methods=["POST"])
+@admin_routes.route("/admin/reminder-settings", methods=["PUT"])
 @role_required("admin")
 async def update_reminder_settings():
-    """تحديث إعدادات التذكير"""
+    """تحديث إعدادات التذكير باستخدام PUT"""
     try:
         data = await request.get_json()
         first_reminder = data.get("first_reminder")
         second_reminder = data.get("second_reminder")
 
-        # التحقق من صحة البيانات
-        if None in (first_reminder, second_reminder):
-            return jsonify({"error": "جميع الحقول مطلوبة"}), 400
+        # التحقق من وجود جميع الحقول المطلوبة
+        if first_reminder is None or second_reminder is None:
+            logging.error("❌ بيانات ناقصة في الطلب")
+            return jsonify({"error": "جميع الحقول مطلوبة (first_reminder, second_reminder)"}), 400
 
+        # التحقق من صحة نوع البيانات
         try:
             first_reminder = int(first_reminder)
             second_reminder = int(second_reminder)
-        except ValueError:
-            return jsonify({"error": "القيم يجب أن تكون أرقام صحيحة"}), 400
+        except (ValueError, TypeError):
+            logging.error(f"❌ قيم غير صحيحة: first={first_reminder}, second={second_reminder}")
+            return jsonify({"error": "يجب أن تكون القيم أرقامًا صحيحة موجبة"}), 400
+
+        # التحقق من القيم الموجبة
+        if first_reminder <= 0 or second_reminder <= 0:
+            logging.error(f"❌ قيم غير صالحة: first={first_reminder}, second={second_reminder}")
+            return jsonify({"error": "يجب أن تكون القيم أكبر من الصفر"}), 400
 
         async with current_app.db_pool.acquire() as connection:
-            # التحقق من وجود إعدادات سابقة
+            # الحصول على الإعدادات الحالية
             existing_settings = await connection.fetchrow(
                 "SELECT id FROM reminder_settings LIMIT 1"
             )
 
             if existing_settings:
+                # تحديث الإعدادات الحالية
                 await connection.execute(
                     """UPDATE reminder_settings 
                     SET first_reminder = $1, second_reminder = $2 
                     WHERE id = $3""",
                     first_reminder, second_reminder, existing_settings["id"]
                 )
-                action = "تم التحديث"
+                action_type = "update"
+                log_msg = f"🔄 تم تحديث إعدادات التذكير: {first_reminder}h, {second_reminder}h"
             else:
+                # إضافة إعدادات جديدة إذا لم تكن موجودة
                 await connection.execute(
                     """INSERT INTO reminder_settings 
                     (first_reminder, second_reminder) 
                     VALUES ($1, $2)""",
                     first_reminder, second_reminder
                 )
-                action = "تم الإضافة"
+                action_type = "create"
+                log_msg = f"✅ تم إضافة إعدادات التذكير: {first_reminder}h, {second_reminder}h"
 
-            logging.info(f"✅ {action} لإعدادات التذكير: {first_reminder}h, {second_reminder}h")
-            return jsonify({"message": f"{action} بنجاح"}), 200
+            logging.info(log_msg)
+            return jsonify({
+                "message": "تم حفظ الإعدادات بنجاح",
+                "action": action_type,
+                "first_reminder": first_reminder,
+                "second_reminder": second_reminder
+            }), 200
 
     except Exception as e:
-        logging.error(f"Error updating reminder settings: {str(e)}")
-        return jsonify({"error": "حدث خطأ أثناء تحديث الإعدادات"}), 500
+        logging.error(f"❌ خطأ فادح في تحديث الإعدادات: {str(e)}", exc_info=True)
+        return jsonify({
+            "error": "حدث خطأ داخلي أثناء معالجة الطلب",
+            "details": str(e)
+        }), 500
