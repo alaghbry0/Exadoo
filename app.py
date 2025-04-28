@@ -111,7 +111,7 @@ async def initialize_app():
         logging.info("✅ aiohttp session initialized")
 
         logging.info("🔄 Initializing AI service...")
-        app.ai_service = DeepSeekService()
+        app.ai_service = DeepSeekService(app)
         logging.info("✅ AI service initialized")
 
         # 1. تهيئة الخدمة التضمينية أولاً

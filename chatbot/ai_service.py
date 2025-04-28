@@ -1,29 +1,76 @@
 # ai_service.py - Modified version
 import aiohttp
-import os
 import json
 import time
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 
+
 class DeepSeekService:
-    def __init__(self):
-        self.api_key = os.getenv("DEEPSEEK_API_KEY", "")
+    """
+    Service for interacting with DeepSeek AI via streaming and prefix completions.
+    Requires initialization with Quart app to inject db_pool and logger.
+    """
+    def __init__(self, app=None):
+        # DB pool and logger will be set in init_app;
+        # provide a fallback logger until then.
+        self.db_pool = None
+        self.logger = logging.getLogger(__name__)
+
+        # DeepSeek endpoints and defaults
         self.api_url = "https://api.deepseek.com/v1/chat/completions"
         self.api_url_beta = "https://api.deepseek.com/beta/chat/completions"
         self.default_model = "deepseek-chat"
-        self.cache = {}
-        self.cache_ttl = 3600
-        # Create a dedicated logger for this class
-        self.logger = logging.getLogger(__name__)
+
+        # API key caching mechanism
+        self._api_key_cache = {"api_key": None, "timestamp": 0.0}
+        self.API_KEY_CACHE_TTL = 300  # 5 دقائق
+
+        if app:
+            self.init_app(app)
+
+    def init_app(self, app) -> None:
+        """Initialize service with application dependencies."""
+        self.db_pool = app.db_pool
+        self.logger = app.logger or self.logger
+
+    async def get_deepseek_api_key(self) -> Optional[str]:
+        """Retrieve API key from database, with simple TTL caching."""
+        now = time.time()
+        # Reload key if TTL expired or not yet fetched
+        if (self._api_key_cache["api_key"] is None or
+                now - self._api_key_cache["timestamp"] > self.API_KEY_CACHE_TTL):
+            if not self.db_pool:
+                self.logger.error("Database pool not initialized")
+                return None
+
+            try:
+                async with self.db_pool.acquire() as conn:
+                    record = await conn.fetchrow(
+                        "SELECT api_key FROM wallet ORDER BY id DESC LIMIT 1"
+                    )
+                if not record or not record.get('api_key'):
+                    self.logger.error("No API key found in database")
+                    return None
+
+                # Update cache
+                self._api_key_cache['api_key'] = record['api_key']
+                self._api_key_cache['timestamp'] = now
+                self.logger.info("API key updated from database")
+
+            except Exception as e:
+                self.logger.error(f"Error retrieving API key: {e}")
+                return None
+
+        return self._api_key_cache['api_key']
 
     async def stream_response(self, messages: List[Dict[str, str]], settings: dict = None):
         """
         Stream a response from DeepSeek API with Server-Sent Events (SSE)
         """
-        # 1. Get API key
-        api_key = self.api_key
+        # 1. Get API key from database
+        api_key = await self.get_deepseek_api_key()
         if not api_key:
             self.logger.error("DeepSeek API key not available")
             yield {"role": "assistant", "content": "عذرًا، لا يمكن الاتصال بخدمة الذكاء الاصطناعي حاليًا."}
@@ -168,7 +215,7 @@ class DeepSeekService:
                                                 # Add function arguments
                                                 if 'arguments' in tool_call_delta['function']:
                                                     current_tool_call['function']['arguments'] += \
-                                                    tool_call_delta['function']['arguments']
+                                                        tool_call_delta['function']['arguments']
 
                                     # If this is a new turn (delta has only role), yield any complete tool call
                                     if 'role' in delta and len(delta) == 1 and in_tool_call:
@@ -183,7 +230,7 @@ class DeepSeekService:
                                         chat_manager = settings.get("chat_manager")
                                         if chat_manager:
                                             await chat_manager.update_kv_cache(settings.get("session_id"),
-                                                                         data["kv_cache_id"])
+                                                                               data["kv_cache_id"])
                                     except Exception as e:
                                         self.logger.error(f"Error updating KV cache: {str(e)}")
 
@@ -211,17 +258,10 @@ class DeepSeekService:
             self.logger.error(f"Error in streaming response: {str(e)}", exc_info=True)
             yield {"content": "حدث خطأ أثناء معالجة الطلب. يرجى المحاولة مرة أخرى."}
 
-    async def get_chat_prefix_completion(self, messages: List[Dict[str, Any]], settings: Optional[Dict] = None) -> \
-    Optional[Dict[str, Any]]:
-        """
-        Get a completion using Chat Prefix Completion (Beta).
-        Follows the Chat Completion API structure.
-        """
-        if not settings:
-            settings = {}
-
-        # 1. Get API key
-        api_key = self.api_key
+    async def get_chat_prefix_completion(self, messages: List[Dict[str, Any]], settings: Optional[Dict] = None) -> Optional[Dict[str, Any]]:
+        """Get completion using Chat Prefix Completion (Beta)"""
+        # 1. Get API key from database
+        api_key = await self.get_deepseek_api_key()
         if not api_key:
             self.logger.error("DeepSeek API key not available for prefix completion")
             return None
@@ -301,101 +341,6 @@ class DeepSeekService:
             import traceback
             self.logger.error(traceback.format_exc())
             return None
-
-    def _generate_cache_key(self, messages, temperature, max_tokens, model):
-        """Create a cache key from messages and settings"""
-        # Create a simplified version of messages for caching
-        simplified_messages = []
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            # Only include the first 100 chars of content for the key
-            simplified_msg = f"{role}:{content[:100]}"
-            simplified_messages.append(simplified_msg)
-
-        # Join all messages with a delimiter
-        message_str = "|||".join(simplified_messages)
-        message_hash = str(hash(message_str))
-
-        return f"{message_hash}_{temperature}_{max_tokens}_{model}"
-
-    def _store_in_cache(self, key, response):
-        """Store response in cache"""
-        self.cache[key] = {
-            'response': response,
-            'timestamp': time.time()
-        }
-
-        # Clean old items from cache
-        self._clean_cache()
-
-    def _get_from_cache(self, key):
-        """Retrieve response from cache if exists and valid"""
-        if key in self.cache:
-            cache_item = self.cache[key]
-            current_time = time.time()
-
-            # Check item validity
-            if current_time - cache_item['timestamp'] < self.cache_ttl:
-                return cache_item['response']
-            else:
-                # Remove expired item
-                del self.cache[key]
-
-        return None
-
-    def _clean_cache(self):
-        """Clean cache of old items"""
-        current_time = time.time()
-        keys_to_remove = []
-
-        for key, item in self.cache.items():
-            if current_time - item['timestamp'] >= self.cache_ttl:
-                keys_to_remove.append(key)
-
-        for key in keys_to_remove:
-            del self.cache[key]
-
-        # If cache is too large, remove oldest items
-        max_cache_size = 1000  # Maximum number of items in cache
-        if len(self.cache) > max_cache_size:
-            # Sort items by time and remove oldest
-            sorted_items = sorted(self.cache.items(), key=lambda x: x[1]['timestamp'])
-            items_to_remove = len(self.cache) - max_cache_size
-
-            for i in range(items_to_remove):
-                del self.cache[sorted_items[i][0]]
-
-# في ai_service.py
-_api_key_cache = {
-    "api_key": None,
-    "timestamp": 0.0
-}
-API_KEY_CACHE_TTL = 300  # 5 دقائق
-
-
-async def get_deepseek_api_key() -> Optional[str]:
-    global _api_key_cache
-    now = asyncio.get_event_loop().time()
-
-    # إذا انتهت مدة التخزين المؤقت أو لا يوجد مفتاح
-    if _api_key_cache["api_key"] is None or now - _api_key_cache["timestamp"] > API_KEY_CACHE_TTL:
-        async with current_app.db_pool.acquire() as connection:
-            try:
-                record = await connection.fetchrow(
-                    "SELECT api_key FROM wallet ORDER BY id DESC LIMIT 1"
-                )
-                if not record or not record['api_key']:
-                    current_app.logger.error("❌ لا يوجد API Key مسجل في جدول المحفظة")
-                    return None
-
-                _api_key_cache["api_key"] = record['api_key']
-                _api_key_cache["timestamp"] = now
-                current_app.logger.info("تم تحديث API Key من قاعدة البيانات")
-            except Exception as e:
-                current_app.logger.error(f"خطأ في استرجاع API Key: {str(e)}")
-                return None
-    return _api_key_cache["api_key"]
 
 class AIModelManager:
     """إدارة نماذج الذكاء الاصطناعي المتعددة"""
@@ -563,3 +508,68 @@ class AIModelManager:
                 return {"role": "assistant", "content": "صفحة اكسادوا الرسمية متاحة على الرابط: https://exaado.com"}
             return {"role": "assistant",
                     "content": "حدث خطأ أثناء الاتصال بخدمة الذكاء الاصطناعي. يمكنك زيارة موقع اكسادوا مباشرة على https://exaado.com."}
+
+
+    def _get_from_cache(self, key):
+        """Retrieve response from cache if exists and valid"""
+        if key in self.cache:
+            cache_item = self.cache[key]
+            current_time = time.time()
+
+            # Check item validity
+            if current_time - cache_item['timestamp'] < self.cache_ttl:
+                return cache_item['response']
+            else:
+                # Remove expired item
+                del self.cache[key]
+
+        return None
+
+    def _store_in_cache(self, key, response):
+        """Store response in cache"""
+        self.cache[key] = {
+            'response': response,
+            'timestamp': time.time()
+        }
+
+        # Clean old items from cache
+        self._clean_cache()
+
+        def _generate_cache_key(self, messages, temperature, max_tokens, model):
+            """Create a cache key from messages and settings"""
+            # Create a simplified version of messages for caching
+            simplified_messages = []
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                # Only include the first 100 chars of content for the key
+                simplified_msg = f"{role}:{content[:100]}"
+                simplified_messages.append(simplified_msg)
+
+            # Join all messages with a delimiter
+            message_str = "|||".join(simplified_messages)
+            message_hash = str(hash(message_str))
+
+            return f"{message_hash}_{temperature}_{max_tokens}_{model}"
+
+        def _clean_cache(self):
+            """Clean cache of old items"""
+            current_time = time.time()
+            keys_to_remove = []
+
+            for key, item in self.cache.items():
+                if current_time - item['timestamp'] >= self.cache_ttl:
+                    keys_to_remove.append(key)
+
+            for key in keys_to_remove:
+                del self.cache[key]
+
+            # If cache is too large, remove oldest items
+            max_cache_size = 1000  # Maximum number of items in cache
+            if len(self.cache) > max_cache_size:
+                # Sort items by time and remove oldest
+                sorted_items = sorted(self.cache.items(), key=lambda x: x[1]['timestamp'])
+                items_to_remove = len(self.cache) - max_cache_size
+
+                for i in range(items_to_remove):
+                    del self.cache[sorted_items[i][0]]

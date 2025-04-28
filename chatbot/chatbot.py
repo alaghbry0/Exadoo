@@ -302,6 +302,10 @@ async def _get_bot_settings() -> dict:
 URL_PATTERN = re.compile(r'https?://\S+')
 
 
+
+URL_PATTERN = re.compile(r'https?://\S+')
+
+
 def _prepare_prompt(user_message, knowledge_items, conversation_history, settings):
     """تحضير المطلب للبوت مع تحسينات الأداء والدقة والهيكلة الجديدة"""
     # ترتيب العناصر حسب الأهمية مع مراعاة الروابط

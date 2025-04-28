@@ -85,6 +85,17 @@ async def get_settings():
         return jsonify({'error': 'حدث خطأ أثناء استرجاع الإعدادات'}), 500
 
 
+DEFAULT_RESPONSE_TEMPLATE = (
+    "{system_instructions}\n\n"
+    "--- السياق ---\n"
+    "{context}\n\n"
+    "--- سجل المحادثة ---\n"
+    "{conversation_history}\n\n"
+    "--- السؤال ---\n"
+    "{user_message}\n\n"
+    "--- الإجابة ---"
+)
+
 @admin_chatbot_bp.route('/settings', methods=['POST'])
 @role_required("admin")
 async def update_settings():
@@ -102,23 +113,37 @@ async def update_settings():
 
     # معالجة faq_questions إذا كانت سلسلة
     faq_questions = data.get('faq_questions', [])
-    
     if isinstance(faq_questions, str):
         try:
-            faq_questions = json.loads(faq_questions.replace("'", "\""))  # إصلاح للعلامات
+            faq_questions = json.loads(faq_questions.replace("'", "\""))
         except json.JSONDecodeError:
             return jsonify({'error': 'تنسيق الأسئلة الشائعة غير صحيح'}), 400
-
     if not isinstance(faq_questions, list):
         return jsonify({'error': 'يجب أن تكون الأسئلة الشائعة في شكل قائمة'}), 400
 
+    # معالجة response_template
+    rt_input = data.get('response_template', None)
     async with current_app.db_pool.acquire() as conn:
+        # إذا طُلب عدم التعديل ("none") أو لم يُرسَل الحقل، نأخذ القيمة الحالية
+        if rt_input is None or (isinstance(rt_input, str) and rt_input.lower() == 'none'):
+            row = await conn.fetchrow(
+                "SELECT response_template FROM bot_settings ORDER BY created_at DESC LIMIT 1"
+            )
+            if row and row['response_template']:
+                response_template = row['response_template']
+            else:
+                response_template = DEFAULT_RESPONSE_TEMPLATE
+        else:
+            # استخدام القيمة المرسلة مباشرة
+            response_template = rt_input
+
+        # الآن ندرج السجل الجديد مع response_template
         await conn.execute(
             """
             INSERT INTO bot_settings 
             (name, system_instructions, welcome_message, 
-             fallback_message, temperature, max_tokens, faq_questions)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+             fallback_message, temperature, max_tokens, faq_questions, response_template)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
             """,
             data['name'],
             data['system_instructions'],
@@ -126,8 +151,10 @@ async def update_settings():
             data['fallback_message'],
             temperature,
             max_tokens,
-            json.dumps(faq_questions)
+            json.dumps(faq_questions),
+            response_template
         )
+
     return jsonify({'status': 'success'})
 
 @admin_chatbot_bp.route('/knowledge', methods=['GET'])
