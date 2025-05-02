@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from dotenv import load_dotenv
 from quart import Blueprint, current_app  # ✅ استيراد `Blueprint` لاستخدامه في `app.py`
-from database.db_queries import get_subscription
+from database.db_queries import get_subscription, add_user
 from quart import current_app
 
 
@@ -52,29 +52,39 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from aiogram import Bot, Dispatcher, types
 import logging
 
+# داخل دالة start_command:
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
-    """✅ إرسال زر فتح التطبيق المصغر عند استخدام /start (مبسط)"""
-    user_id = message.from_user.id
-    full_name = message.from_user.full_name or "مستخدم عزيز"
+    user = message.from_user
+    user_id = user.id
+    username = user.username or None
+    full_name = user.full_name or None
 
-    # ✅ لوحة مفاتيح مبسطة بزر واحد فقط (فتح التطبيق المصغر)
+    # ─── تسجيل أو تحديث بيانات المستخدم في جدول users ───
+    try:
+        async with current_app.db_pool.acquire() as conn:
+            await add_user(
+                connection=conn,
+                telegram_id=user_id,
+                username=username,
+                full_name=full_name
+            )
+            logging.info(f"✅ تم تسجيل/تحديث المستخدم {user_id} في قاعدة البيانات")
+    except Exception as e:
+        logging.error(f"❌ فشل تسجيل المستخدم {user_id}: {e}")
+
+    # ─── بعد كده نعرض الزر والرسالة زي ما هي ───
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔹 فتح التطبيق", web_app=WebAppInfo(url=WEB_APP_URL))],
-        # ✅ تم حذف زر "فتح القناة" مؤقتًا للتبسيط
     ])
 
-    logging.info(f"✅ /start من المستخدم: {user_id}, Full Name: {full_name}")
-
     welcome_text = (
-        f"👋 مرحبًا {full_name}!\n\n"
+        f"👋 مرحبًا {full_name or 'مستخدم'}!\n\n"
         "مرحبًا بك في **@Exaado**  \n"
         "هنا يمكنك إدارة اشتراكاتك في قنواتنا بسهولة.\n\n"
         "نتمنى لك تجربة رائعة! 🚀"
     )
-
     await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
-
 
 # إضافة معالج لطلبات الانضمام
 @dp.chat_join_request()

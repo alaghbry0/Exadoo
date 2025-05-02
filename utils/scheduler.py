@@ -137,13 +137,27 @@ async def handle_reminder_task(connection, telegram_id: int, task_type: str, tas
             """, telegram_id, channel_id)
             return
 
+        # 🔹 جلب إعدادات الرسائل من قاعدة البيانات
+        reminder_settings = await connection.fetchrow(
+            "SELECT first_reminder_message, second_reminder_message FROM reminder_settings LIMIT 1"
+        )
+
+        if not reminder_settings:
+            logging.warning("⚠️ إعدادات التذكير غير موجودة. استخدام الرسائل الافتراضية.")
+            first_reminder_message = "📢 تنبيه: اشتراكك سينتهي في {expiry_date} بتوقيت الرياض. يرجى التجديد."
+            second_reminder_message = "⏳ تبقى {remaining_hours} ساعة على انتهاء اشتراكك. لا تنسَ التجديد!"
+        else:
+            first_reminder_message = reminder_settings["first_reminder_message"]
+            second_reminder_message = reminder_settings["second_reminder_message"]
+
         # 🔹 تجهيز رسالة التذكير
         if task_type == "first_reminder":
             local_expiry = expiry_date.astimezone(pytz.timezone("Asia/Riyadh"))  # تحويل التوقيت إلى UTC+3
-            message = f"📢 تنبيه: اشتراكك سينتهي في {local_expiry.strftime('%Y/%m/%d %H:%M:%S')} بتوقيت الرياض. يرجى التجديد."
+            formatted_date = local_expiry.strftime('%Y/%m/%d %H:%M:%S')
+            message = first_reminder_message.format(expiry_date=formatted_date)
         elif task_type == "second_reminder":
             remaining_hours = int((expiry_date - current_time).total_seconds() // 3600)
-            message = f"⏳ تبقى {remaining_hours} ساعة على انتهاء اشتراكك. لا تنسَ التجديد!"
+            message = second_reminder_message.format(remaining_hours=remaining_hours)
         else:
             logging.warning(f"⚠️ نوع تذكير غير معروف: {task_type}.")
             return
@@ -167,7 +181,29 @@ async def handle_reminder_task(connection, telegram_id: int, task_type: str, tas
     except Exception as e:
         logging.error(f"❌ خطأ أثناء إرسال التذكير للمستخدم {telegram_id}: {e}")
 
+#دالة مساعدة لتنسيق المدة الزمنية
+
+async def format_timedelta(delta: timedelta) -> str:
+    total_seconds = int(delta.total_seconds())
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days} يوم")
+    if hours > 0:
+        parts.append(f"{hours} ساعة")
+    if minutes > 0 and days == 0:  # لا نعرض الدقائق إذا كان هناك أيام
+        parts.append(f"{minutes} دقيقة")
+
+    if not parts:
+        return "أقل من دقيقة"
+
+    return " و".join(parts)
+
 # ----------------- 🔹 بدء الجدولة ----------------- #
+
 
 async def start_scheduler(connection):
 

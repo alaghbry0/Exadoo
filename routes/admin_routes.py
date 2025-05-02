@@ -894,7 +894,7 @@ async def get_reminder_settings():
     try:
         async with current_app.db_pool.acquire() as connection:
             settings = await connection.fetchrow(
-                "SELECT first_reminder, second_reminder FROM reminder_settings LIMIT 1"
+                "SELECT first_reminder, second_reminder, first_reminder_message, second_reminder_message FROM reminder_settings LIMIT 1"
             )
 
             if not settings:
@@ -902,7 +902,9 @@ async def get_reminder_settings():
 
             return jsonify({
                 "first_reminder": settings["first_reminder"],
-                "second_reminder": settings["second_reminder"]
+                "second_reminder": settings["second_reminder"],
+                "first_reminder_message": settings["first_reminder_message"],
+                "second_reminder_message": settings["second_reminder_message"]
             }), 200
 
     except Exception as e:
@@ -918,6 +920,8 @@ async def update_reminder_settings():
         data = await request.get_json()
         first_reminder = data.get("first_reminder")
         second_reminder = data.get("second_reminder")
+        first_reminder_message = data.get("first_reminder_message")
+        second_reminder_message = data.get("second_reminder_message")
 
         # التحقق من وجود جميع الحقول المطلوبة
         if first_reminder is None or second_reminder is None:
@@ -937,6 +941,11 @@ async def update_reminder_settings():
             logging.error(f"❌ قيم غير صالحة: first={first_reminder}, second={second_reminder}")
             return jsonify({"error": "يجب أن تكون القيم أكبر من الصفر"}), 400
 
+        # التحقق من وجود رسائل التذكير
+        if not first_reminder_message or not second_reminder_message:
+            logging.error("❌ رسائل التذكير مفقودة")
+            return jsonify({"error": "رسائل التذكير مطلوبة"}), 400
+
         async with current_app.db_pool.acquire() as connection:
             # الحصول على الإعدادات الحالية
             existing_settings = await connection.fetchrow(
@@ -947,9 +956,12 @@ async def update_reminder_settings():
                 # تحديث الإعدادات الحالية
                 await connection.execute(
                     """UPDATE reminder_settings 
-                    SET first_reminder = $1, second_reminder = $2 
-                    WHERE id = $3""",
-                    first_reminder, second_reminder, existing_settings["id"]
+                    SET first_reminder = $1, second_reminder = $2, 
+                    first_reminder_message = $3, second_reminder_message = $4
+                    WHERE id = $5""",
+                    first_reminder, second_reminder,
+                    first_reminder_message, second_reminder_message,
+                    existing_settings["id"]
                 )
                 action_type = "update"
                 log_msg = f"🔄 تم تحديث إعدادات التذكير: {first_reminder}h, {second_reminder}h"
@@ -957,9 +969,9 @@ async def update_reminder_settings():
                 # إضافة إعدادات جديدة إذا لم تكن موجودة
                 await connection.execute(
                     """INSERT INTO reminder_settings 
-                    (first_reminder, second_reminder) 
-                    VALUES ($1, $2)""",
-                    first_reminder, second_reminder
+                    (first_reminder, second_reminder, first_reminder_message, second_reminder_message) 
+                    VALUES ($1, $2, $3, $4)""",
+                    first_reminder, second_reminder, first_reminder_message, second_reminder_message
                 )
                 action_type = "create"
                 log_msg = f"✅ تم إضافة إعدادات التذكير: {first_reminder}h, {second_reminder}h"
@@ -969,7 +981,9 @@ async def update_reminder_settings():
                 "message": "تم حفظ الإعدادات بنجاح",
                 "action": action_type,
                 "first_reminder": first_reminder,
-                "second_reminder": second_reminder
+                "second_reminder": second_reminder,
+                "first_reminder_message": first_reminder_message,
+                "second_reminder_message": second_reminder_message
             }), 200
 
     except Exception as e:

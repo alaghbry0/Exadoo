@@ -1,10 +1,11 @@
-from aiogram import Bot
-bot = Bot(token="7942179576:AAF77Tfhb8pjevtf9Qd4bsju0h0gncZjSyI")
-import asyncio
-async def t():
-    try:
-        await bot.delete_webhook()
-        print("Webhook removed")
-    except Exception as e:
-        print("ERROR:", e)
-asyncio.run(t())
+import requests
+
+BOT_TOKEN = "7942179576:AAF77Tfhb8pjevtf9Qd4bsju0h0gncZjSyI"
+
+def handle_callback_queries():
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    response = requests.get(url).json()
+    for update in response.get('result', []):
+        if 'callback_query' in update:
+            user = update['callback_query']['from']
+            print(f"User ID: {user['id']}, Username: @{user.get('username', 'None')}")
