@@ -63,7 +63,7 @@ async def get_public_subscription_plans():
         async with current_app.db_pool.acquire() as connection:
             if subscription_type_id:
                 query = """
-                    SELECT id, subscription_type_id, name, price, telegram_stars_price, duration_days, is_active, created_at
+                    SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
                     FROM subscription_plans
                     WHERE subscription_type_id = $1 AND is_active = true
                     ORDER BY created_at DESC
@@ -71,7 +71,7 @@ async def get_public_subscription_plans():
                 results = await connection.fetch(query, int(subscription_type_id))
             else:
                 query = """
-                    SELECT id, subscription_type_id, name, price, telegram_stars_price, duration_days, is_active, created_at
+                    SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
                     FROM subscription_plans
                     WHERE is_active = true
                     ORDER BY created_at DESC
@@ -86,7 +86,6 @@ async def get_public_subscription_plans():
     except Exception as e:
         logging.error("Error fetching public subscription plans: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-    
 
 @public_routes.route("/payment-history", methods=["GET"])
 async def get_payment_history():

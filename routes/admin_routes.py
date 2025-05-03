@@ -287,7 +287,6 @@ async def get_subscription_type(type_id: int):
 # نقاط API لإدارة خطط الاشتراك (subscription_plans)
 #######################################
 
-# إضافة خطة اشتراك جديدة لنوع معين
 @admin_routes.route("/subscription-plans", methods=["POST"])
 @role_required("admin")  # ✅ استخدام @role_required("admin")
 async def create_subscription_plan():
@@ -296,6 +295,7 @@ async def create_subscription_plan():
         subscription_type_id = data.get("subscription_type_id")
         name = data.get("name")
         price = data.get("price")
+        original_price = data.get("original_price", price)  # إذا لم يتم توفير سعر أصلي، استخدم السعر العادي
         duration_days = data.get("duration_days")
         telegram_stars_price = data.get("telegram_stars_price", 0)
         is_active = data.get("is_active", True)
@@ -306,15 +306,16 @@ async def create_subscription_plan():
         async with current_app.db_pool.acquire() as connection:
             query = """
                 INSERT INTO subscription_plans
-                (subscription_type_id, name, price, telegram_stars_price, duration_days, is_active)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, subscription_type_id, name, price, telegram_stars_price, duration_days, is_active, created_at;
+                (subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at;
             """
             result = await connection.fetchrow(
                 query,
                 subscription_type_id,
                 name,
                 price,
+                original_price,
                 telegram_stars_price,
                 duration_days,
                 is_active
@@ -334,9 +335,22 @@ async def update_subscription_plan(plan_id: int):
         subscription_type_id = data.get("subscription_type_id")
         name = data.get("name")
         price = data.get("price")
+        original_price = data.get("original_price")
         duration_days = data.get("duration_days")
         telegram_stars_price = data.get("telegram_stars_price")
         is_active = data.get("is_active")
+
+        # إذا تم تعديل السعر ولم يتم تحديد سعر أصلي، اجعل السعر الأصلي هو نفس السعر الجديد
+        if price is not None and original_price is None:
+            async with current_app.db_pool.acquire() as connection:
+                # الحصول على السعر الأصلي الحالي
+                current_plan = await connection.fetchrow(
+                    "SELECT price, original_price FROM subscription_plans WHERE id = $1", plan_id
+                )
+
+                # التحقق مما إذا كان السعر الأصلي الحالي مساويًا للسعر الحالي
+                if current_plan and current_plan['price'] == current_plan['original_price']:
+                    original_price = price
 
         async with current_app.db_pool.acquire() as connection:
             query = """
@@ -344,17 +358,19 @@ async def update_subscription_plan(plan_id: int):
                 SET subscription_type_id = COALESCE($1, subscription_type_id),
                     name = COALESCE($2, name),
                     price = COALESCE($3, price),
-                    telegram_stars_price = COALESCE($4, telegram_stars_price),
-                    duration_days = COALESCE($5, duration_days),
-                    is_active = COALESCE($6, is_active)
-                WHERE id = $7
-                RETURNING id, subscription_type_id, name, price, telegram_stars_price, duration_days, is_active, created_at;
+                    original_price = COALESCE($4, original_price),
+                    telegram_stars_price = COALESCE($5, telegram_stars_price),
+                    duration_days = COALESCE($6, duration_days),
+                    is_active = COALESCE($7, is_active)
+                WHERE id = $8
+                RETURNING id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at;
             """
             result = await connection.fetchrow(
                 query,
                 subscription_type_id,
                 name,
                 price,
+                original_price,
                 telegram_stars_price,
                 duration_days,
                 is_active,
@@ -369,20 +385,6 @@ async def update_subscription_plan(plan_id: int):
         return jsonify({"error": "Internal server error"}), 500
 
 
-# حذف خطة اشتراك
-@admin_routes.route("/subscription-plans/<int:plan_id>", methods=["DELETE"])
-@role_required("admin")  # ✅ استخدام @role_required("admin")
-async def delete_subscription_plan(plan_id: int):
-    try:
-        async with current_app.db_pool.acquire() as connection:
-            query = "DELETE FROM subscription_plans WHERE id = $1"
-            await connection.execute(query, plan_id)
-        return jsonify({"message": "Subscription plan deleted successfully"}), 200
-    except Exception as e:
-        logging.error("Error deleting subscription plan: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
-
-
 # جلب جميع خطط الاشتراك، مع إمكانية التصفية حسب subscription_type_id
 @admin_routes.route("/subscription-plans", methods=["GET"])
 @role_required("admin")  # ✅ استخدام @role_required("admin")
@@ -392,7 +394,7 @@ async def get_subscription_plans():
         async with current_app.db_pool.acquire() as connection:
             if subscription_type_id:
                 query = """
-                    SELECT id, subscription_type_id, name, price, telegram_stars_price, duration_days, is_active, created_at
+                    SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
                     FROM subscription_plans
                     WHERE subscription_type_id = $1
                     ORDER BY created_at DESC
@@ -400,7 +402,7 @@ async def get_subscription_plans():
                 results = await connection.fetch(query, int(subscription_type_id))
             else:
                 query = """
-                    SELECT id, subscription_type_id, name, price, telegram_stars_price, duration_days, is_active, created_at
+                    SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
                     FROM subscription_plans
                     ORDER BY created_at DESC
                 """
@@ -419,7 +421,7 @@ async def get_subscription_plan(plan_id: int):
     try:
         async with current_app.db_pool.acquire() as connection:
             query = """
-                SELECT id, subscription_type_id, name, price, telegram_stars_price, duration_days, is_active, created_at
+                SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
                 FROM subscription_plans
                 WHERE id = $1
             """
@@ -431,7 +433,6 @@ async def get_subscription_plan(plan_id: int):
     except Exception as e:
         logging.error("Error fetching subscription plan: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
 
 @admin_routes.route("/subscriptions", methods=["GET"])
 @role_required("admin")  # ✅ استخدام @role_required("admin")
