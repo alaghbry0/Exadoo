@@ -299,7 +299,7 @@ async def get_user_subscriptions(connection, telegram_id: int):
                 s.start_date,
                 s.expiry_date, 
                 s.is_active,
-                s.invite_link,  # <-- إضافة هذا الحقل
+                s.invite_link,
                 st.name AS subscription_name
             FROM subscriptions s
             JOIN subscription_types st ON s.subscription_type_id = st.id
