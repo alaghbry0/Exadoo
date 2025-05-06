@@ -1,7 +1,8 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from routes.ws_routes import broadcast_new_notification
+
 
 async def create_notification(
         connection,
@@ -47,7 +48,8 @@ async def create_notification(
         "title": title,
         "message": message,
         "extra_data": extra_data,
-        "created_at": datetime.now().isoformat(),
+        
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "read_status": False
     }
 
