@@ -16,32 +16,48 @@ async def check_payment_status():
             return jsonify({'error': 'Payment token is required'}), 400
             
         async with current_app.db_pool.acquire() as conn:
-            record = await conn.fetchrow('''
-                SELECT 
-                    p.status, 
-                    p.created_at, 
-                    p.amount, 
-                    p.subscription_plan_id,
-                    s.invite_link
+            # الحصول على بيانات الدفع الأساسية
+            payment_record = await conn.fetchrow('''
+                SELECT p.status, p.created_at, p.amount, p.subscription_plan_id, p.telegram_id
                 FROM payments p
-                LEFT JOIN subscriptions s 
-                    ON p.payment_token = s.payment_token
                 WHERE p.payment_token = $1
             ''', payment_token)
             
-            if not record:
+            if not payment_record:
                 return jsonify({'error': 'Payment not found'}), 404
 
-            payment_status = record['status']
+            # البحث عن الاشتراك مع إعادة المحاولة لمدة 5 ثواني
+            max_retries = 5
+            invite_link = None
+            
+            for _ in range(max_retries):
+                subscription_record = await conn.fetchrow('''
+                    SELECT s.invite_link 
+                    FROM subscriptions s
+                    WHERE 
+                        s.subscription_type_id = $1 AND
+                        s.telegram_id = $2
+                    ORDER BY s.created_at DESC
+                    LIMIT 1
+                ''', payment_record['subscription_plan_id'], payment_record['telegram_id'])
+                
+                if subscription_record and subscription_record['invite_link']:
+                    invite_link = subscription_record['invite_link']
+                    break
+                    
+                await asyncio.sleep(1)  # انتظار 1 ثانية قبل إعادة المحاولة
+
+            # تعديل حالة الدفع
+            payment_status = payment_record['status']
             if payment_status == 'completed':
                 payment_status = 'exchange_success'
                 
             return jsonify({
                 'status': payment_status,
-                'created_at': record['created_at'].isoformat() if record['created_at'] else None,
-                'amount': record['amount'],
-                'plan_id': record['subscription_plan_id'],
-                'invite_link': record['invite_link']
+                'created_at': payment_record['created_at'].isoformat() if payment_record['created_at'] else None,
+                'amount': payment_record['amount'],
+                'plan_id': payment_record['subscription_plan_id'],
+                'invite_link': invite_link
             }), 200
                 
     except Exception as e:
