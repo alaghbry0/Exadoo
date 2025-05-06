@@ -51,7 +51,8 @@ def calculate_subscription_details(sub: Dict[str, Any], local_tz: pytz.BaseTzInf
         "progress": progress,
         "status": status,
         "start_date": start_date.isoformat(),
-        "expiry_date": expiry_date.isoformat()
+        "expiry_date": expiry_date.isoformat(),
+        "invite_link": sub.get('invite_link')  # <-- إضافة هذا الحقل
     }
 
 @user_bp.route("/api/user/subscriptions", methods=["GET"])

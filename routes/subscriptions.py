@@ -116,6 +116,10 @@ async def subscribe():
                 telegram_id, channel_id
             )
 
+            # Get invitation link through add_user_to_channel function
+            channel_result = await add_user_to_channel(telegram_id, subscription_plan["subscription_type_id"], db_pool)
+            invite_link = channel_result.get("invite_link")
+
             # Calculate new expiry date and handle subscription update/creation
             if subscription:
                 is_subscription_active = subscription['is_active'] and subscription['expiry_date'] >= current_time
@@ -126,6 +130,7 @@ async def subscribe():
                     start_date = current_time
                     new_expiry = start_date + timedelta(minutes=duration_minutes, days=duration_days)
 
+                # داخل الـ if subscription:
                 success = await update_subscription(
                     connection,
                     telegram_id,
@@ -135,7 +140,8 @@ async def subscribe():
                     new_expiry,
                     start_date,
                     True,
-                    payment_id
+                    payment_id,
+                    invite_link  # <-- إضافة invite_link هنا
                 )
                 if not success:
                     logging.error(f"❌ Failed to update subscription for {telegram_id}")
@@ -145,6 +151,7 @@ async def subscribe():
             else:
                 start_date = current_time
                 new_expiry = start_date + timedelta(minutes=duration_minutes, days=duration_days)
+                # داخل الـ else:
                 added = await add_subscription(
                     connection,
                     telegram_id,
@@ -154,7 +161,8 @@ async def subscribe():
                     start_date,
                     new_expiry,
                     True,
-                    payment_id
+                    payment_id,
+                    invite_link  # <-- إضافة invite_link هنا
                 )
                 if not added:
                     logging.error(f"❌ Failed to create subscription for {telegram_id}")
@@ -162,9 +170,7 @@ async def subscribe():
 
                 logging.info(f"✅ New subscription created for {telegram_id} until {new_expiry}")
 
-            # Get invitation link through add_user_to_channel function
-            channel_result = await add_user_to_channel(telegram_id, subscription_plan["subscription_type_id"], db_pool)
-            invite_link = channel_result.get("invite_link")
+
 
             # Schedule reminders
             reminder_settings = await connection.fetchrow(

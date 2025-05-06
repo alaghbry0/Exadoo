@@ -71,14 +71,17 @@ async def add_subscription(
     start_date: datetime,
     expiry_date: datetime,
     is_active: bool = True,
-    payment_id: str = None  # <-- إضافة payment_id كمعامل اختياري
+    payment_id: str = None,
+    invite_link: str = None  # <-- إضافة invite_link
 ):
     try:
         await connection.execute("""
             INSERT INTO subscriptions 
-            (telegram_id, channel_id, subscription_type_id, subscription_plan_id, start_date, expiry_date, is_active, payment_id, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-        """, telegram_id, channel_id, subscription_type_id, subscription_plan_id,  start_date, expiry_date, is_active, payment_id)
+            (telegram_id, channel_id, subscription_type_id, subscription_plan_id, 
+             start_date, expiry_date, is_active, payment_id, invite_link, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        """, telegram_id, channel_id, subscription_type_id, subscription_plan_id,
+            start_date, expiry_date, is_active, payment_id, invite_link)
 
         logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id})")
         return True
@@ -86,7 +89,6 @@ async def add_subscription(
     except Exception as e:
         logging.error(f"❌ Error adding subscription for {telegram_id}: {e}")
         return False
-
 
 # 1. تعديل دالة update_subscription (إزالة التعليقات الداخلية)
 async def update_subscription(
@@ -98,10 +100,11 @@ async def update_subscription(
     new_expiry_date: datetime,
     start_date: datetime,
     is_active: bool = True,
-    payment_id: str = None  # <-- إضافة payment_id كمعامل اختياري
+    payment_id: str = None,
+    invite_link: str = None  # <-- إضافة invite_link
 ):
     try:
-        if payment_id:  # ✅ تحديث payment_id فقط إذا كان موجودًا
+        if payment_id or invite_link:  # ✅ تحديث إذا كان هناك invite_link أو payment_id
             await connection.execute("""
                 UPDATE subscriptions SET
                     subscription_type_id = $1,
@@ -110,10 +113,12 @@ async def update_subscription(
                     start_date = $4,
                     is_active = $5,
                     payment_id = $6,
+                    invite_link = $7,
                     updated_at = NOW()
-                WHERE telegram_id = $7 AND channel_id = $8
-            """, subscription_type_id, subscription_plan_id, new_expiry_date, start_date, is_active, payment_id, telegram_id, channel_id)
-        else:  # ✅ تحديث بدون تعديل `payment_id`
+                WHERE telegram_id = $8 AND channel_id = $9
+            """, subscription_type_id, subscription_plan_id, new_expiry_date,
+                start_date, is_active, payment_id, invite_link, telegram_id, channel_id)
+        else:  # ✅ تحديث بدون تعديل `payment_id` أو `invite_link`
             await connection.execute("""
                 UPDATE subscriptions SET
                     subscription_type_id = $1,
@@ -123,7 +128,8 @@ async def update_subscription(
                     is_active = $5,
                     updated_at = NOW()
                 WHERE telegram_id = $6 AND channel_id = $7
-            """, subscription_type_id, new_expiry_date, start_date, is_active, telegram_id, channel_id)
+            """, subscription_type_id, new_expiry_date, start_date,
+                is_active, telegram_id, channel_id)
 
         logging.info(f"✅ Subscription updated for {telegram_id} (Channel: {channel_id})")
         return True
@@ -131,6 +137,7 @@ async def update_subscription(
     except Exception as e:
         logging.error(f"❌ Error updating subscription for {telegram_id}: {e}")
         return False
+
 
 async def get_subscription(connection, telegram_id: int, channel_id: int):
     """
@@ -289,9 +296,10 @@ async def get_user_subscriptions(connection, telegram_id: int):
         subscriptions = await connection.fetch("""
             SELECT 
                 s.subscription_type_id, 
-                s.start_date,  -- <-- إضافة هذا الحقل
+                s.start_date,
                 s.expiry_date, 
                 s.is_active,
+                s.invite_link,  # <-- إضافة هذا الحقل
                 st.name AS subscription_name
             FROM subscriptions s
             JOIN subscription_types st ON s.subscription_type_id = st.id
