@@ -32,14 +32,14 @@ async def check_payment_status():
             
             for _ in range(max_retries):
                 subscription_record = await conn.fetchrow('''
-                    SELECT s.invite_link 
-                    FROM subscriptions s
-                    WHERE 
-                        s.subscription_type_id = $1 AND
-                        s.telegram_id = $2
-                    ORDER BY s.created_at DESC
-                    LIMIT 1
-                ''', payment_record['subscription_plan_id'], payment_record['telegram_id'])
+    SELECT s.invite_link 
+    FROM subscriptions s
+    WHERE 
+        s.subscription_type_id = $1 AND
+        s.telegram_id = $2
+    ORDER BY s.start_date DESC  # التعديل هنا
+    LIMIT 1
+''', payment_record['subscription_plan_id'], payment_record['telegram_id'])
                 
                 if subscription_record and subscription_record['invite_link']:
                     invite_link = subscription_record['invite_link']
