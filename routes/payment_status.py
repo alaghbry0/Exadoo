@@ -37,7 +37,7 @@ async def check_payment_status():
     WHERE 
         s.subscription_type_id = $1 AND
         s.telegram_id = $2
-    ORDER BY s.start_date DESC  # التعديل هنا
+    ORDER BY s.start_date DESC
     LIMIT 1
 ''', payment_record['subscription_plan_id'], payment_record['telegram_id'])
                 
