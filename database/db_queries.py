@@ -5,7 +5,7 @@ import pytz
 import logging
 from decimal import Decimal
 
-from typing import Optional
+from typing import Optional, Union
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
@@ -60,34 +60,52 @@ async def get_user(connection, telegram_id: int):
         return None
 
 
+async def get_user_db_id_by_telegram_id(conn, telegram_id: int) -> Optional[int]:
+    """Fetches the primary key 'id' from the 'users' table for a given telegram_id."""
+    user_record = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
+    return user_record['id'] if user_record else None
+
+async def get_active_subscription_types(conn) -> list:
+    """Fetches all active subscription types (managed channels)."""
+    return await conn.fetch("SELECT id, channel_id, name FROM subscription_types WHERE is_active = TRUE ORDER BY id")
+
+# في db_queries.py (إذا لم تكن موجودة بالفعل أو بشكل مشابه)
+async def get_subscription_type_details_by_id(conn, sub_type_id: int):
+    """Fetches details for a specific subscription_type_id."""
+    return await conn.fetchrow("SELECT id, channel_id FROM subscription_types WHERE id = $1", sub_type_id)
+
 # ----------------- 🔹 إدارة الاشتراكات ----------------- #
 
 async def add_subscription(
-    connection,
+    connection: asyncpg.Connection, # الأفضل تحديد نوع الاتصال
+    user_id: int,
     telegram_id: int,
     channel_id: int,
     subscription_type_id: int,
-    subscription_plan_id: int,
     start_date: datetime,
     expiry_date: datetime,
+    subscription_plan_id: Optional[int] = None,
     is_active: bool = True,
-    payment_id: str = None,
-    invite_link: str = None  # <-- إضافة invite_link
+    source: Optional[str] = None,
+    payment_id: Optional[str] = None,
+    invite_link: Optional[str] = None
 ):
     try:
         await connection.execute("""
-            INSERT INTO subscriptions 
-            (telegram_id, channel_id, subscription_type_id, subscription_plan_id, 
-             start_date, expiry_date, is_active, payment_id, invite_link, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-        """, telegram_id, channel_id, subscription_type_id, subscription_plan_id,
-            start_date, expiry_date, is_active, payment_id, invite_link)
+            INSERT INTO subscriptions
+            (user_id, telegram_id, channel_id, subscription_type_id,
+             start_date, expiry_date, subscription_plan_id,
+             is_active, source, payment_id, invite_link, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+        """, user_id, telegram_id, channel_id, subscription_type_id,
+            start_date, expiry_date, subscription_plan_id,
+            is_active, source, payment_id, invite_link)
 
-        logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id})")
+        logging.info(f"✅ Subscription added for user_id {user_id} (TG: {telegram_id}, Channel: {channel_id}, Source: {source})")
         return True
 
     except Exception as e:
-        logging.error(f"❌ Error adding subscription for {telegram_id}: {e}")
+        logging.error(f"❌ Error adding subscription for user_id {user_id} (TG: {telegram_id}): {e}", exc_info=True) # أضفت exc_info=True لتفاصيل أفضل
         return False
 
 # 1. تعديل دالة update_subscription (إزالة التعليقات الداخلية)

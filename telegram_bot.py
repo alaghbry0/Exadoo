@@ -4,14 +4,16 @@ import asyncio
 import sys
 import json
 import aiohttp  # ✅ استيراد `aiohttp` لإرسال الطلبات
-from aiogram import Bot, Dispatcher, types 
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, ChatJoinRequest
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from dotenv import load_dotenv
 from quart import Blueprint, current_app  # ✅ استيراد `Blueprint` لاستخدامه في `app.py`
-from database.db_queries import get_subscription, add_user
+from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, get_active_subscription_types,get_subscription_type_details_by_id
+
 from quart import current_app
+from datetime import datetime, timezone, timedelta
 
 
 
@@ -27,6 +29,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEB_APP_URL = os.getenv("WEB_APP_URL")
 SUBSCRIBE_URL = os.getenv("SUBSCRIBE_URL")  # ✅ تحميل رابط `/api/subscribe`
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # ✅ تحميل `WEBHOOK_SECRET`
+ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID"))
 
 # ✅ التحقق من القيم المطلوبة في البيئة
 if not TELEGRAM_BOT_TOKEN or not WEB_APP_URL or not SUBSCRIBE_URL or not WEBHOOK_SECRET:
@@ -47,44 +50,252 @@ async def remove_webhook():
     logging.info("✅ تم إزالة Webhook بنجاح!")
 
 
-# 🔹 وظيفة /start
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-from aiogram import Bot, Dispatcher, types
-import logging
 
-# داخل دالة start_command:
-@dp.message(Command("start"))
-async def start_command(message: types.Message):
-    user = message.from_user
-    user_id = user.id
-    username = user.username or None
-    full_name = user.full_name or None
 
-    # ─── تسجيل أو تحديث بيانات المستخدم في جدول users ───
-    try:
-        async with current_app.db_pool.acquire() as conn:
-            await add_user(
-                connection=conn,
-                telegram_id=user_id,
-                username=username,
-                full_name=full_name
+async def check_if_legacy_migration_done(conn: asyncpg.Connection, user_db_id: int) -> bool:
+    count = await conn.fetchval(
+        "SELECT COUNT(*) FROM subscriptions WHERE user_id = $1 AND source = 'legacy'",
+        user_db_id
+    )
+    return count > 0
+
+async def find_legacy_subscriptions_by_username(conn: asyncpg.Connection, username_clean: str):
+    if not username_clean:
+        return []
+    return await conn.fetch(
+        """SELECT ls.*, st.channel_id AS target_channel_id
+           FROM legacy_subscriptions ls
+           JOIN subscription_types st ON ls.subscription_type_id = st.id
+           WHERE ls.username = $1 AND ls.processed = FALSE
+           ORDER BY ls.id""",
+        username_clean
+    )
+
+async def mark_legacy_subscription_processed(conn: asyncpg.Connection, legacy_sub_id: int):
+    await conn.execute("UPDATE legacy_subscriptions SET processed = TRUE WHERE id = $1", legacy_sub_id)
+    logging.info(f"Marked legacy subscription ID {legacy_sub_id} as processed.")
+
+async def handle_legacy_user(
+    conn: asyncpg.Connection,
+    # bot: Bot, # لم تعد هناك حاجة لإرسال رسائل للمستخدم من هنا
+    telegram_id: int,
+    user_db_id: int,
+    username_clean: str
+):
+    legacy_records = await find_legacy_subscriptions_by_username(conn, username_clean)
+    migrated_count = 0
+    if not legacy_records:
+        logging.info(f"No unprocessed legacy records found for {username_clean} (UserDBID: {user_db_id}, TGID: {telegram_id}). Might have been processed or username mismatch.")
+        return False
+
+    for legacy_sub in legacy_records:
+        channel_id_from_legacy = legacy_sub['target_channel_id']
+        if not channel_id_from_legacy:
+            logging.error(f"Legacy migration: Could not determine target_channel_id for legacy_sub ID {legacy_sub['id']} (UserDBID: {user_db_id}). subscription_type_id {legacy_sub['subscription_type_id']} might be invalid or inactive.")
+            continue
+
+        async with conn.transaction():
+            try:
+                existing_migrated_sub = await conn.fetchrow(
+                    "SELECT id FROM subscriptions WHERE user_id = $1 AND channel_id = $2 AND source = 'legacy'",
+                    user_db_id, channel_id_from_legacy
+                )
+                if existing_migrated_sub:
+                    logging.info(f"Legacy subscription for channel {channel_id_from_legacy} already migrated for UserDBID {user_db_id}. Marking original legacy record {legacy_sub['id']} as processed.")
+                    await mark_legacy_subscription_processed(conn, legacy_sub['id'])
+                    continue
+
+                is_active_legacy = legacy_sub['expiry_date'] > datetime.now(timezone.utc) if legacy_sub['expiry_date'] else False
+
+                await add_subscription( # تأكد أن هذه هي الدالة المعدلة من db_queries.py
+                    connection=conn,
+                    user_id=user_db_id,
+                    telegram_id=telegram_id,
+                    channel_id=channel_id_from_legacy,
+                    subscription_type_id=legacy_sub['subscription_type_id'],
+                    start_date=legacy_sub['start_date'], # معامل إجباري
+                    expiry_date=legacy_sub['expiry_date'], # معامل إجباري
+                    subscription_plan_id=None, # أو legacy_sub.get('subscription_plan_id')
+                    is_active=is_active_legacy,
+                    source='legacy'
+                )
+                await mark_legacy_subscription_processed(conn, legacy_sub['id'])
+                migrated_count += 1
+                logging.info(f"Successfully migrated legacy subscription (ID: {legacy_sub['id']}) for UserDBID {user_db_id} to channel {channel_id_from_legacy}.")
+            except Exception as e:
+                logging.error(f"Error migrating legacy subscription (ID: {legacy_sub['id']}) for UserDBID {user_db_id}: {e}", exc_info=True)
+    return migrated_count > 0
+
+
+async def handle_telegram_list_user(
+    conn: asyncpg.Connection,
+    bot: Bot,
+    admin_telegram_id: Optional[int],
+    telegram_id: int,
+    user_db_id: int,
+    full_name: str,
+    member_statuses: dict
+):
+    added_for_review_count = 0
+    active_subscription_types = await get_active_subscription_types(conn)
+
+    for sub_type in active_subscription_types:
+        managed_channel_id = sub_type['channel_id']
+        subscription_type_id = sub_type['id']
+        channel_name = sub_type['name']
+        member_status = member_statuses.get(managed_channel_id)
+
+        if member_status and member_status.status not in ["left", "kicked", "restricted", "banned"]:
+            existing_sub_for_channel = await conn.fetchrow(
+                "SELECT id, source FROM subscriptions WHERE user_id = $1 AND channel_id = $2 ORDER BY expiry_date DESC LIMIT 1",
+                user_db_id, managed_channel_id
             )
-            logging.info(f"✅ تم تسجيل/تحديث المستخدم {user_id} في قاعدة البيانات")
-    except Exception as e:
-        logging.error(f"❌ فشل تسجيل المستخدم {user_id}: {e}")
+            if existing_sub_for_channel:
+                logging.info(f"UserDBID {user_db_id} already has a subscription record (ID: {existing_sub_for_channel['id']}, Source: {existing_sub_for_channel['source']}) for channel {managed_channel_id}. Skipping 'telegram_list' creation.")
+                continue
 
-    # ─── بعد كده نعرض الزر والرسالة زي ما هي ───
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔹 فتح التطبيق", web_app=WebAppInfo(url=WEB_APP_URL))],
-    ])
+            async with conn.transaction():
+                try:
+                    now_utc = datetime.now(timezone.utc)
+                    await add_subscription( # تأكد أن هذه هي الدالة المعدلة من db_queries.py
+                        connection=conn,
+                        user_id=user_db_id,
+                        telegram_id=telegram_id,
+                        channel_id=managed_channel_id,
+                        subscription_type_id=subscription_type_id,
+                        start_date=now_utc, # معامل إجباري
+                        expiry_date=now_utc, # معامل إجباري، ينتهي فورًا
+                        subscription_plan_id=None,
+                        is_active=False,
+                        source='telegram_list'
+                    )
+                    added_for_review_count += 1
+                    logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}, Name: {full_name}) found in channel {channel_name} ({managed_channel_id}) and added with source 'telegram_list'. Admin review needed.")
 
+                    admin_message = (
+                        f"👤 مراجعة مستخدم: {full_name} (ID: `{telegram_id}`)\n"
+                        f"تم العثور عليه في القناة: {channel_name} (`{managed_channel_id}`)\n"
+                        f"وليس لديه اشتراك مسجل سابقاً لهذه القناة.\n"
+                        f"تم إنشاء سجل اشتراك غير نشط (`telegram_list`) له.\n"
+                        f"الرجاء المراجعة واتخاذ الإجراء."
+                    )
+                    if admin_telegram_id:
+                        try:
+                            await bot.send_message(admin_telegram_id, admin_message, parse_mode="Markdown")
+                        except Exception as e_admin_msg:
+                            logging.error(f"Failed to send admin notification for telegram_list user {telegram_id}: {e_admin_msg}")
+                    else:
+                        logging.warning("ADMIN_TELEGRAM_ID not set. Cannot send 'telegram_list' notification.")
+                except Exception as e:
+                    logging.error(f"Error creating 'telegram_list' subscription for UserDBID {user_db_id} in channel {managed_channel_id}: {e}", exc_info=True)
+    return added_for_review_count > 0
+
+
+# معالج أمر /start
+# يجب تمرير الاعتماديات (bot, db_pool, web_app_url, admin_telegram_id) عند تسجيل هذا المعالج
+@Command("start") # يمكنك تسجيله بهذه الطريقة إذا كنت تستخدم dp.include_router(your_router)
+                  # أو dp.message(Command("start"))(partial(start_command_processor, ...))
+async def start_command_processor(message: types.Message, bot: Bot, db_pool: asyncpg.Pool, web_app_url: str, admin_telegram_id: Optional[int]):
+    user = message.from_user
+    telegram_id = user.id
+    username_raw = user.username
+    full_name = user.full_name or "مستخدم تيليجرام"
+    username_clean = username_raw.lower().replace('@', '').strip() if username_raw else ""
+
+    # لا حاجة لـ user_message_parts الآن
+    # user_message_parts = []
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await add_user(conn, telegram_id, username=username_raw, full_name=full_name)
+            user_db_id = await get_user_db_id_by_telegram_id(conn, telegram_id)
+
+            if not user_db_id:
+                logging.error(f"Failed to get/create user_db_id for telegram_id {telegram_id}.")
+                await message.answer("حدث خطأ أثناء معالجة طلبك. يرجى المحاولة لاحقًا أو التواصل مع الدعم.")
+                return
+
+            managed_channels = await get_active_subscription_types(conn)
+            # if not managed_channels: # لا داعي للقلق هنا، سيتعامل الكود أدناه مع القائمة الفارغة
+            #     logging.warning("No active subscription types (managed channels) found in the database.")
+
+            legacy_already_fully_migrated = await check_if_legacy_migration_done(conn, user_db_id)
+            # processed_legacy_this_time = False # لم نعد بحاجة لتتبع هذا لإرسال رسالة للمستخدم
+
+            if username_clean and not legacy_already_fully_migrated:
+                logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}, User: {username_clean}) - Attempting legacy migration.")
+                processed_this_time = await handle_legacy_user(conn, telegram_id, user_db_id, username_clean) # أزلت bot من الوسائط
+                if processed_this_time:
+                    # user_message_parts.append("✅ تم تحديث بيانات اشتراكك السابق بنجاح!") # تم الإزالة
+                    logging.info(f"Legacy migration successful for user {user_db_id}.") # سجل داخلي فقط
+                    legacy_already_fully_migrated = True # مهم للمنطق التالي
+
+            member_statuses = {}
+            is_member_any_managed_channel = False
+            if managed_channels: # فقط إذا كانت هناك قنوات مُدارة
+                for channel_info in managed_channels:
+                    try:
+                        member_status = await bot.get_chat_member(chat_id=channel_info['channel_id'], user_id=telegram_id)
+                        member_statuses[channel_info['channel_id']] = member_status
+                        if member_status.status not in ["left", "kicked", "restricted", "banned"]:
+                            is_member_any_managed_channel = True
+                    except TelegramAPIError as e:
+                        if "user not found" in e.message.lower() or "chat not found" in e.message.lower() or "bot is not a member" in e.message.lower():
+                            logging.warning(f"Could not get chat member status for user {telegram_id} in channel {channel_info['channel_id']}: {e.message}")
+                        else:
+                            logging.error(f"Telegram API error getting chat member for user {telegram_id} in channel {channel_info['channel_id']}: {e}", exc_info=True)
+                        member_statuses[channel_info['channel_id']] = None
+                    except Exception as e_gen:
+                        logging.error(f"Generic error getting chat member for user {telegram_id} in channel {channel_info['channel_id']}: {e_gen}", exc_info=True)
+                        member_statuses[channel_info['channel_id']] = None
+
+            active_subs_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM subscriptions WHERE user_id = $1 AND is_active = TRUE AND expiry_date > NOW()",
+                user_db_id
+            )
+
+            if is_member_any_managed_channel and not legacy_already_fully_migrated and active_subs_count == 0:
+                any_legacy_record_exists_for_username = False
+                if username_clean:
+                    any_legacy_record_exists_for_username = await conn.fetchval(
+                        "SELECT 1 FROM legacy_subscriptions WHERE username = $1 LIMIT 1", username_clean
+                    )
+                if not any_legacy_record_exists_for_username:
+                    logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}) is member, no active subs, no legacy. Handling as 'telegram_list'.")
+                    await handle_telegram_list_user( # لم نعد نهتم بالقيمة المرجعة هنا للرسالة
+                        conn, bot, admin_telegram_id, telegram_id, user_db_id, full_name, member_statuses
+                    )
+                    # if handled_as_telegram_list: # تم الإزالة
+                        # user_message_parts.append("ℹ️ تم التعرف على عضويتك في إحدى قنواتنا. سيقوم المسؤول بمراجعة حالة اشتراكك قريبًا.")
+                else:
+                    logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}) is member, no active subs, but a legacy record (possibly processed) exists for username '{username_clean}'. Skipping 'telegram_list'.")
+
+            # لا حاجة لهذا الجزء إذا كانت الرسالة ثابتة
+            # if not user_message_parts:
+            #     if active_subs_count > 0 and not processed_legacy_this_time:
+            #          user_message_parts.append("✨ أهلاً بعودتك! اشتراكاتك الحالية نشطة.")
+
+    # --- نهاية منطق قاعدة البيانات والمعاملة ---
+
+    # بناء الرسالة النهائية - تم التبسيط
+    # final_welcome_message_intro = "\n".join(user_message_parts) # تم الإزالة
+    # if final_welcome_message_intro: # تم الإزالة
+    #     final_welcome_message_intro += "\n\n---\n\n" # تم الإزالة
+
+    # رسالة ترحيب ثابتة
     welcome_text = (
-        f"👋 مرحبًا {full_name or 'مستخدم'}!\n\n"
-        "مرحبًا بك في **@Exaado**  \n"
+        # f"{final_welcome_message_intro}" # تم الإزالة
+        f"👋 مرحبًا {full_name}!\n\n" # استخدم full_name الذي تم تعيين قيمة افتراضية له
+        f"مرحبًا بك في **@Exaado**  \n"
         "هنا يمكنك إدارة اشتراكاتك في قنواتنا بسهولة.\n\n"
         "نتمنى لك تجربة رائعة! 🚀"
     )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔹 فتح التطبيق 🔹", web_app=WebAppInfo(url=web_app_url))],
+    ])
     await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
+
 
 # إضافة معالج لطلبات الانضمام
 @dp.chat_join_request()
