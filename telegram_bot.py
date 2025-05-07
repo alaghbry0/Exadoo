@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from dotenv import load_dotenv
 from quart import Blueprint, current_app, request, jsonify
-from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, get_active_subscription_types,get_subscription_type_details_by_id
+from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, get_active_subscription_types,get_subscription_type_details_by_id, add_subscription, add_pending_subscription
 import asyncpg
 from functools import partial
 from typing import Optional
@@ -130,15 +130,14 @@ async def handle_legacy_user(
 
 
 async def handle_telegram_list_user(
-    conn: asyncpg.Connection,
-
-    admin_telegram_id: Optional[int],
-    telegram_id: int,
-    user_db_id: int,
-    full_name: str,
-    member_statuses: dict
+        conn: asyncpg.Connection,
+        telegram_id: int,
+        user_db_id: int,
+        full_name: str,
+        member_statuses: dict
 ):
-    added_for_review_count = 0
+    admin_telegram_id = ADMIN_ID
+    added_to_pending_count = 0
     active_subscription_types = await get_active_subscription_types(conn)
 
     for sub_type in active_subscription_types:
@@ -148,50 +147,71 @@ async def handle_telegram_list_user(
         member_status = member_statuses.get(managed_channel_id)
 
         if member_status and member_status.status not in ["left", "kicked", "restricted", "banned"]:
-            existing_sub_for_channel = await conn.fetchrow(
-                "SELECT id, source FROM subscriptions WHERE user_id = $1 AND channel_id = $2 ORDER BY expiry_date DESC LIMIT 1",
-                user_db_id, managed_channel_id
+            existing_actual_sub = await conn.fetchrow(
+                "SELECT id, source FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2 LIMIT 1",
+                telegram_id, managed_channel_id
             )
-            if existing_sub_for_channel:
-                logging.info(f"UserDBID {user_db_id} already has a subscription record (ID: {existing_sub_for_channel['id']}, Source: {existing_sub_for_channel['source']}) for channel {managed_channel_id}. Skipping 'telegram_list' creation.")
+            if existing_actual_sub:
+                logging.info(f"User TGID {telegram_id} has actual sub. Skipping.")
                 continue
 
-            async with conn.transaction():
-                try:
-                    now_utc = datetime.now(timezone.utc)
-                    await add_subscription( # تأكد أن هذه هي الدالة المعدلة من db_queries.py
-                        connection=conn,
-                        user_id=user_db_id,
-                        telegram_id=telegram_id,
-                        channel_id=managed_channel_id,
-                        subscription_type_id=subscription_type_id,
-                        start_date=now_utc, # معامل إجباري
-                        expiry_date=now_utc, # معامل إجباري، ينتهي فورًا
-                        subscription_plan_id=None,
-                        is_active=False,
-                        source='telegram_list'
-                    )
-                    added_for_review_count += 1
-                    logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}, Name: {full_name}) found in channel {channel_name} ({managed_channel_id}) and added with source 'telegram_list'. Admin review needed.")
+            # --- هنا يبدأ منطق الإشعار ---
+            logging.info(
+                f"User TGID {telegram_id} (Name: {full_name}) found in channel {channel_name} without active sub. Needs review.")
 
-                    admin_message = (
-                        f"👤 مراجعة مستخدم: {full_name} (ID: `{telegram_id}`)\n"
-                        f"تم العثور عليه في القناة: {channel_name} (`{managed_channel_id}`)\n"
-                        f"وليس لديه اشتراك مسجل سابقاً لهذه القناة.\n"
-                        f"تم إنشاء سجل اشتراك غير نشط (`telegram_list`) له.\n"
-                        f"الرجاء المراجعة واتخاذ الإجراء."
+            status_of_pending_add = "الرجاء المراجعة واتخاذ الإجراء."  # رسالة افتراضية
+            was_newly_added = False
+
+            try:
+                was_newly_added = await add_pending_subscription(
+                    connection=conn,
+                    user_db_id=user_db_id,
+                    telegram_id=telegram_id,
+                    channel_id=managed_channel_id,
+                    subscription_type_id=subscription_type_id
+                )
+
+                if was_newly_added:
+                    added_to_pending_count += 1
+                    logging.info(f"User TGID {telegram_id} added to PENDING for channel {channel_name}.")
+                    status_of_pending_add = "تمت إضافته إلى قائمة الاشتراكات المعلقة للمراجعة."
+                else:
+                    # التحقق مما إذا كان موجودًا بالفعل أم فشل لسبب آخر
+                    is_already_pending = await conn.fetchval(
+                        "SELECT 1 FROM pending_subscriptions WHERE telegram_id = $1 AND channel_id = $2",
+                        telegram_id, managed_channel_id
                     )
-                    if admin_telegram_id:
-                        try:
-                            await bot.send_message(admin_telegram_id, admin_message, parse_mode="Markdown")
-                        except Exception as e_admin_msg:
-                            logging.error(f"Failed to send admin notification for telegram_list user {telegram_id}: {e_admin_msg}")
+                    if is_already_pending:
+                        logging.info(f"User TGID {telegram_id} already in PENDING for channel {channel_name}.")
+                        status_of_pending_add = "موجود مسبقًا في قائمة الاشتراكات المعلقة."
                     else:
-                        logging.warning("ADMIN_TELEGRAM_ID not set. Cannot send 'telegram_list' notification.")
-                except Exception as e:
-                    logging.error(f"Error creating 'telegram_list' subscription for UserDBID {user_db_id} in channel {managed_channel_id}: {e}", exc_info=True)
-    return added_for_review_count > 0
+                        logging.error(
+                            f"Failed to add TGID {telegram_id} to PENDING for channel {channel_name} (returned False, not found).")
+                        status_of_pending_add = "فشلت محاولة إضافته إلى `pending_subscriptions` (لم يكن موجودًا مسبقًا)."
 
+            except Exception as e:
+                logging.error(f"EXCEPTION while processing PENDING for TGID {telegram_id}, channel {channel_name}: {e}",
+                              exc_info=True)
+                status_of_pending_add = f"حدث خطأ أثناء محاولة إضافته إلى `pending_subscriptions`: {str(e)}."
+
+            # --- إرسال الإشعار الآن ---
+            admin_message = (
+                f"👤 مراجعة مستخدم:\n"
+                f"الاسم: {full_name} (ID: `{telegram_id}`)\n"
+                f"القناة: {channel_name} (`{managed_channel_id}`)\n"
+                f"تم العثور عليه في القناة وليس لديه اشتراك مسجل.\n"
+                f"الحالة بخصوص الإضافة للمعلقة: {status_of_pending_add}"
+            )
+
+            if admin_telegram_id:
+                try:
+                    await bot.send_message(admin_telegram_id, admin_message, parse_mode="Markdown")
+                except Exception as e_admin_msg:
+                    logging.error(f"Failed to send admin notification for user {telegram_id}: {e_admin_msg}")
+            else:
+                logging.warning("ADMIN_TELEGRAM_ID not set. Cannot send admin notification.")
+
+    return added_to_pending_count > 0
 
 # معالج أمر /start
 # يجب تمرير الاعتماديات (bot, db_pool, web_app_url, admin_telegram_id) عند تسجيل هذا المعالج
@@ -262,7 +282,7 @@ async def start_command(message: types.Message):
                 if not any_legacy_record_exists_for_username:
                     logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}) is member, no active subs, no legacy. Handling as 'telegram_list'.")
                     await handle_telegram_list_user( # لم نعد نهتم بالقيمة المرجعة هنا للرسالة
-                        conn,  admin_telegram_id, telegram_id, user_db_id, full_name, member_statuses
+                        conn,   telegram_id, user_db_id, full_name, member_statuses
                     )
                     # if handled_as_telegram_list: # تم الإزالة
                         # user_message_parts.append("ℹ️ تم التعرف على عضويتك في إحدى قنواتنا. سيقوم المسؤول بمراجعة حالة اشتراكك قريبًا.")
@@ -291,7 +311,8 @@ async def start_command(message: types.Message):
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔹 فتح التطبيق 🔹", web_app=WebAppInfo(url=web_app_url))],
+        [InlineKeyboardButton(text="🔹 فتح التطبيق 🔹",
+                              web_app=WebAppInfo(url=WEB_APP_URL))],
     ])
     await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
 

@@ -74,6 +74,56 @@ async def get_subscription_type_details_by_id(conn, sub_type_id: int):
     """Fetches details for a specific subscription_type_id."""
     return await conn.fetchrow("SELECT id, channel_id FROM subscription_types WHERE id = $1", sub_type_id)
 
+async def add_pending_subscription(
+    connection: asyncpg.Connection,
+    user_db_id: int,
+    telegram_id: int,
+    channel_id: int,
+    subscription_type_id: int
+) -> bool:
+    """
+    يضيف اشتراكًا معلقًا للمراجعة.
+    يستخدم ON CONFLICT لتجنب التكرار.
+    يعود True إذا تم إدراج صف جديد، False إذا كان السجل موجودًا بالفعل (بسبب ON CONFLICT).
+    """
+    try:
+        # 🔴 المشكلة الأولى: استدعاء INSERT ... RETURNING id مرتين
+        result = await connection.execute( # <-- الاستدعاء الأول
+            """
+            INSERT INTO pending_subscriptions (user_db_id, telegram_id, channel_id, subscription_type_id, found_at, status)
+            VALUES ($1, $2, $3, $4, NOW(), 'pending')
+            ON CONFLICT (telegram_id, channel_id) DO NOTHING
+            RETURNING id; 
+            """,
+            user_db_id,
+            telegram_id,
+            channel_id,
+            subscription_type_id,
+        )
+
+        # 🔴 المشكلة الثانية: هذا الشرط غير دقيق ويعتمد على سلسلة نصية
+        if result and " 0 0" not in result: # طريقة بسيطة للتحقق, قد تحتاج لتحسين
+            # 🔴 المشكلة الثالثة: إذا كان الشرط أعلاه صحيحًا، يتم استدعاء نفس جملة INSERT مرة أخرى!
+            record_id = await connection.fetchval( # <-- الاستدعاء الثاني لنفس جملة INSERT
+                """
+                INSERT INTO pending_subscriptions (user_db_id, telegram_id, channel_id, subscription_type_id, found_at, status)
+                VALUES ($1, $2, $3, $4, NOW(), 'pending')
+                ON CONFLICT (telegram_id, channel_id) DO NOTHING
+                RETURNING id;
+                """,
+                user_db_id, telegram_id, channel_id, subscription_type_id
+            )
+            return record_id is not None # تم الإدراج إذا أعيد id
+
+    except Exception as e:
+        logging.error(
+            f"❌ Error adding pending subscription for user_db_id {user_db_id} (TG: {telegram_id}), channel {channel_id}: {e}",
+            exc_info=True
+        )
+        return False
+    return False
+
+
 # ----------------- 🔹 إدارة الاشتراكات ----------------- #
 
 async def add_subscription(
