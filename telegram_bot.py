@@ -196,17 +196,15 @@ async def handle_telegram_list_user(
 # معالج أمر /start
 # يجب تمرير الاعتماديات (bot, db_pool, web_app_url, admin_telegram_id) عند تسجيل هذا المعالج
 @dp.message(Command("start"))
-async def start_command(message: types.Message, db_pool: asyncpg.Pool, web_app_url: str, admin_telegram_id: Optional[int]):
+async def start_command(message: types.Message):
     user = message.from_user
     telegram_id = user.id
     username_raw = user.username
     full_name = user.full_name or "مستخدم تيليجرام"
     username_clean = username_raw.lower().replace('@', '').strip() if username_raw else ""
 
-    # لا حاجة لـ user_message_parts الآن
-    # user_message_parts = []
 
-    async with db_pool.acquire() as conn:
+    async with current_app.db_pool.acquire() as conn:
         async with conn.transaction():
             await add_user(conn, telegram_id, username=username_raw, full_name=full_name)
             user_db_id = await get_user_db_id_by_telegram_id(conn, telegram_id)
