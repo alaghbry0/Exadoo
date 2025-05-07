@@ -9,10 +9,12 @@ from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, W
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from dotenv import load_dotenv
-from quart import Blueprint, current_app  # ✅ استيراد `Blueprint` لاستخدامه في `app.py`
+from quart import Blueprint, current_app, request, jsonify
 from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, get_active_subscription_types,get_subscription_type_details_by_id
+import asyncpg
+from functools import partial
+from typing import Optional
 
-from quart import current_app
 from datetime import datetime, timezone, timedelta
 
 
@@ -129,7 +131,7 @@ async def handle_legacy_user(
 
 async def handle_telegram_list_user(
     conn: asyncpg.Connection,
-    bot: Bot,
+
     admin_telegram_id: Optional[int],
     telegram_id: int,
     user_db_id: int,
@@ -193,9 +195,8 @@ async def handle_telegram_list_user(
 
 # معالج أمر /start
 # يجب تمرير الاعتماديات (bot, db_pool, web_app_url, admin_telegram_id) عند تسجيل هذا المعالج
-@Command("start") # يمكنك تسجيله بهذه الطريقة إذا كنت تستخدم dp.include_router(your_router)
-                  # أو dp.message(Command("start"))(partial(start_command_processor, ...))
-async def start_command_processor(message: types.Message, bot: Bot, db_pool: asyncpg.Pool, web_app_url: str, admin_telegram_id: Optional[int]):
+@dp.message(Command("start"))
+async def start_command(message: types.Message, db_pool: asyncpg.Pool, web_app_url: str, admin_telegram_id: Optional[int]):
     user = message.from_user
     telegram_id = user.id
     username_raw = user.username
@@ -263,7 +264,7 @@ async def start_command_processor(message: types.Message, bot: Bot, db_pool: asy
                 if not any_legacy_record_exists_for_username:
                     logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}) is member, no active subs, no legacy. Handling as 'telegram_list'.")
                     await handle_telegram_list_user( # لم نعد نهتم بالقيمة المرجعة هنا للرسالة
-                        conn, bot, admin_telegram_id, telegram_id, user_db_id, full_name, member_statuses
+                        conn,  admin_telegram_id, telegram_id, user_db_id, full_name, member_statuses
                     )
                     # if handled_as_telegram_list: # تم الإزالة
                         # user_message_parts.append("ℹ️ تم التعرف على عضويتك في إحدى قنواتنا. سيقوم المسؤول بمراجعة حالة اشتراكك قريبًا.")
