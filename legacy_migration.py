@@ -124,13 +124,13 @@ async def import_sheet_to_legacy(conn, excel_sheet_name: str, df: pd.DataFrame, 
         query = """
             INSERT INTO legacy_subscriptions (original_excel_sheet, username, subscription_type_id, start_date, expiry_date, processed)
             VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT ON CONSTRAINT unique_legacy_user_sub_type -- تأكد من اسم القيد
+            ON CONFLICT ON CONSTRAINT unique_legacy_user_sub_type
             DO UPDATE SET
                 start_date = EXCLUDED.start_date,
                 expiry_date = EXCLUDED.expiry_date,
                 original_excel_sheet = EXCLUDED.original_excel_sheet,
                 processed = EXCLUDED.processed; 
-                -- تحديث processed أيضًا للتأكد من أنه يُعاد تعيينه إذا تم تحديث سجل قديم
+                
         """
         # لاحظ أن ترتيب الأعمدة في VALUES يجب أن يطابق ترتيبها في records_to_insert_final
         # records_to_insert_final يحتوي على: (original_excel_sheet, username_processed, sub_type_id_for_record, start_date, expiry_date, False)
