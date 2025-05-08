@@ -449,10 +449,11 @@ async def get_subscriptions():
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
         search_term = request.args.get("search", "")
-        source = request.args.get("source")  # أضفنا متغير source للفرز
+        source = request.args.get("source")
+        subscription_type_id_filter = request.args.get("type")
 
-        # استعلام SQL للحصول على الاشتراكات مع بيانات المستخدم والخطط والأنواع
-        query = """
+        # استعلام SQL الأساسي
+        base_query = """
             SELECT
                 s.*,
                 u.full_name,
@@ -467,45 +468,87 @@ async def get_subscriptions():
         """
         params = []
 
+        # بناء جملة WHERE ديناميكيًا
+        conditions = []
+
         if user_id:
-            query += f" AND s.telegram_id = ${len(params) + 1}"
+            conditions.append(f"s.telegram_id = ${len(params) + 1}")
             params.append(user_id)
         if channel_id:
-            query += f" AND s.channel_id = ${len(params) + 1}"
+            conditions.append(f"s.channel_id = ${len(params) + 1}")
             params.append(channel_id)
         if status:
-            if status.lower() == "active":
-                query += " AND s.is_active = true"
-            elif status.lower() == "inactive":
-                query += " AND s.is_active = false"
+            status_cond = "s.is_active = true" if status.lower() == "active" else "s.is_active = false"
+            conditions.append(status_cond)
         if start_date:
-            query += f" AND s.expiry_date >= ${len(params) + 1}::timestamptz"
+            conditions.append(f"s.expiry_date >= ${len(params) + 1}::timestamptz")
             params.append(start_date)
         if end_date:
-            query += f" AND s.expiry_date <= ${len(params) + 1}::timestamptz"
+            conditions.append(f"s.expiry_date <= ${len(params) + 1}::timestamptz")
             params.append(end_date)
         if search_term:
-            query += f" AND (u.full_name ILIKE ${len(params) + 1} OR u.username ILIKE ${len(params) + 1} OR s.telegram_id::TEXT ILIKE ${len(params) + 1})"
+            conditions.append(
+                f"(u.full_name ILIKE ${len(params) + 1} OR "
+                f"u.username ILIKE ${len(params) + 1} OR "
+                f"s.telegram_id::TEXT ILIKE ${len(params) + 1})"
+            )
             params.append(f"%{search_term}%")
-        # إضافة تصفية حسب source
         if source:
-            query += f" AND s.source = ${len(params) + 1}"
+            conditions.append(f"s.source = ${len(params) + 1}")
             params.append(source)
+        if subscription_type_id_filter:
+            try:
+                conditions.append(f"s.subscription_type_id = ${len(params) + 1}")
+                params.append(int(subscription_type_id_filter))
+            except ValueError:
+                logging.warning(f"Invalid subscription_type_id: {subscription_type_id_filter}")
 
-        # إضافة ترتيب وتجزئة
-        query += f" ORDER BY s.expiry_date DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
-        params.append(page_size)
-        params.append(offset)
+        # بناء الاستعلام النهائي
+        final_query = base_query
+        if conditions:
+            final_query += " AND " + " AND ".join(conditions)
+
+        # استعلام العد المعدل
+        count_query = (
+            final_query
+            .replace("s.*, u.full_name, u.username, sp.name AS subscription_plan_name, st.name AS subscription_type_name", "COUNT(*) as count", 1)
+            .split("ORDER BY")[0]
+        )
+
+        # إضافة التصنيف والتجزئة للاستعلام الرئيسي
+        final_query += f" ORDER BY s.expiry_date DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+        params.extend([page_size, offset])
 
         async with current_app.db_pool.acquire() as connection:
-            # حل مشكلة InvalidCachedStatementError
-            await connection.execute("DEALLOCATE ALL")
-            rows = await connection.fetch(query, *params)
+            # تنفيذ استعلام العد
+            count_params = params[:-2]
+            total_count = 0
+            try:
+                count_result = await connection.fetchrow(count_query, *count_params)
+                total_count = count_result['count'] if count_result else 0
+            except Exception as count_error:
+                logging.error("Count query failed: %s", count_error)
+                return jsonify({"error": "Failed to get total count"}), 500
 
-        return jsonify([dict(row) for row in rows])
+            # تنفيذ الاستعلام الرئيسي
+            try:
+                rows = await connection.fetch(final_query, *params)
+            except asyncpg.PostgresError as db_error:
+                logging.error("Database error: %s", db_error)
+                return jsonify({"error": "Database operation failed"}), 500
 
+        # بناء النتيجة النهائية
+        results = [dict(row) for row in rows]
+        for item in results:
+            item['total_count'] = total_count
+
+        return jsonify(results)
+
+    except ValueError as ve:
+        logging.error("Invalid input value: %s", ve)
+        return jsonify({"error": "Invalid request parameters"}), 400
     except Exception as e:
-        logging.error("Error fetching subscriptions: %s", e, exc_info=True)
+        logging.error("Unexpected error: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
@@ -522,7 +565,6 @@ async def get_subscription_sources():
         """
 
         async with current_app.db_pool.acquire() as connection:
-            await connection.execute("DEALLOCATE ALL")
             rows = await connection.fetch(query)
 
         sources = [row['source'] for row in rows if row['source']]
@@ -570,7 +612,6 @@ async def get_pending_subscriptions():
         params.append(offset)
 
         async with current_app.db_pool.acquire() as connection:
-            await connection.execute("DEALLOCATE ALL")
             rows = await connection.fetch(query, *params)
 
         return jsonify([dict(row) for row in rows])
@@ -668,7 +709,6 @@ async def get_legacy_subscriptions():
         params.append(offset)
 
         async with current_app.db_pool.acquire() as connection:
-            await connection.execute("DEALLOCATE ALL")
             rows = await connection.fetch(query, *params)
 
         return jsonify([dict(row) for row in rows])
