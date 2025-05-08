@@ -678,35 +678,6 @@ async def get_legacy_subscriptions():
         return jsonify({"error": "Internal server error"}), 500
 
 
-# واجهة API إضافية للتعامل مع إجراءات legacy_subscriptions (معالجة)
-@admin_routes.route("/legacy_subscriptions/<int:id>/process", methods=["POST"])
-@role_required("admin")
-async def process_legacy_subscription(id):
-    try:
-        async with current_app.db_pool.acquire() as connection:
-            await connection.execute("DEALLOCATE ALL")
-
-            # الحصول على بيانات الاشتراك القديم
-            legacy_sub = await connection.fetchrow("""
-                SELECT * FROM legacy_subscriptions WHERE id = $1
-            """, id)
-
-            if not legacy_sub:
-                return jsonify({"error": "Legacy subscription not found"}), 404
-
-            # تحديث الاشتراك القديم ليصبح "processed"
-            await connection.execute("""
-                UPDATE legacy_subscriptions 
-                SET processed = TRUE
-                WHERE id = $1
-            """, id)
-
-        return jsonify({"success": True})
-
-    except Exception as e:
-        logging.error("Error processing legacy subscription: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
-
 # =====================================
 # 2. API لجلب بيانات الدفعات مع دعم الفلاتر والتجزئة والتقارير المالية
 # =====================================
