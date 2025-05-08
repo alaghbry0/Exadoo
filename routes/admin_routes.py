@@ -442,13 +442,13 @@ async def get_subscriptions():
         # الحصول على المتغيرات من استعلام URL
         user_id = request.args.get("user_id")
         channel_id = request.args.get("channel_id")
-        status = request.args.get("status")  # متوقع: active أو inactive
+        status = request.args.get("status")  # active أو inactive
         start_date = request.args.get("start_date")
         end_date = request.args.get("end_date")
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
-        search_term = request.args.get("search", "")
+        search_term = request.args.get("search", "").strip()
         source = request.args.get("source")
         subscription_type_id_filter = request.args.get("type")
 
@@ -467,88 +467,84 @@ async def get_subscriptions():
             WHERE 1=1
         """
         params = []
-
-        # بناء جملة WHERE ديناميكيًا
         conditions = []
 
+        # بناء الشروط الديناميكية
         if user_id:
-            conditions.append(f"s.telegram_id = ${len(params) + 1}")
+            conditions.append(f"s.telegram_id = ${len(params)+1}")
             params.append(user_id)
         if channel_id:
-            conditions.append(f"s.channel_id = ${len(params) + 1}")
+            conditions.append(f"s.channel_id = ${len(params)+1}")
             params.append(channel_id)
         if status:
-            status_cond = "s.is_active = true" if status.lower() == "active" else "s.is_active = false"
-            conditions.append(status_cond)
+            status_bool = "true" if status.lower() == "active" else "false"
+            conditions.append(f"s.is_active = {status_bool}")
         if start_date:
-            conditions.append(f"s.expiry_date >= ${len(params) + 1}::timestamptz")
+            conditions.append(f"s.expiry_date >= ${len(params)+1}::timestamptz")
             params.append(start_date)
         if end_date:
-            conditions.append(f"s.expiry_date <= ${len(params) + 1}::timestamptz")
+            conditions.append(f"s.expiry_date <= ${len(params)+1}::timestamptz")
             params.append(end_date)
         if search_term:
             conditions.append(
-                f"(u.full_name ILIKE ${len(params) + 1} OR "
-                f"u.username ILIKE ${len(params) + 1} OR "
-                f"s.telegram_id::TEXT ILIKE ${len(params) + 1})"
+                f"(u.full_name ILIKE ${len(params)+1} OR "
+                f"u.username ILIKE ${len(params)+1} OR "
+                f"s.telegram_id::TEXT ILIKE ${len(params)+1})"
             )
             params.append(f"%{search_term}%")
         if source:
-            conditions.append(f"s.source = ${len(params) + 1}")
+            conditions.append(f"s.source = ${len(params)+1}")
             params.append(source)
         if subscription_type_id_filter:
             try:
-                conditions.append(f"s.subscription_type_id = ${len(params) + 1}")
+                conditions.append(f"s.subscription_type_id = ${len(params)+1}")
                 params.append(int(subscription_type_id_filter))
             except ValueError:
                 logging.warning(f"Invalid subscription_type_id: {subscription_type_id_filter}")
 
         # بناء الاستعلام النهائي
-        final_query = base_query
+        query = base_query
         if conditions:
-            final_query += " AND " + " AND ".join(conditions)
+            query += " AND " + " AND ".join(conditions)
 
-        # استعلام العد المعدل
-        count_query = (
-            final_query
-            .replace("s.*, u.full_name, u.username, sp.name AS subscription_plan_name, st.name AS subscription_type_name", "COUNT(*) as count", 1)
-            .split("ORDER BY")[0]
-        )
+        # استعلام العد المحسن
+        count_query = f"""
+            SELECT COUNT(*) AS total_count 
+            FROM ({query.replace('s.*, u.full_name, u.username', 's.id')}) AS subquery
+        """.split("ORDER BY")[0]
 
-        # إضافة التصنيف والتجزئة للاستعلام الرئيسي
-        final_query += f" ORDER BY s.expiry_date DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+        # إضافة التجزئة والترتيب
+        paginated_query = query + f" ORDER BY s.expiry_date DESC LIMIT ${len(params)+1} OFFSET ${len(params)+2}"
         params.extend([page_size, offset])
 
-        async with current_app.db_pool.acquire() as connection:
+        async with current_app.db_pool.acquire() as conn:
             # تنفيذ استعلام العد
-            count_params = params[:-2]
-            total_count = 0
             try:
-                count_result = await connection.fetchrow(count_query, *count_params)
-                total_count = count_result['count'] if count_result else 0
-            except Exception as count_error:
-                logging.error("Count query failed: %s", count_error)
-                return jsonify({"error": "Failed to get total count"}), 500
+                count_params = params[:-2]
+                count_row = await conn.fetchrow(count_query, *count_params)
+                total = count_row['total_count'] if count_row else 0
+            except asyncpg.UndefinedColumnError:
+                total = 0
+                logging.warning("Count query column mismatch, falling back to 0")
 
             # تنفيذ الاستعلام الرئيسي
-            try:
-                rows = await connection.fetch(final_query, *params)
-            except asyncpg.PostgresError as db_error:
-                logging.error("Database error: %s", db_error)
-                return jsonify({"error": "Database operation failed"}), 500
+            rows = await conn.fetch(paginated_query, *params)
 
-        # بناء النتيجة النهائية
+        # بناء النتيجة
         results = [dict(row) for row in rows]
         for item in results:
-            item['total_count'] = total_count
+            item['total_count'] = total
 
         return jsonify(results)
 
     except ValueError as ve:
-        logging.error("Invalid input value: %s", ve)
+        logging.error(f"Validation error: {str(ve)}")
         return jsonify({"error": "Invalid request parameters"}), 400
+    except asyncpg.PostgresError as pe:
+        logging.error(f"Database error: {str(pe)}")
+        return jsonify({"error": "Database operation failed"}), 500
     except Exception as e:
-        logging.error("Unexpected error: %s", e, exc_info=True)
+        logging.error(f"Unexpected error: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
