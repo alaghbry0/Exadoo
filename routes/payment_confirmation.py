@@ -31,6 +31,8 @@ payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 
 getcontext().prec = 30
 
+# تعديل مستوى السجلات ليكون ERROR كحد أدنى
+logging.basicConfig(level=logging.WARNING)
 
 
 def normalize_address(addr_str: str) -> str:
@@ -443,7 +445,7 @@ async def periodic_check_payments():
                 except AttributeError as e:
                     logging.warning(f"⚠️ أثناء إغلاق provider: {e}")
         logging.info("✅ انتهاء دورة parse_transactions الدورية. سيتم إعادة التشغيل بعد 30 ثانية.")
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
 
 
 
