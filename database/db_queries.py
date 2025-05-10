@@ -127,8 +127,8 @@ async def add_pending_subscription(
 # ----------------- 🔹 إدارة الاشتراكات ----------------- #
 
 async def add_subscription(
-    connection: asyncpg.Connection, # الأفضل تحديد نوع الاتصال
-    user_id: int,
+    connection: asyncpg.Connection,
+    user_id: int,  # تم إصلاح الموقع
     telegram_id: int,
     channel_id: int,
     subscription_type_id: int,
@@ -147,10 +147,18 @@ async def add_subscription(
              start_date, expiry_date, subscription_plan_id,
              is_active, source, payment_id, invite_link, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-        """, user_id, telegram_id, channel_id, subscription_type_id,
-            start_date, expiry_date, subscription_plan_id,
-            is_active, source, payment_id, invite_link)
-
+        """,
+        user_id,
+        telegram_id,
+        channel_id,
+        subscription_type_id,
+        start_date,
+        expiry_date,
+        subscription_plan_id,
+        is_active,
+        source,
+        payment_id,
+        invite_link)
         logging.info(f"✅ Subscription added for user_id {user_id} (TG: {telegram_id}, Channel: {channel_id}, Source: {source})")
         return True
 

@@ -9,7 +9,6 @@ from database.db_queries import (
 )
 from utils.db_utils import add_user_to_channel
 
-
 # نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
 from utils.notifications import create_notification
 
@@ -19,6 +18,7 @@ subscriptions_bp = Blueprint("subscriptions", __name__)
 LOCAL_TZ = pytz.timezone("Asia/Riyadh")  # التوقيت المحلي
 IS_DEVELOPMENT = True  # يمكن تغييره بناءً على بيئة التطبيق
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # مفتاح Webhook
+
 
 @subscriptions_bp.route("/api/subscribe", methods=["POST"])
 async def subscribe():
@@ -47,7 +47,8 @@ async def subscribe():
                      f"subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
 
         # Validate input data
-        if not isinstance(telegram_id, int) or not isinstance(subscription_plan_id, int) or not isinstance(payment_id, str):
+        if not isinstance(telegram_id, int) or not isinstance(subscription_plan_id, int) or not isinstance(payment_id,
+                                                                                                           str):
             logging.error(f"❌ Invalid data format: telegram_id={telegram_id}, "
                           f"subscription_plan_id={subscription_plan_id}, payment_id={payment_id}")
             return jsonify({"error": "Invalid data format"}), 400
@@ -154,23 +155,23 @@ async def subscribe():
                 # داخل الـ else:
                 added = await add_subscription(
                     connection,
-                    telegram_id,
-                    channel_id,
-                    subscription_plan["subscription_type_id"],
-                    subscription_plan_id,
-                    start_date,
-                    new_expiry,
-                    True,
-                    payment_id,
-                    invite_link  # <-- إضافة invite_link هنا
+                    user_id=user_id,
+                    telegram_id=telegram_id,
+                    channel_id=channel_id,
+                    subscription_type_id=subscription_plan["subscription_type_id"],
+                    start_date=start_date,
+                    expiry_date=new_expiry,
+                    subscription_plan_id=subscription_plan_id,
+                    is_active=True,
+                    source=None,
+                    payment_id=payment_id,
+                    invite_link=invite_link
                 )
                 if not added:
                     logging.error(f"❌ Failed to create subscription for {telegram_id}")
                     return jsonify({"error": "Failed to create subscription"}), 500
 
                 logging.info(f"✅ New subscription created for {telegram_id} until {new_expiry}")
-
-
 
             # Schedule reminders
             reminder_settings = await connection.fetchrow(
@@ -250,10 +251,10 @@ async def subscribe():
                 "invite_link": invite_link,
                 "payment_token": payment_token
             }
-            
+
             # Create notification using the standardized function
             notification_message = f"✅ تم {'تجديد' if subscription else 'تفعيل'} اشتراكك في {subscription_name} حتى {new_expiry_local.strftime('%Y-%m-%d %H:%M:%S UTC+3')}"
-            
+
             # Use the centralized notification system for WebSocket notifications
             await create_notification(
                 connection=connection,
@@ -264,9 +265,7 @@ async def subscribe():
                 is_public=False,
                 telegram_ids=[telegram_id]
             )
-            
 
-            
             # The create_notification function will automatically handle:
             # 1. Saving to the database
             # 2. Broadcasting to WebSocket
@@ -282,7 +281,7 @@ async def subscribe():
             }
 
             return jsonify(response_data), 200
-            
+
     except Exception as e:
         logging.error(f"❌ Critical error in /api/subscribe: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
