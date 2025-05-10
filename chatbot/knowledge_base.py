@@ -2,6 +2,7 @@
 import re
 import asyncio
 from urllib.parse import urlparse
+from quart import current_app
 import time
 from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict

@@ -7,6 +7,9 @@ from config import SECRET_KEY
 import pytz
 from chatbot.knowledge_base import KnowledgeBase
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 admin_chatbot_bp = Blueprint('admin_chatbot', __name__)
 knowledge_base = KnowledgeBase()
@@ -251,64 +254,78 @@ async def add_knowledge_item():
     """إضافة عنصر جديد إلى قاعدة المعرفة"""
     try:
         data = await request.get_json()
+        if not data:
+            return jsonify({'error': 'البيانات مطلوبة'}), 400
 
-        if not data.get('title') or not data.get('content'):
+        title = data.get('title')
+        content = data.get('content')
+
+        if not title or not content:
             return jsonify({'error': 'العنوان والمحتوى مطلوبان'}), 400
 
+        # تمرير current_app.db_pool إلى دالة KnowledgeBase
         item_id = await knowledge_base.add_item(
-            data['title'],
-            data['content'],
+            current_app.db_pool, # <-- تمرير مجمع الاتصالات
+            title,
+            content,
             data.get('category'),
             data.get('tags', [])
         )
 
-        return jsonify({'id': item_id, 'status': 'success'})
+        if item_id:
+            return jsonify({'id': item_id, 'status': 'success', 'message': 'تمت إضافة العنصر بنجاح'})
+        else:
+            # إذا كان add_item يمكن أن يفشل بدون استثناء (نادرًا ما يكون هذا هو الحال لإضافة)
+            logger.error(f"فشل add_item في KnowledgeBase للبيانات: {data}")
+            return jsonify({'error': 'فشل إضافة العنصر لسبب غير معروف'}), 500
 
     except Exception as e:
-        current_app.logger.error(f"خطأ في إضافة عنصر قاعدة المعرفة: {str(e)}")
+        logger.error(f"خطأ في إضافة عنصر قاعدة المعرفة: {str(e)} - البيانات: {await request.get_data()}", exc_info=True)
         return jsonify({'error': 'حدث خطأ أثناء إضافة العنصر'}), 500
 
 
 @admin_chatbot_bp.route('/knowledge/<int:item_id>', methods=['PUT'])
 @role_required("admin")
-async def update_knowledge_item(item_id):
-    """تحديث عنصر موجود في قاعدة المعرفة"""
+async def update_knowledge_item_route(item_id):
     try:
         data = await request.get_json()
+        if not data:
+            return jsonify({'error': 'البيانات مطلوبة'}), 400
 
         success = await knowledge_base.update_item(
             item_id,
-            data.get('title'),
-            data.get('content'),
-            data.get('category'),
-            data.get('tags')
+            title=data.get('title'),
+            content=data.get('content'),
+            category=data.get('category'),
+            tags=data.get('tags')
         )
-
         if success:
-            return jsonify({'status': 'success'})
+            return jsonify({'id': item_id, 'status': 'updated'})
         else:
-            return jsonify({'error': 'لم يتم تحديث أي بيانات'}), 400
-
+            return jsonify({'error': 'فشل تحديث العنصر أو العنصر غير موجود'}), 404 # أو 500 إذا كان خطأ
+    except RuntimeError as re:
+        current_app.logger.error(f"خطأ في تهيئة KnowledgeBase عند تحديث عنصر: {str(re)}")
+        return jsonify({'error': f'خطأ داخلي في الخادم: {str(re)}'}), 500
     except Exception as e:
-        current_app.logger.error(f"خطأ في تحديث عنصر قاعدة المعرفة: {str(e)}")
-        return jsonify({'error': 'حدث خطأ أثناء تحديث العنصر'}), 500
+        current_app.logger.error(f"خطأ في تحديث عنصر قاعدة المعرفة {item_id}: {str(e)}", exc_info=True)
+        return jsonify({'error': f'حدث خطأ أثناء تحديث العنصر: {str(e)}'}), 500
 
 
 @admin_chatbot_bp.route('/knowledge/<int:item_id>', methods=['DELETE'])
 @role_required("admin")
-async def delete_knowledge_item(item_id):
-    """حذف عنصر من قاعدة المعرفة"""
+async def delete_knowledge_item_route(item_id):
     try:
         success = await knowledge_base.delete_item(item_id)
-
         if success:
-            return jsonify({'status': 'success'})
+            return jsonify({'id': item_id, 'status': 'deleted'})
         else:
-            return jsonify({'error': 'لم يتم العثور على العنصر'}), 404
-
+            return jsonify({'error': 'فشل حذف العنصر أو العنصر غير موجود'}), 404
+    except RuntimeError as re:
+        current_app.logger.error(f"خطأ في تهيئة KnowledgeBase عند حذف عنصر: {str(re)}")
+        return jsonify({'error': f'خطأ داخلي في الخادم: {str(re)}'}), 500
     except Exception as e:
-        current_app.logger.error(f"خطأ في حذف عنصر قاعدة المعرفة: {str(e)}")
-        return jsonify({'error': 'حدث خطأ أثناء حذف العنصر'}), 500
+        current_app.logger.error(f"خطأ في حذف عنصر قاعدة المعرفة {item_id}: {str(e)}", exc_info=True)
+        return jsonify({'error': f'حدث خطأ أثناء حذف العنصر: {str(e)}'}), 500
 
 
 @admin_chatbot_bp.route('/rebuild-embeddings', methods=['POST'])
