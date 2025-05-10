@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from typing import Optional, Union
 
+
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
     return await asyncpg.create_pool(**DATABASE_CONFIG)
@@ -32,7 +33,6 @@ async def add_user(connection, telegram_id, username=None, full_name=None, walle
     except Exception as e:
         logging.error(f"Error adding/updating user {telegram_id}: {e}")
         return False
-
 
 
 async def get_user(connection, telegram_id: int):
@@ -65,21 +65,24 @@ async def get_user_db_id_by_telegram_id(conn, telegram_id: int) -> Optional[int]
     user_record = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
     return user_record['id'] if user_record else None
 
+
 async def get_active_subscription_types(conn) -> list:
     """Fetches all active subscription types (managed channels)."""
     return await conn.fetch("SELECT id, channel_id, name FROM subscription_types WHERE is_active = TRUE ORDER BY id")
+
 
 # في db_queries.py (إذا لم تكن موجودة بالفعل أو بشكل مشابه)
 async def get_subscription_type_details_by_id(conn, sub_type_id: int):
     """Fetches details for a specific subscription_type_id."""
     return await conn.fetchrow("SELECT id, channel_id FROM subscription_types WHERE id = $1", sub_type_id)
 
+
 async def add_pending_subscription(
-    connection: asyncpg.Connection,
-    user_db_id: int,
-    telegram_id: int,
-    channel_id: int,
-    subscription_type_id: int
+        connection: asyncpg.Connection,
+        user_db_id: int,
+        telegram_id: int,
+        channel_id: int,
+        subscription_type_id: int
 ) -> bool:
     """
     يضيف اشتراكًا معلقًا للمراجعة.
@@ -88,7 +91,7 @@ async def add_pending_subscription(
     """
     try:
         # 🔴 المشكلة الأولى: استدعاء INSERT ... RETURNING id مرتين
-        result = await connection.execute( # <-- الاستدعاء الأول
+        result = await connection.execute(  # <-- الاستدعاء الأول
             """
             INSERT INTO pending_subscriptions (user_db_id, telegram_id, channel_id, subscription_type_id, found_at, status)
             VALUES ($1, $2, $3, $4, NOW(), 'pending')
@@ -102,9 +105,9 @@ async def add_pending_subscription(
         )
 
         # 🔴 المشكلة الثانية: هذا الشرط غير دقيق ويعتمد على سلسلة نصية
-        if result and " 0 0" not in result: # طريقة بسيطة للتحقق, قد تحتاج لتحسين
+        if result and " 0 0" not in result:  # طريقة بسيطة للتحقق, قد تحتاج لتحسين
             # 🔴 المشكلة الثالثة: إذا كان الشرط أعلاه صحيحًا، يتم استدعاء نفس جملة INSERT مرة أخرى!
-            record_id = await connection.fetchval( # <-- الاستدعاء الثاني لنفس جملة INSERT
+            record_id = await connection.fetchval(  # <-- الاستدعاء الثاني لنفس جملة INSERT
                 """
                 INSERT INTO pending_subscriptions (user_db_id, telegram_id, channel_id, subscription_type_id, found_at, status)
                 VALUES ($1, $2, $3, $4, NOW(), 'pending')
@@ -113,7 +116,7 @@ async def add_pending_subscription(
                 """,
                 user_db_id, telegram_id, channel_id, subscription_type_id
             )
-            return record_id is not None # تم الإدراج إذا أعيد id
+            return record_id is not None  # تم الإدراج إذا أعيد id
 
     except Exception as e:
         logging.error(
@@ -124,11 +127,9 @@ async def add_pending_subscription(
     return False
 
 
-# ----------------- 🔹 إدارة الاشتراكات ----------------- #
-
-async def add_subscription(
-    connection: asyncpg.Connection,
-    user_id: int,  # تم إصلاح الموقع
+async def add_subscription_for_legacy(
+    connection: asyncpg.Connection, # الأفضل تحديد نوع الاتصال
+    user_id: int,
     telegram_id: int,
     channel_id: int,
     subscription_type_id: int,
@@ -147,18 +148,10 @@ async def add_subscription(
              start_date, expiry_date, subscription_plan_id,
              is_active, source, payment_id, invite_link, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-        """,
-        user_id,
-        telegram_id,
-        channel_id,
-        subscription_type_id,
-        start_date,
-        expiry_date,
-        subscription_plan_id,
-        is_active,
-        source,
-        payment_id,
-        invite_link)
+        """, user_id, telegram_id, channel_id, subscription_type_id,
+            start_date, expiry_date, subscription_plan_id,
+            is_active, source, payment_id, invite_link)
+
         logging.info(f"✅ Subscription added for user_id {user_id} (TG: {telegram_id}, Channel: {channel_id}, Source: {source})")
         return True
 
@@ -166,18 +159,48 @@ async def add_subscription(
         logging.error(f"❌ Error adding subscription for user_id {user_id} (TG: {telegram_id}): {e}", exc_info=True) # أضفت exc_info=True لتفاصيل أفضل
         return False
 
+
+# ----------------- 🔹 إدارة الاشتراكات ----------------- #
+
+async def add_subscription(
+        connection,
+        telegram_id: int,
+        channel_id: int,
+        subscription_type_id: int,
+        subscription_plan_id: int,
+        start_date: datetime,
+        expiry_date: datetime,
+        is_active: bool = True,
+        payment_id: str = None  # <-- إضافة payment_id كمعامل اختياري
+):
+    try:
+        await connection.execute("""
+            INSERT INTO subscriptions 
+            (telegram_id, channel_id, subscription_type_id, subscription_plan_id, start_date, expiry_date, is_active, payment_id, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        """, telegram_id, channel_id, subscription_type_id, subscription_plan_id, start_date, expiry_date, is_active,
+                                 payment_id)
+
+        logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id})")
+        return True
+
+    except Exception as e:
+        logging.error(f"❌ Error adding subscription for {telegram_id}: {e}")
+        return False
+
+
 # 1. تعديل دالة update_subscription (إزالة التعليقات الداخلية)
 async def update_subscription(
-    connection,
-    telegram_id: int,
-    channel_id: int,
-    subscription_type_id: int,
-    subscription_plan_id: int,
-    new_expiry_date: datetime,
-    start_date: datetime,
-    is_active: bool = True,
-    payment_id: str = None,
-    invite_link: str = None  # <-- إضافة invite_link
+        connection,
+        telegram_id: int,
+        channel_id: int,
+        subscription_type_id: int,
+        subscription_plan_id: int,
+        new_expiry_date: datetime,
+        start_date: datetime,
+        is_active: bool = True,
+        payment_id: str = None,
+        invite_link: str = None  # <-- إضافة invite_link
 ):
     try:
         if payment_id or invite_link:  # ✅ تحديث إذا كان هناك invite_link أو payment_id
@@ -193,7 +216,7 @@ async def update_subscription(
                     updated_at = NOW()
                 WHERE telegram_id = $8 AND channel_id = $9
             """, subscription_type_id, subscription_plan_id, new_expiry_date,
-                start_date, is_active, payment_id, invite_link, telegram_id, channel_id)
+                                     start_date, is_active, payment_id, invite_link, telegram_id, channel_id)
         else:  # ✅ تحديث بدون تعديل `payment_id` أو `invite_link`
             await connection.execute("""
                 UPDATE subscriptions SET
@@ -205,7 +228,7 @@ async def update_subscription(
                     updated_at = NOW()
                 WHERE telegram_id = $6 AND channel_id = $7
             """, subscription_type_id, new_expiry_date, start_date,
-                is_active, telegram_id, channel_id)
+                                     is_active, telegram_id, channel_id)
 
         logging.info(f"✅ Subscription updated for {telegram_id} (Channel: {channel_id})")
         return True
@@ -274,6 +297,7 @@ async def deactivate_subscription(connection, telegram_id: int, channel_id: int 
     except Exception as e:
         logging.error(f"❌ Error deactivating subscription(s) for user {telegram_id}: {e}")
         return False
+
 
 # ----------------- 🔹 إدارة المهام المجدولة ----------------- #
 
@@ -344,7 +368,6 @@ async def get_pending_tasks(connection, channel_id: int = None):
     except Exception as e:
         logging.error(f"❌ Error retrieving pending tasks (channel_id: {channel_id}): {e}")
         return []
-
 
 
 async def update_task_status(connection, task_id: int, status: str):
@@ -444,12 +467,12 @@ async def record_payment(
 
 
 async def update_payment_with_txhash(
-    conn,
-    payment_token: str,
-    tx_hash: str,
-    amount_received: Decimal,
-    status: str = "completed",
-    error_message: Optional[str] = None
+        conn,
+        payment_token: str,
+        tx_hash: str,
+        amount_received: Decimal,
+        status: str = "completed",
+        error_message: Optional[str] = None
 ) -> Optional[dict]:
     """
     تحديث سجل الدفع مع تفاصيل جديدة وتحديث حالة المعاملة في incoming_transactions
@@ -477,11 +500,11 @@ async def update_payment_with_txhash(
                 error_message,
                 payment_token
             )
-            
+
             if not payment_row:
                 logging.error(f"❌ لم يتم العثور على دفعة بالـ token: {payment_token}")
                 return None
-            
+
             # 2. تحديث جدول incoming_transactions
             incoming_query = """
                 UPDATE incoming_transactions
@@ -490,16 +513,15 @@ async def update_payment_with_txhash(
                 RETURNING txhash;
             """
             incoming_row = await conn.fetchrow(incoming_query, tx_hash)
-            
+
             if not incoming_row:
                 logging.warning(f"⚠️ لم يتم العثور على معاملة واردة بالـ txhash: {tx_hash}")
-            
+
             return dict(payment_row)
-            
+
     except Exception as e:
         logging.error(f"❌ فشل تحديث الدفعة والمعاملة: {str(e)}", exc_info=True)
         return None
-
 
 
 async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Optional[dict]:
@@ -527,12 +549,12 @@ async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Op
 
 
 async def record_incoming_transaction(
-    conn,
-    txhash: str,
-    sender: str,
-    amount: float,
-    payment_token: Optional[str] = None,
-    memo: Optional[str] = None
+        conn,
+        txhash: str,
+        sender: str,
+        amount: float,
+        payment_token: Optional[str] = None,
+        memo: Optional[str] = None
 ):
     """
     تسجيل المعاملة الواردة في جدول incoming_transactions مع التوقيت المصحح
@@ -553,15 +575,16 @@ async def record_incoming_transaction(
             )
             ON CONFLICT (txhash) DO NOTHING
         ''',
-        txhash,
-        sender,
-        amount,
-        payment_token,
-        False,
-        memo)
+                           txhash,
+                           sender,
+                           amount,
+                           payment_token,
+                           False,
+                           memo)
         logging.info(f"✅ تم تسجيل المعاملة {txhash}")
     except Exception as e:
         logging.error(f"❌ فشل تسجيل المعاملة {txhash}: {str(e)}")
+
 
 async def get_unread_notifications_count(connection, telegram_id: int) -> int:
     """

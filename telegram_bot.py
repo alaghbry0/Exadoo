@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from dotenv import load_dotenv
 from quart import Blueprint, current_app, request, jsonify
-from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, get_active_subscription_types,get_subscription_type_details_by_id, add_subscription, add_pending_subscription
+from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, get_active_subscription_types,get_subscription_type_details_by_id, add_subscription_for_legacy, add_pending_subscription
 import asyncpg
 from functools import partial
 from typing import Optional
@@ -109,7 +109,7 @@ async def handle_legacy_user(
 
                 is_active_legacy = legacy_sub['expiry_date'] > datetime.now(timezone.utc) if legacy_sub['expiry_date'] else False
 
-                await add_subscription( # تأكد أن هذه هي الدالة المعدلة من db_queries.py
+                await add_subscription_for_legacy( # تأكد أن هذه هي الدالة المعدلة من db_queries.py
                     connection=conn,
                     user_id=user_db_id,
                     telegram_id=telegram_id,

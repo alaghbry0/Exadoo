@@ -155,17 +155,14 @@ async def subscribe():
                 # داخل الـ else:
                 added = await add_subscription(
                     connection,
-                    user_id=user_id,
-                    telegram_id=telegram_id,
-                    channel_id=channel_id,
-                    subscription_type_id=subscription_plan["subscription_type_id"],
-                    start_date=start_date,
-                    expiry_date=new_expiry,
-                    subscription_plan_id=subscription_plan_id,
-                    is_active=True,
-                    source=None,
-                    payment_id=payment_id,
-                    invite_link=invite_link
+                    telegram_id,
+                    channel_id,
+                    subscription_plan["subscription_type_id"],
+                    subscription_plan_id,
+                    start_date,
+                    new_expiry,
+                    True,
+                    payment_id
                 )
                 if not added:
                     logging.error(f"❌ Failed to create subscription for {telegram_id}")
