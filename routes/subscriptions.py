@@ -162,7 +162,8 @@ async def subscribe():
                     start_date,
                     new_expiry,
                     True,
-                    payment_id
+                    payment_id,
+                    invite_link  # <-- إضافة invite_link هنا
                 )
                 if not added:
                     logging.error(f"❌ Failed to create subscription for {telegram_id}")
