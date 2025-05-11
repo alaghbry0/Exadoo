@@ -12,69 +12,57 @@ telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 # ----------------- 🔹 إضافة المستخدم إلى القناة ----------------- #
 
-async def add_user_to_channel(telegram_id: int, subscription_type_id: int, db_pool):
+async def generate_channel_invite_link(telegram_id: int, channel_id: int, channel_name: str):  # اسم أكثر عمومية
     """
-    إضافة المستخدم إلى القناة أو توليد رابط دعوة للمستخدم.
-    يُعيد الدالة قاموسًا يحتوي على:
-      - success: حالة العملية (True/False)
-      - already_joined: (سيكون دائمًا False بعد إزالة الفحص)
-      - invite_link: رابط الدعوة (إن تم توليده)
-      - message: رسالة توضيحية
+    توليد رابط دعوة لمستخدم لقناة محددة.
     """
     try:
-        async with db_pool.acquire() as connection:
-            subscription_type = await connection.fetchrow(
-                "SELECT channel_id, name FROM subscription_types WHERE id = $1", subscription_type_id
-            )
-
-        if not subscription_type:
-            logging.error(f"❌ نوع الاشتراك {subscription_type_id} غير موجود.")
-            return {"success": False, "error": "Invalid subscription type."}
-
-        channel_id = int(subscription_type['channel_id'])
-        channel_name = subscription_type['name']
-
-        # إزالة الحظر إن وجد للتأكد من إمكانية الانضمام
+        # إزالة الحظر إن وجد
         try:
             await telegram_bot.unban_chat_member(chat_id=channel_id, user_id=telegram_id)
-        except TelegramAPIError:
-            logging.warning(f"⚠️ لم يتمكن من إزالة الحظر عن المستخدم {telegram_id}.")
+            logging.info(f"Attempted to unban user {telegram_id} from channel {channel_id}.")
+        except TelegramAPIError as e:
+            logging.warning(f"⚠️ Could not unban user {telegram_id} from channel {channel_id}: {e.message}")
 
-        # حساب وقت انتهاء صلاحية رابط الدعوة: شهر كامل (30 يوم) من الآن
-        expire_date = int(time.time()) + (30 * 24 * 60 * 60)
-
-        # إنشاء رابط دعوة للمستخدم مع صلاحية محددة الزمن
+        expire_date = int(time.time()) + (30 * 24 * 60 * 60)  # شهر واحد
         invite_link_obj = await telegram_bot.create_chat_invite_link(
             chat_id=channel_id,
-            creates_join_request=True,  # خيار يتطلب موافقة المسؤول عند الانضمام
-            name=f"اشتراك مستخدم {telegram_id}",  # اسم وصفي للرابط
-            expire_date=expire_date        # انتهاء الصلاحية بعد شهر
+            creates_join_request=True,
+            name=f"اشتراك {telegram_id} في {channel_name}",
+            expire_date=expire_date
         )
-        invite_link = invite_link_obj.invite_link
-        logging.info(f"✅ تم إنشاء رابط الدعوة للمستخدم {telegram_id}: {invite_link}")
-
-        # التأكد من أن invite_link نصي؛ إذا كان None، نعيد سلسلة فارغة
-        if invite_link is None:
-            invite_link = ""
-        elif not isinstance(invite_link, str):
-            invite_link = str(invite_link)
-        logging.info(f"Type of invite_link: {type(invite_link)} - Value: {invite_link}")
+        invite_link_str = invite_link_obj.invite_link
+        logging.info(
+            f"✅ تم إنشاء رابط دعوة للمستخدم {telegram_id} لقناة {channel_name} ({channel_id}): {invite_link_str}")
 
         return {
             "success": True,
-            "already_joined": False,
-            "invite_link": invite_link,
-            "message": f"تم تفعيل اشتراكك بنجاح! يمكنك الانضمام إلى قناة {channel_name} عبر الرابط المقدم. سيتم قبول طلب انضمامك من قبل مشرفي القناة."
+            "invite_link": invite_link_str if invite_link_str else "",
+            "message": f"تم إنشاء رابط دعوة لك للانضمام إلى قناة {channel_name}."
         }
-
     except TelegramAPIError as e:
-        logging.error(f"❌ خطأ أثناء إنشاء رابط الدعوة للمستخدم {telegram_id}: {e}")
-        return {"success": False, "error": str(e)}
+        logging.error(f"❌ خطأ API أثناء إنشاء رابط دعوة للمستخدم {telegram_id} لقناة {channel_id}: {e}")
+        return {"success": False, "invite_link": None, "error": str(e)}
     except Exception as e:
-        logging.error(f"❌ خطأ غير متوقع أثناء إضافة المستخدم {telegram_id}: {e}")
-        return {"success": False, "error": str(e)}
+        logging.error(f"❌ خطأ غير متوقع أثناء معالجة القناة {channel_id} للمستخدم {telegram_id}: {e}")
+        return {"success": False, "invite_link": None, "error": str(e)}
 
-# ----------------- 🔹 إزالة المستخدم من القناة ----------------- #
+
+async def send_message_to_user(telegram_id: int, message_text: str):
+    """
+    إرسال رسالة نصية إلى مستخدم تليجرام.
+    """
+    try:
+        await telegram_bot.send_message(chat_id=telegram_id, text=message_text, parse_mode="HTML")  # أضفت parse_mode
+        logging.info(f"✅ Message sent to {telegram_id}")
+        return True
+    except TelegramAPIError as e:
+        logging.error(f"❌ Failed to send message to {telegram_id}: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"❌ Unexpected error sending message to {telegram_id}: {e}")
+        return False
+
 
 async def remove_user_from_channel(connection, telegram_id: int, channel_id: int):
     """
@@ -82,31 +70,38 @@ async def remove_user_from_channel(connection, telegram_id: int, channel_id: int
     """
     try:
         # جلب اسم القناة
-        subscription_type = await connection.fetchrow(
-            "SELECT name FROM subscription_types WHERE channel_id = $1", channel_id
+        # بما أن scheduled_tasks.channel_id لم يعد مقيدًا بـ subscription_types
+        # نحتاج لجلب اسم القناة من subscription_type_channels أو جدول Channels عام إذا كان لديك
+        channel_info = await connection.fetchrow(
+            """SELECT stc.channel_name, st.name as subscription_type_name
+               FROM subscription_type_channels stc
+               JOIN subscription_types st ON stc.subscription_type_id = st.id
+               WHERE stc.channel_id = $1 LIMIT 1""",
+            channel_id
         )
 
-        if not subscription_type:
-            logging.error(f"❌ لم يتم العثور على القناة {channel_id}.")
-            return False
-
-        channel_name = subscription_type['name']
+        # إذا لم يتم العثور عليه في subscription_type_channels، قد يكون قناة قديمة أو خطأ ما.
+        # يمكنك وضع اسم افتراضي أو تسجيل خطأ.
+        channel_display_name = channel_info['channel_name'] if channel_info and channel_info[
+            'channel_name'] else f"القناة {channel_id}"
+        subscription_type_name_for_message = channel_info['subscription_type_name'] if channel_info else "الاشتراك"
 
         # محاولة إزالة المستخدم من القناة
         try:
             await telegram_bot.ban_chat_member(chat_id=channel_id, user_id=telegram_id)
-            logging.info(f"✅ تمت إزالة المستخدم {telegram_id} من القناة {channel_id}.")
+            logging.info(f"✅ تمت إزالة المستخدم {telegram_id} من القناة {channel_display_name} ({channel_id}).")
         except TelegramAPIError as e:
-            logging.error(f"❌ فشل إزالة المستخدم {telegram_id} من القناة {channel_id}: {e}")
-            return False
+            logging.error(f"❌ فشل إزالة المستخدم {telegram_id} من القناة {channel_display_name} ({channel_id}): {e}")
+            # لا ترجع False هنا مباشرة، فقد نرغب في إرسال الرسالة على أي حال
+            pass
 
         # إرسال إشعار للمستخدم
-        success = await send_message(
-            telegram_id,
-            f"⚠️ تم إخراجك من قناة '{channel_name}' بسبب انتهاء الاشتراك.\n"
+        message_to_user = (
+            f"⚠️ تم إخراجك من قناة '{channel_display_name}' (التابعة لاشتراك '{subscription_type_name_for_message}') بسبب انتهاء الاشتراك.\n"
             "🔄 يمكنك التجديد للعودة مجددًا!"
         )
-        return success
+        await send_message_to_user(telegram_id, message_to_user)
+        return True
 
     except Exception as e:
         logging.error(f"❌ خطأ غير متوقع أثناء إزالة المستخدم {telegram_id} من القناة {channel_id}: {e}")

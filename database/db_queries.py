@@ -172,22 +172,36 @@ async def add_subscription(
     expiry_date: datetime,
     is_active: bool = True,
     payment_id: str = None,
-    invite_link: str = None  # <-- إضافة invite_link
+    invite_link: str = None,
+    returning_id: bool = False # <-- أضف المعامل هنا مع قيمة افتراضية
 ):
     try:
-        await connection.execute("""
+        query = """
             INSERT INTO subscriptions 
             (telegram_id, channel_id, subscription_type_id, subscription_plan_id, 
              start_date, expiry_date, is_active, payment_id, invite_link, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-        """, telegram_id, channel_id, subscription_type_id, subscription_plan_id,
-            start_date, expiry_date, is_active, payment_id, invite_link)
+        """
+        params = [
+            telegram_id, channel_id, subscription_type_id, subscription_plan_id,
+            start_date, expiry_date, is_active, payment_id, invite_link
+        ]
 
-        logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id})")
-        return True
+        if returning_id:
+            query += " RETURNING id" # أضف RETURNING id إلى الاستعلام
+            # استخدم fetchval للحصول على القيمة المرجعة (الـ id)
+            new_subscription_id = await connection.fetchval(query, *params)
+            logging.info(f"✅ Subscription added with ID {new_subscription_id} for user {telegram_id} (Channel: {channel_id})")
+            return new_subscription_id # أرجع الـ ID
+        else:
+            await connection.execute(query, *params)
+            logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id})")
+            return True # السلوك القديم إذا لم يتم طلب إرجاع ID
 
     except Exception as e:
-        logging.error(f"❌ Error adding subscription for {telegram_id}: {e}")
+        logging.error(f"❌ Error adding subscription for {telegram_id} (Channel: {channel_id}): {e}", exc_info=True)
+        if returning_id:
+            return None # أرجع None في حالة الخطأ إذا كان من المفترض إرجاع ID
         return False
 
 

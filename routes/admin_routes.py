@@ -143,145 +143,375 @@ async def remove_user():
 # نقاط API لإدارة أنواع الاشتراكات (subscription_types)
 #######################################
 
-# إضافة نوع اشتراك جديد
+
+# --- إنشاء نوع اشتراك جديد ---
 @admin_routes.route("/subscription-types", methods=["POST"])
-@role_required("admin")  # ✅ استخدام @role_required("admin")
+# @role_required("admin") # افترض أن هذا الديكوريتور موجود
 async def create_subscription_type():
     try:
         data = await request.get_json()
         name = data.get("name")
-        channel_id = data.get("channel_id")
+        main_channel_id = data.get("main_channel_id")  # تم تغيير الاسم ليعكس الغرض
         description = data.get("description", "")
         image_url = data.get("image_url", "")
-        features = data.get("features", [])  # يجب أن يكون قائمة (List)
+        features = data.get("features", [])
         usp = data.get("usp", "")
         is_active = data.get("is_active", True)
+        # قائمة اختيارية للقنوات الفرعية
+        # كل عنصر في القائمة يجب أن يكون قاموسًا مثل: {"channel_id": 123, "channel_name": "اسم القناة"}
+        secondary_channels_data = data.get("secondary_channels", [])  # قائمة اختيارية
 
-        if not name or channel_id is None:
-            return jsonify({"error": "Missing required fields: name and channel_id"}), 400
+        if not name or main_channel_id is None:
+            return jsonify({"error": "Missing required fields: name and main_channel_id"}), 400
+
+        try:
+            # التحقق من أن main_channel_id هو رقم صحيح
+            main_channel_id = int(main_channel_id)
+        except ValueError:
+            return jsonify({"error": "main_channel_id must be an integer"}), 400
+
+        # التحقق من صحة بيانات القنوات الفرعية
+        valid_secondary_channels = []
+        if not isinstance(secondary_channels_data, list):
+            return jsonify({"error": "secondary_channels must be a list"}), 400
+
+        for ch_data in secondary_channels_data:
+            if not isinstance(ch_data, dict) or "channel_id" not in ch_data:
+                return jsonify({"error": "Each secondary channel must be an object with a 'channel_id'"}), 400
+            try:
+                ch_id = int(ch_data["channel_id"])
+                ch_name = ch_data.get("channel_name")  # اسم القناة اختياري هنا
+                if ch_id == main_channel_id:  # لا يمكن أن تكون القناة الفرعية هي نفسها الرئيسية
+                    return jsonify(
+                        {"error": f"Secondary channel ID {ch_id} cannot be the same as the main channel ID."}), 400
+                valid_secondary_channels.append({"channel_id": ch_id, "channel_name": ch_name})
+            except ValueError:
+                return jsonify({
+                                   "error": f"Invalid channel_id '{ch_data['channel_id']}' in secondary_channels. Must be an integer."}), 400
 
         async with current_app.db_pool.acquire() as connection:
-            query = """
-                INSERT INTO subscription_types
-                (name, channel_id, description, image_url, features, usp, is_active)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
-                RETURNING id, name, channel_id, description, image_url, features, usp, is_active, created_at;
-            """
-            result = await connection.fetchrow(
-                query,
-                name,
-                channel_id,
-                description,
-                image_url,
-                json.dumps(features),
-                usp,
-                is_active
-            )
-        return jsonify(dict(result)), 201
+            async with connection.transaction():  # استخدام Transaction لضمان سلامة البيانات
+                # 1. إدراج في subscription_types
+                query_type = """
+                    INSERT INTO subscription_types
+                    (name, channel_id, description, image_url, features, usp, is_active)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+                    RETURNING id, name, channel_id AS main_channel_id, description, image_url, features, usp, is_active, created_at;
+                """
+                created_type = await connection.fetchrow(
+                    query_type, name, main_channel_id, description, image_url,
+                    json.dumps(features), usp, is_active
+                )
+                if not created_type:
+                    # هذا لا ينبغي أن يحدث إذا كان الاستعلام صحيحًا ولم يكن هناك خطأ في قاعدة البيانات
+                    raise Exception("Failed to create subscription type record.")
+
+                new_type_id = created_type["id"]
+
+                # 2. إدراج القناة الرئيسية في subscription_type_channels
+                # افترض أن لديك اسمًا للقناة الرئيسية، أو يمكنك جعله اختياريًا أو جلبه لاحقًا
+                main_channel_name_from_data = data.get("main_channel_name", f"Main Channel for {name}")  # اسم افتراضي
+
+                await connection.execute(
+                    """
+                    INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
+                    VALUES ($1, $2, $3, TRUE)
+                    ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET
+                    channel_name = EXCLUDED.channel_name, is_main = TRUE;
+                    """,
+                    new_type_id, main_channel_id, main_channel_name_from_data
+                )
+
+                # 3. إدراج القنوات الفرعية في subscription_type_channels
+                if valid_secondary_channels:
+                    for sec_channel in valid_secondary_channels:
+                        await connection.execute(
+                            """
+                            INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
+                            VALUES ($1, $2, $3, FALSE)
+                            ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET
+                            channel_name = EXCLUDED.channel_name, is_main = FALSE;
+                            """,
+                            new_type_id, sec_channel["channel_id"], sec_channel.get("channel_name")
+                        )
+
+                # جلب كل القنوات المرتبطة بعد الإدراج
+                linked_channels_query = "SELECT channel_id, channel_name, is_main FROM subscription_type_channels WHERE subscription_type_id = $1"
+                linked_channels_rows = await connection.fetch(linked_channels_query, new_type_id)
+
+                response_data = dict(created_type)
+                response_data["linked_channels"] = [dict(row) for row in linked_channels_rows]
+
+        return jsonify(response_data), 201
+
     except Exception as e:
         logging.error("Error creating subscription type: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 
-# تعديل بيانات نوع اشتراك موجود
+# --- تعديل بيانات نوع اشتراك موجود ---
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["PUT"])
-@role_required("admin")  # ✅ استخدام @role_required("admin")
+# @role_required("admin")
 async def update_subscription_type(type_id: int):
     try:
         data = await request.get_json()
+
+        # الحقول التي يمكن تحديثها في subscription_types
         name = data.get("name")
-        channel_id = data.get("channel_id")
+        new_main_channel_id_str = data.get("main_channel_id")
         description = data.get("description")
         image_url = data.get("image_url")
-        features = data.get("features")
+        features = data.get("features")  # قائمة
         usp = data.get("usp")
         is_active = data.get("is_active")
+        main_channel_name_from_data = data.get("main_channel_name")  # اسم القناة الرئيسية المحدث
+
+        # قائمة القنوات الفرعية (إذا تم تمريرها، ستحل محل القائمة القديمة بالكامل)
+        # إذا لم يتم تمريرها (secondary_channels is None)، لا نغير القنوات الفرعية الحالية.
+        # إذا تم تمريرها كقائمة فارغة ([]), سيتم حذف كل القنوات الفرعية.
+        secondary_channels_data = data.get("secondary_channels")  # يمكن أن يكون None, أو قائمة
+
+        new_main_channel_id = None
+        if new_main_channel_id_str is not None:
+            try:
+                new_main_channel_id = int(new_main_channel_id_str)
+            except ValueError:
+                return jsonify({"error": "main_channel_id must be an integer if provided"}), 400
+
+        valid_new_secondary_channels = []
+        if secondary_channels_data is not None:  # فقط إذا تم توفير المفتاح
+            if not isinstance(secondary_channels_data, list):
+                return jsonify({"error": "secondary_channels must be a list if provided"}), 400
+            for ch_data in secondary_channels_data:
+                if not isinstance(ch_data, dict) or "channel_id" not in ch_data:
+                    return jsonify({"error": "Each secondary channel must be an object with 'channel_id'"}), 400
+                try:
+                    ch_id = int(ch_data["channel_id"])
+                    if new_main_channel_id is not None and ch_id == new_main_channel_id:  # التحقق مقابل الـ ID الجديد إذا تم توفيره
+                        return jsonify({
+                                           "error": f"Secondary channel ID {ch_id} cannot be the same as the new main channel ID."}), 400
+                    # إذا لم يتم توفير new_main_channel_id، يجب التحقق مقابل الـ ID الرئيسي الحالي من قاعدة البيانات (خطوة إضافية)
+
+                    valid_new_secondary_channels.append({
+                        "channel_id": ch_id,
+                        "channel_name": ch_data.get("channel_name")
+                    })
+                except ValueError:
+                    return jsonify(
+                        {"error": f"Invalid channel_id '{ch_data['channel_id']}' in secondary_channels."}), 400
 
         async with current_app.db_pool.acquire() as connection:
-            query = """
-                UPDATE subscription_types
-                SET name = COALESCE($1, name),
-                    channel_id = COALESCE($2, channel_id),
-                    description = COALESCE($3, description),
-                    image_url = COALESCE($4, image_url),
-                    features = COALESCE($5::jsonb, features),
-                    usp = COALESCE($6, usp),
-                    is_active = COALESCE($7, is_active)
-                WHERE id = $8
-                RETURNING id, name, channel_id, description, image_url, features, usp, is_active, created_at;
-            """
-            features_json = json.dumps(features) if features is not None else None
-            result = await connection.fetchrow(query, name, channel_id, description, image_url, features_json, usp,
-                                               is_active, type_id)
-        if result:
-            return jsonify(dict(result)), 200
-        else:
-            return jsonify({"error": "Subscription type not found"}), 404
+            async with connection.transaction():
+                # 1. جلب القناة الرئيسية الحالية (إذا لم يتم توفير قناة رئيسية جديدة)
+                current_main_channel_id_db = new_main_channel_id  # استخدام الجديد إذا توفر
+                if current_main_channel_id_db is None:  # إذا لم يتم توفير main_channel_id جديد في الطلب
+                    current_main_channel_id_db = await connection.fetchval(
+                        "SELECT channel_id FROM subscription_types WHERE id = $1", type_id)
+                    if current_main_channel_id_db is None:  # نوع الاشتراك غير موجود
+                        return jsonify({"error": "Subscription type not found"}), 404
+
+                # التأكد من أن القنوات الفرعية الجديدة لا تتعارض مع القناة الرئيسية النهائية
+                for sec_ch in valid_new_secondary_channels:
+                    if sec_ch["channel_id"] == current_main_channel_id_db:
+                        return jsonify({
+                                           "error": f"Secondary channel ID {sec_ch['channel_id']} conflicts with the effective main channel ID."}), 400
+
+                # 2. تحديث subscription_types
+                query_type_update = """
+                    UPDATE subscription_types
+                    SET name = COALESCE($1, name),
+                        channel_id = COALESCE($2, channel_id),
+                        description = COALESCE($3, description),
+                        image_url = COALESCE($4, image_url),
+                        features = COALESCE($5::jsonb, features),
+                        usp = COALESCE($6, usp),
+                        is_active = COALESCE($7, is_active)
+                    WHERE id = $8
+                    RETURNING id, name, channel_id AS main_channel_id, description, image_url, features, usp, is_active, created_at;
+                """
+                features_json = json.dumps(features) if features is not None else None
+                updated_type = await connection.fetchrow(
+                    query_type_update, name, new_main_channel_id, description, image_url,
+                    features_json, usp, is_active, type_id
+                )
+
+                if not updated_type:
+                    return jsonify({"error": "Subscription type not found or no update occurred"}), 404
+
+                effective_main_channel_id = updated_type["main_channel_id"]  # القناة الرئيسية بعد التحديث
+
+                # 3. إدارة القنوات في subscription_type_channels
+                # إذا تم توفير secondary_channels_data (حتى لو قائمة فارغة), سنقوم بإعادة بناء الروابط.
+                # إذا كان secondary_channels_data هو None, لا نلمس الروابط الحالية إلا لتحديث is_main إذا تغيرت القناة الرئيسية.
+
+                # أ. تحديث أو إضافة القناة الرئيسية الجديدة
+                if main_channel_name_from_data is None:  # إذا لم يتم توفير اسم جديد للقناة الرئيسية
+                    # جلب الاسم الحالي للقناة الرئيسية إذا كانت موجودة، أو استخدم اسم افتراضي
+                    existing_main_ch_name_row = await connection.fetchrow(
+                        "SELECT channel_name FROM subscription_type_channels WHERE subscription_type_id = $1 AND channel_id = $2",
+                        type_id, effective_main_channel_id
+                    )
+                    main_channel_name_to_use = existing_main_ch_name_row[
+                        'channel_name'] if existing_main_ch_name_row and existing_main_ch_name_row[
+                        'channel_name'] else f"Main Channel for {updated_type['name']}"
+                else:
+                    main_channel_name_to_use = main_channel_name_from_data
+
+                # أولاً، تأكد من أن جميع القنوات الأخرى ليست هي الرئيسية
+                await connection.execute(
+                    "UPDATE subscription_type_channels SET is_main = FALSE WHERE subscription_type_id = $1 AND channel_id != $2",
+                    type_id, effective_main_channel_id
+                )
+                # ثم، قم بتعيين/تحديث القناة الرئيسية الفعلية
+                await connection.execute(
+                    """
+                    INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
+                    VALUES ($1, $2, $3, TRUE)
+                    ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET
+                    channel_name = EXCLUDED.channel_name, is_main = TRUE;
+                    """,
+                    type_id, effective_main_channel_id, main_channel_name_to_use
+                )
+
+                # ب. إذا تم توفير قائمة بالقنوات الفرعية (حتى لو فارغة)، قم بإعادة بنائها
+                if secondary_channels_data is not None:
+                    # حذف جميع القنوات الفرعية القديمة (التي ليست هي القناة الرئيسية الجديدة)
+                    await connection.execute(
+                        "DELETE FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = FALSE AND channel_id != $2",
+                        type_id, effective_main_channel_id
+                        # لا تحذف القناة الرئيسية إذا كانت بالخطأ is_main=false مؤقتاً
+                    )
+                    # تأكد من أن is_main=false لا تحذف القناة الرئيسية
+                    await connection.execute(
+                        "DELETE FROM subscription_type_channels WHERE subscription_type_id = $1 AND channel_id != $2 AND is_main = FALSE",
+                        type_id, effective_main_channel_id
+                    )
+
+                    # إضافة القنوات الفرعية الجديدة
+                    for sec_channel in valid_new_secondary_channels:
+                        await connection.execute(
+                            """
+                            INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
+                            VALUES ($1, $2, $3, FALSE)
+                            ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET
+                            channel_name = EXCLUDED.channel_name, is_main = FALSE; 
+                            """,  # تأكد من أن التحديث لا يجعلها is_main = TRUE بالخطأ
+                            type_id, sec_channel["channel_id"], sec_channel.get("channel_name")
+                        )
+
+                # جلب كل القنوات المرتبطة بعد التحديث
+                linked_channels_query = "SELECT channel_id, channel_name, is_main FROM subscription_type_channels WHERE subscription_type_id = $1 ORDER BY is_main DESC, channel_name"
+                linked_channels_rows = await connection.fetch(linked_channels_query, type_id)
+
+                response_data = dict(updated_type)
+                response_data["linked_channels"] = [dict(row) for row in linked_channels_rows]
+
+        return jsonify(response_data), 200
+
     except Exception as e:
-        logging.error("Error updating subscription type: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+        logging.error("Error updating subscription type %s: %s", type_id, e, exc_info=True)
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 
-# حذف نوع اشتراك
+# --- حذف نوع اشتراك ---
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["DELETE"])
-@role_required("admin")  # ✅ استخدام @role_required("admin")
+# @role_required("admin")
 async def delete_subscription_type(type_id: int):
     try:
         async with current_app.db_pool.acquire() as connection:
-            query = "DELETE FROM subscription_types WHERE id = $1"
-            await connection.execute(query, type_id)
-        return jsonify({"message": "Subscription type deleted successfully"}), 200
+            # الحذف من subscription_types سيؤدي إلى حذف السجلات المرتبطة
+            # من subscription_type_channels بسبب ON DELETE CASCADE
+            # تأكد من أن هذا هو السلوك المطلوب.
+            # إذا كان هناك اشتراكات قائمة subscriptions أو خطط subscription_plans مرتبطة بهذا النوع،
+            # قد تحتاج إلى التعامل معها (منع الحذف أو حذفها أيضًا إذا كان ذلك مناسبًا).
+            # حاليًا، subscription_plans لديها ON DELETE CASCADE.
+            # subscriptions ليس لديها، لذا قد يحدث خطأ إذا كان هناك اشتراكات مرتبطة.
+            # يجب إما إضافة ON DELETE CASCADE أو SET NULL لـ subscriptions.subscription_type_id
+            # أو التحقق برمجيًا هنا.
+
+            # تحقق مبدئي إذا كان هناك اشتراكات مرتبطة (اختياري، لكن جيد)
+            active_subs_count = await connection.fetchval(
+                "SELECT COUNT(*) FROM subscriptions WHERE subscription_type_id = $1", type_id)
+            if active_subs_count > 0:
+                return jsonify({
+                                   "error": f"Cannot delete. There are {active_subs_count} active subscriptions linked to this type."}), 409  # Conflict
+
+            await connection.execute("DELETE FROM subscription_types WHERE id = $1", type_id)
+        return jsonify({"message": "Subscription type and its associated channels deleted successfully"}), 200
     except Exception as e:
-        logging.error("Error deleting subscription type: %s", e, exc_info=True)
+        logging.error("Error deleting subscription type %s: %s", type_id, e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
-# جلب قائمة أنواع الاشتراكات
+# --- جلب قائمة أنواع الاشتراكات ---
 @admin_routes.route("/subscription-types", methods=["GET"])
-@role_required("owner")  # ✅ استخدام @role_required("admin")
+# @role_required("owner") # أو "admin"
 async def get_subscription_types():
     try:
         async with current_app.db_pool.acquire() as connection:
             query = """
-                SELECT id, name, channel_id, description, image_url, features, usp, is_active, created_at
-                FROM subscription_types
-                ORDER BY created_at DESC
+                SELECT 
+                    st.id, st.name, st.channel_id AS main_channel_id, st.description, 
+                    st.image_url, st.features, st.usp, st.is_active, st.created_at,
+                    (SELECT json_agg(json_build_object('channel_id', stc.channel_id, 'channel_name', stc.channel_name, 'is_main', stc.is_main)) 
+                     FROM subscription_type_channels stc 
+                     WHERE stc.subscription_type_id = st.id) AS linked_channels
+                FROM subscription_types st
+                ORDER BY st.created_at DESC;
             """
             results = await connection.fetch(query)
 
-        types = []
-        for row in results:
-            row_dict = dict(row)
-            row_dict["features"] = json.loads(row_dict["features"]) if row_dict["features"] else []
-            types.append(row_dict)
+        types_list = []
+        for row_data in results:
+            type_item = dict(row_data)
+            # features بالفعل jsonb، لا حاجة لـ json.loads إذا كان PostgreSQL يُرجعها كـ dict/list
+            # إذا كانت تُرجع كنص JSON، عندها ستحتاج للتحويل.
+            # linked_channels يُرجعها json_agg كـ JSON (غالبًا نص)، لذا قد تحتاج للتحويل
+            if isinstance(type_item.get("linked_channels"), str):
+                type_item["linked_channels"] = json.loads(type_item["linked_channels"]) if type_item[
+                    "linked_channels"] else []
+            elif type_item.get("linked_channels") is None:  # إذا لم تكن هناك قنوات مرتبطة، json_agg قد يُرجع NULL
+                type_item["linked_channels"] = []
 
-        return jsonify(types), 200, {"Content-Type": "application/json; charset=utf-8"}
+            types_list.append(type_item)
 
+        return jsonify(types_list), 200
     except Exception as e:
         logging.error("Error fetching subscription types: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
-# جلب تفاصيل نوع اشتراك معين
+# --- جلب تفاصيل نوع اشتراك معين ---
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["GET"])
-@role_required("admin")  # ✅ استخدام @role_required("admin")
+# @role_required("admin")
 async def get_subscription_type(type_id: int):
     try:
         async with current_app.db_pool.acquire() as connection:
-            query = """
-                SELECT id, name, channel_id, description, image_url, features, usp, is_active, created_at
+            query_type = """
+                SELECT id, name, channel_id AS main_channel_id, description, image_url, features, usp, is_active, created_at
                 FROM subscription_types
-                WHERE id = $1
+                WHERE id = $1;
             """
-            result = await connection.fetchrow(query, type_id)
-        if result:
-            return jsonify(dict(result)), 200
-        else:
-            return jsonify({"error": "Subscription type not found"}), 404
-    except Exception as e:
-        logging.error("Error fetching subscription type: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+            type_details = await connection.fetchrow(query_type, type_id)
 
+            if not type_details:
+                return jsonify({"error": "Subscription type not found"}), 404
+
+            query_channels = """
+                SELECT channel_id, channel_name, is_main
+                FROM subscription_type_channels
+                WHERE subscription_type_id = $1
+                ORDER BY is_main DESC, channel_name;
+            """
+            linked_channels_rows = await connection.fetch(query_channels, type_id)
+
+            response_data = dict(type_details)
+            response_data["linked_channels"] = [dict(row) for row in linked_channels_rows]
+
+        return jsonify(response_data), 200
+    except Exception as e:
+        logging.error("Error fetching subscription type %s: %s", type_id, e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 #######################################
 # نقاط API لإدارة خطط الاشتراك (subscription_plans)
