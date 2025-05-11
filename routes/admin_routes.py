@@ -9,6 +9,8 @@ import pytz
 from functools import wraps
 import jwt
 import asyncpg
+import asyncio
+
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
@@ -1638,3 +1640,88 @@ async def update_reminder_settings():
             "error": "حدث خطأ داخلي أثناء معالجة الطلب",
             "details": str(e)
         }), 500
+
+
+@admin_routes.route("/terms-conditions", methods=["GET"])
+@role_required("admin")
+async def get_terms_conditions():
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                SELECT id, terms_array, updated_at
+                FROM terms_conditions
+                ORDER BY updated_at DESC
+                LIMIT 1;
+            """
+            result = await connection.fetchrow(query)
+
+            if result:
+                return jsonify({
+                    "id": result["id"],
+                    "terms_array": result["terms_array"],
+                    "updated_at": result["updated_at"].isoformat() if result["updated_at"] else None
+                }), 200
+            else:
+                return jsonify({"terms_array": []}), 200
+
+    except Exception as e:
+        logging.error("Error fetching terms and conditions: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# Create or update terms and conditions
+@admin_routes.route("/terms-conditions", methods=["POST"])
+@role_required("admin")
+async def update_terms_conditions():
+    try:
+        data = await request.get_json()
+        terms_array = data.get("terms_array", [])
+
+        # Validate input
+        if not isinstance(terms_array, list):
+            return jsonify({"error": "terms_array must be a list"}), 400
+
+        import json
+        # تحويل قائمة Python إلى سلسلة نصية بتنسيق JSON
+        terms_json = json.dumps(terms_array)
+
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                INSERT INTO terms_conditions (terms_array)
+                VALUES ($1::jsonb)
+                RETURNING id, terms_array, updated_at;
+            """
+            result = await connection.fetchrow(query, terms_json)
+
+        return jsonify({
+            "id": result["id"],
+            "terms_array": result["terms_array"],
+            "updated_at": result["updated_at"].isoformat() if result["updated_at"] else None
+        }), 201
+
+    except Exception as e:
+        logging.error("Error updating terms and conditions: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# Delete specific terms and conditions (optional)
+@admin_routes.route("/terms-conditions/<int:terms_id>", methods=["DELETE"])
+@role_required("admin")
+async def delete_terms_conditions(terms_id):
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                DELETE FROM terms_conditions 
+                WHERE id = $1
+                RETURNING id;
+            """
+            result = await connection.fetchrow(query, terms_id)
+
+            if result:
+                return jsonify({"message": "Terms and conditions deleted successfully"}), 200
+            else:
+                return jsonify({"error": "Terms and conditions not found"}), 404
+
+    except Exception as e:
+        logging.error("Error deleting terms and conditions: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
