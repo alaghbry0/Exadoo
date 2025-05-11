@@ -263,9 +263,9 @@ async def add_knowledge_item():
         if not title or not content:
             return jsonify({'error': 'العنوان والمحتوى مطلوبان'}), 400
 
-        # تمرير current_app.db_pool إلى دالة KnowledgeBase
+        # تمرير current_app.db_pool إلى دالة KnowledgeBase  <-- هذا التعليق لم يعد صحيحاً
         item_id = await knowledge_base.add_item(
-            current_app.db_pool, # <-- تمرير مجمع الاتصالات
+            # current_app.db_pool, # <-- قم بإزالة هذا السطر
             title,
             content,
             data.get('category'),
@@ -275,7 +275,6 @@ async def add_knowledge_item():
         if item_id:
             return jsonify({'id': item_id, 'status': 'success', 'message': 'تمت إضافة العنصر بنجاح'})
         else:
-            # إذا كان add_item يمكن أن يفشل بدون استثناء (نادرًا ما يكون هذا هو الحال لإضافة)
             logger.error(f"فشل add_item في KnowledgeBase للبيانات: {data}")
             return jsonify({'error': 'فشل إضافة العنصر لسبب غير معروف'}), 500
 
