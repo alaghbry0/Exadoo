@@ -30,7 +30,7 @@ async def get_public_subscription_types():
                     features, 
                     usp, 
                     is_active,
-                    is_recommended, -- أضف هذا الحقل الجديد
+                    is_recommended,
                     created_at
                 FROM subscription_types
                 WHERE is_active = true
@@ -143,6 +143,31 @@ async def get_public_wallet():
             return jsonify({"wallet_address": ""}), 200
     except Exception as e:
         logging.error("❌ Error fetching public wallet address: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@public_routes.route("/terms-conditions", methods=["GET"])
+async def get_public_terms_conditions():
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                SELECT terms_array, updated_at
+                FROM terms_conditions
+                ORDER BY updated_at DESC
+                LIMIT 1;
+            """
+            result = await connection.fetchrow(query)
+
+            if result:
+                return jsonify({
+                    "terms_array": result["terms_array"],
+                    "updated_at": result["updated_at"].isoformat() if result["updated_at"] else None
+                }), 200
+            else:
+                return jsonify({"terms_array": []}), 200
+
+    except Exception as e:
+        logging.error("Error fetching public terms and conditions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
