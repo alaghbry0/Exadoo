@@ -321,71 +321,103 @@ async def start_command(message: types.Message):
 @dp.chat_join_request()
 async def handle_join_request(join_request: ChatJoinRequest):
     """
-    معالجة طلبات الانضمام للقناة والتحقق من الاشتراكات
+    معالجة طلبات الانضمام للقنوات الرئيسية والفرعية والتحقق من الاشتراكات.
     """
     user_id = join_request.from_user.id
-    chat_id = join_request.chat.id
+    requested_chat_id = join_request.chat.id  # القناة التي يحاول المستخدم الانضمام إليها
     username = join_request.from_user.username or "لا يوجد اسم مستخدم"
     full_name = join_request.from_user.full_name or "لا يوجد اسم كامل"
 
-    logging.info(f"🔹 طلب انضمام جديد من المستخدم {user_id} (@{username} - {full_name}) إلى القناة {chat_id}")
+    logging.info(
+        f"🔹 طلب انضمام جديد من المستخدم {user_id} (@{username} - {full_name}) إلى القناة {requested_chat_id} ({join_request.chat.title or 'بدون عنوان'})")
 
     try:
         async with current_app.db_pool.acquire() as connection:
-            # البحث عن اشتراك نشط للمستخدم في هذه القناة
-            subscription = await get_subscription(connection, user_id, chat_id)
+            # 1. تحديد نوع الاشتراك والقناة الرئيسية بناءً على القناة التي يُطلب الانضمام إليها
+            #    وأيضاً الحصول على اسم القناة المنضم إليها فعلياً
+            channel_data = await connection.fetchrow(
+                """
+                SELECT 
+                    stc.subscription_type_id, 
+                    stc.channel_name AS joined_channel_name,
+                    st.channel_id AS main_channel_id_for_subscription,
+                    st.name AS subscription_package_name
+                FROM subscription_type_channels stc
+                JOIN subscription_types st ON stc.subscription_type_id = st.id
+                WHERE stc.channel_id = $1
+                """,
+                requested_chat_id
+            )
 
-            if subscription:
-                logging.info(f" تم العثور على اشتراك نشط للمستخدم {user_id} في القناة {chat_id}")
+            if not channel_data:
+                logging.warning(
+                    f"⚠️ القناة {requested_chat_id} غير معرفة في جدول subscription_type_channels. سيتم رفض الطلب.")
+                await bot.decline_chat_join_request(chat_id=requested_chat_id, user_id=user_id)
+                return
 
-                # جلب اسم القناة من جدول subscription_types باستخدام channel_id أو subscription_type_id حسب التصميم
-                # في هذا المثال يتم استخدام channel_id للبحث عن اسم القناة:
-                subscription_type = await connection.fetchrow(
-                    "SELECT name FROM subscription_types WHERE channel_id = $1", chat_id
-                )
-                channel_name = subscription_type['name'] if subscription_type else "القناة"
+            main_channel_id_for_subscription_check = channel_data['main_channel_id_for_subscription']
+            # اسم القناة التي انضم إليها المستخدم فعلياً
+            actual_joined_channel_name = channel_data[
+                                             'joined_channel_name'] or join_request.chat.title or f"القناة {requested_chat_id}"
+            # اسم باقة الاشتراك (مثال: "Fx Exaado" أو "CRYPTO Exaado")
+            # subscription_package_name = channel_data['subscription_package_name']
 
-                # إذا كان المستخدم يملك اشتراك نشط، قبول طلب الانضمام
+            logging.info(
+                f"🔍 القناة المطلوبة {requested_chat_id} ({actual_joined_channel_name}) تابعة لنوع الاشتراك ID: {channel_data['subscription_type_id']}. القناة الرئيسية للتحقق من الاشتراك هي: {main_channel_id_for_subscription_check}")
+
+            # 2. البحث عن اشتراك نشط للمستخدم في القناة الرئيسية المرتبطة بهذا النوع من الاشتراك
+            subscription = await get_subscription(connection, user_id, main_channel_id_for_subscription_check)
+
+            if subscription and subscription.get('is_active', False):  # استخدام .get للأمان
+                logging.info(
+                    f"✅ تم العثور على اشتراك نشط للمستخدم {user_id} المرتبط بالباقة التي تشمل القناة {requested_chat_id}")
+
                 try:
                     await bot.approve_chat_join_request(
-                        chat_id=chat_id,
+                        chat_id=requested_chat_id,  # قبول الطلب للقناة التي طلب المستخدم الانضمام إليها
                         user_id=user_id
                     )
-                    logging.info(f" تم قبول طلب انضمام المستخدم {user_id} إلى القناة {chat_id}")
+                    logging.info(
+                        f"👍 تم قبول طلب انضمام المستخدم {user_id} إلى القناة {requested_chat_id} ({actual_joined_channel_name})")
 
-                    # إرسال رسالة ترحيبية للمستخدم مع تضمين اسم القناة
                     try:
                         message_text = (
-
-                            f"تهانينا، تم اضافتك إلى قناة {channel_name} بنجاح.🥳\n"
-                            "نتمنى لك تجربه رائعه."
+                            f"🎉 تهانينا، {full_name}!\n"
+                            f"تمت إضافتك بنجاح إلى قناة \"{actual_joined_channel_name}\".\n"
+                            "نتمنى لك تجربة رائعة. 😊"
                         )
                         await bot.send_message(user_id, message_text)
-                        logging.info(f" تم إرسال رسالة ترحيبية للمستخدم {user_id}")
+                        logging.info(
+                            f"✉️ تم إرسال رسالة ترحيبية للمستخدم {user_id} للانضمام إلى {actual_joined_channel_name}")
                     except Exception as e:
-                        logging.warning(f" لم يتم إرسال رسالة الترحيب للمستخدم {user_id}: {e}")
+                        logging.warning(
+                            f"⚠️ لم يتم إرسال رسالة الترحيب للمستخدم {user_id} بعد قبوله في {actual_joined_channel_name}: {e}")
+
                 except Exception as e:
-                    logging.error(f" خطأ أثناء قبول طلب الانضمام للمستخدم {user_id}: {e}")
+                    logging.error(
+                        f"❌ خطأ أثناء قبول طلب الانضمام للمستخدم {user_id} في القناة {requested_chat_id}: {e}")
+
             else:
-                logging.info(f" لم يتم العثور على اشتراك نشط للمستخدم {user_id} في القناة {chat_id}")
-                # إذا لم يكن هناك اشتراك نشط، رفض طلب الانضمام دون إرسال رسالة للمستخدم
+                logging.info(
+                    f"🚫 لم يتم العثور على اشتراك نشط للمستخدم {user_id} يسمح بالانضمام إلى القناة {requested_chat_id} (التحقق تم عبر القناة الرئيسية {main_channel_id_for_subscription_check})")
                 try:
                     await bot.decline_chat_join_request(
-                        chat_id=chat_id,
+                        chat_id=requested_chat_id,
                         user_id=user_id
                     )
-                    logging.info(f" تم رفض طلب انضمام المستخدم {user_id} لعدم وجود اشتراك نشط")
+                    logging.info(
+                        f"👎 تم رفض طلب انضمام المستخدم {user_id} للقناة {requested_chat_id} لعدم وجود اشتراك نشط.")
                 except Exception as e:
-                    logging.error(f" خطأ أثناء رفض طلب الانضمام للمستخدم {user_id}: {e}")
+                    logging.error(f"❌ خطأ أثناء رفض طلب الانضمام للمستخدم {user_id} في القناة {requested_chat_id}: {e}")
 
     except Exception as e:
-        logging.error(f" خطأ أثناء معالجة طلب الانضمام للمستخدم {user_id}: {e}")
-
+        logging.error(f"🚨 خطأ عام أثناء معالجة طلب الانضمام للمستخدم {user_id} للقناة {requested_chat_id}: {e}")
         # في حالة حدوث خطأ، يمكن رفض الطلب كإجراء احترازي
         try:
-            await bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
+            await bot.decline_chat_join_request(chat_id=requested_chat_id, user_id=user_id)
+            logging.info(f"🛡️ تم رفض طلب الانضمام للمستخدم {user_id} كإجراء احترازي بسبب خطأ عام.")
         except Exception as decline_error:
-            logging.error(f" فشل رفض طلب الانضمام بعد حدوث خطأ: {decline_error}")
+            logging.error(f"❌ فشل رفض طلب الانضمام بعد حدوث خطأ عام: {decline_error}")
 
 
 # 🔹 وظيفة معدلة لمعالجة الدفع الناجح
