@@ -276,7 +276,7 @@ async def parse_transactions(provider: LiteBalancer):
                         telegram_ids=[telegram_id]
                     )
 
-                    # ***** تعديل مهم هنا *****
+
                     updated_payment_data = await update_payment_with_txhash(
                         conn,
                         pending_payment['payment_token'],
@@ -498,7 +498,6 @@ async def confirm_payment():
         data = await request.get_json()
         logging.info(f"📥 بيانات الطلب المستلمة في /api/confirm_payment: {json.dumps(data, indent=2)}")
 
-        # التحقق من مفتاح الويب هوك المرسل من الواجهة الأمامية
         webhook_secret_frontend = data.get("webhookSecret")
         if not webhook_secret_frontend or webhook_secret_frontend != os.getenv("WEBHOOK_SECRET"):
             logging.warning("❌ طلب غير مصرح به إلى /api/confirm_payment: مفتاح WEBHOOK_SECRET غير صالح أو مفقود")
@@ -509,7 +508,6 @@ async def confirm_payment():
         telegram_id_str = data.get("telegramId")
         telegram_username = data.get("telegramUsername")
         full_name = data.get("fullName")
-        # تم إزالة order_id واستقبال amount من العميل
 
         logging.info(
             f"✅ استلام طلب تأكيد الدفع: userWalletAddress={user_wallet_address}, "
@@ -528,17 +526,16 @@ async def confirm_payment():
             logging.error(f"❌ telegramId ليس عددًا صحيحًا: {telegram_id_str}. تعذر تسجيل الدفعة.")
             return jsonify({"error": "Invalid telegramId", "details": "telegramId must be an integer."}), 400
 
-        # إنشاء payment_token فريد
-        payment_token = str(uuid4())
+        # إنشاء payment_token فريد (أرقام وحروف فقط)
+        payment_token = str(uuid4()).replace('-', '') # <--- التعديل الأول هنا
 
-        # الحصول على قيمة المبلغ من جدول subscription_plans بناءً على subscription_plan_id
         amount = 0.0
         async with current_app.db_pool.acquire() as conn:
             try:
                 query = "SELECT price FROM subscription_plans WHERE id = $1"
-                record = await conn.fetchrow(query, subscription_plan_id)
-                if record and record.get("price") is not None:
-                    amount = float(record["price"])
+                record_price = await conn.fetchrow(query, subscription_plan_id) # تم تغيير اسم المتغير لتجنب التضارب مع record_payment
+                if record_price and record_price.get("price") is not None:
+                    amount = float(record_price["price"])
                     logging.info(f"✅ تم جلب السعر من جدول subscription_plans: {amount}")
                 else:
                     logging.warning(f"⚠️ لم يتم العثور على خطة بالمعرف {subscription_plan_id}. سيتم تعيين المبلغ إلى 0.0")
@@ -548,12 +545,19 @@ async def confirm_payment():
 
             logging.info("💾 جاري تسجيل الدفعة المعلقة في قاعدة البيانات...")
             result = None
-            max_attempts = 3  # تحديد الحد الأقصى لمحاولات إعادة التسجيل
+            max_attempts = 3
             attempt = 0
 
             while attempt < max_attempts:
                 try:
+                    # إذا كانت هذه ليست المحاولة الأولى، قم بإنشاء توكن جديد
+                    # هذا يضمن أننا نستخدم التوكن الذي تم إنشاؤه خارج الحلقة للمحاولة الأولى
+                    # وننشئ واحدًا جديدًا فقط في حالة حدوث تضارب وإعادة المحاولة
+                    if attempt > 0:
+                        payment_token = str(uuid4()).replace('-', '') # <--- التعديل الثاني هنا (عند إعادة المحاولة)
+                        logging.info(f"🔄 تم إنشاء payment_token جديد للمحاولة {attempt + 1}: {payment_token}")
 
+                    # تأكد من أن record_payment معرفة ومستوردة بشكل صحيح
                     result = await record_payment(
                         conn=conn,
                         telegram_id=telegram_id,
@@ -564,17 +568,21 @@ async def confirm_payment():
                         full_name=full_name,
                         payment_token=payment_token
                     )
-                    break
+                    break # اخرج من الحلقة إذا نجحت العملية
                 except UniqueViolationError:
                     attempt += 1
-                    logging.warning("⚠️ تكرار payment_token، إعادة المحاولة...")
-                    payment_token = str(uuid4())
+                    logging.warning(f"⚠️ تكرار payment_token، إعادة المحاولة ({attempt}/{max_attempts})...")
+                    if attempt >= max_attempts: # إذا وصلنا للحد الأقصى للمحاولات
+                        logging.error("❌ فشل تسجيل الدفعة بعد محاولات متعددة بسبب تضارب payment_token.")
+                        return jsonify({"error": "Failed to record payment after retries"}), 500
+                    # سيتم إنشاء payment_token جديد في بداية اللفة التالية إذا attempt > 0
 
+            # هذا التحقق أصبح أقل أهمية هنا لأننا نتحقق من max_attempts داخل الحلقة
+            # لكنه لا يزال جيدًا كإجراء وقائي إضافي
             if result is None:
-                logging.error("❌ فشل تسجيل الدفعة بعد محاولات متعددة بسبب تضارب payment_token.")
+                logging.error("❌ فشل تسجيل الدفعة بعد محاولات متعددة بسبب تضارب payment_token (لم يتم الوصول للنتيجة).")
                 return jsonify({"error": "Failed to record payment after retries"}), 500
 
-            # تسجيل نفس البيانات في جدول telegram_payments
             try:
                 await conn.execute('''
                     INSERT INTO telegram_payments (
@@ -589,12 +597,13 @@ async def confirm_payment():
                 ''', payment_token, telegram_id)
                 logging.info(f"✅ تم تسجيل البيانات في جدول telegram_payments: {payment_token}")
             except UniqueViolationError as uve:
+                # هذا السيناريو يجب أن يكون نادرًا جدًا إذا كان payment_token في telegram_payments
+                # هو نفسه الذي في الجدول الأول وعليه قيد التفرد أيضًا.
                 logging.warning(f"⚠️ تكرار في telegram_payments لرمز الدفع {payment_token}: {uve}")
             except Exception as e:
                 logging.error(f"❌ خطأ أثناء تسجيل البيانات في جدول telegram_payments: {str(e)}")
 
         logging.info(f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_token={payment_token}")
-        # تنسيق قيمة amount بدقتين بعد الفاصلة
         formatted_amount = f"{amount:.2f}"
         return jsonify({
             "success": True,

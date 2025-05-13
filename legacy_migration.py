@@ -1,211 +1,270 @@
-# excel_importer.py
-import pandas as pd
-import asyncpg
-from datetime import datetime, timezone
 import os
+from dotenv import load_dotenv # تأكد من تثبيت python-dotenv: pip install python-dotenv
+load_dotenv() # تحميل المتغيرات من .env أولاً
+
+import asyncio
+import asyncpg
+import aiohttp
+import json
+from decimal import Decimal
 import logging
 
+# --- إعدادات التسجيل ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# --- إعدادات البرنامج ---
 try:
+    # إذا كنت تفضل DATABASE_URI من config.py ولديك هذا الملف
     from config import DATABASE_URI
+    logging.info("Loaded DATABASE_URI from config.py")
 except ImportError:
-    logging.error("config.py or DATABASE_URI not found.")
+    logging.info("config.py not found or DATABASE_URI not in config.py. Trying DATABASE_URI_FALLBACK from environment.")
     DATABASE_URI = os.getenv("DATABASE_URI_FALLBACK")
-    if not DATABASE_URI:
-        logging.error("DATABASE_URI is not available. Exiting.")
-        exit(1)
 
-EXCEL_FILE_PATH = "./May 2025 Report (2).xlsx"
-USERNAME_COL = 'user name'
-START_DATE_COL = 'Start Date'
-EXPIRY_DATE_COL = 'Expiry date'
+# الآن قم بتحميل المتغيرات الأخرى من البيئة (التي قد تكون تم تعيينها عبر .env)
+SUBSCRIBE_API_URL = os.getenv("SUBSCRIBE_API_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-
-async def import_sheet_to_legacy(conn, excel_sheet_name: str, df: pd.DataFrame, default_sub_type_id=None):
-    # قاموس لتخزين أفضل سجل (أحدث expiry_date) لكل (username, subscription_type_id)
-    # المفتاح: (username_processed, sub_type_id)
-    # القيمة: (original_excel_sheet, username_processed, sub_type_id, start_date, expiry_date, processed_flag)
-    best_records_map = {}
-
-    skipped_due_missing_data = 0
-    skipped_due_empty_username = 0
-    skipped_due_date_conversion_error = 0
-
-    logging.info(f"بدء معالجة واختيار السجلات من ورقة: {excel_sheet_name}")
-
-    for index, row in df.iterrows():
-        original_row_data_for_logging = row.to_dict()  # للاستخدام في حالة التكرار
-
-        username_raw = row.get(USERNAME_COL)
-        start_date_raw = row.get(START_DATE_COL)
-        expiry_date_raw = row.get(EXPIRY_DATE_COL)
-
-        if pd.isna(username_raw) or pd.isna(start_date_raw) or pd.isna(expiry_date_raw):
-            skipped_due_missing_data += 1
-            continue
-
-        # --- تنظيف اسم المستخدم ---
-        # يفضل استخدام .lower().strip() للتوحيد وتجنب المشاكل
-        # username_processed = str(username_raw).replace('@', '') # خيارك الحالي
-        username_processed = str(username_raw).lower().replace('@', '').strip()  # موصى به
-
-        if not username_processed:  # لا حاجة لـ .strip() هنا إذا استخدمته أعلاه
-            skipped_due_empty_username += 1
-            continue
-
-        try:
-            try:
-                start_date_dt = pd.to_datetime(start_date_raw, dayfirst=True)
-            except (ValueError, TypeError):
-                start_date_dt = pd.to_datetime(start_date_raw, dayfirst=False)
-            try:
-                expiry_date_dt = pd.to_datetime(expiry_date_raw, dayfirst=True)
-            except (ValueError, TypeError):
-                expiry_date_dt = pd.to_datetime(expiry_date_raw, dayfirst=False)
-
-            start_date = start_date_dt.tz_localize(None).replace(
-                tzinfo=timezone.utc) if start_date_dt.tzinfo is None else start_date_dt.astimezone(timezone.utc)
-            expiry_date = expiry_date_dt.tz_localize(None).replace(
-                tzinfo=timezone.utc) if expiry_date_dt.tzinfo is None else expiry_date_dt.astimezone(timezone.utc)
-
-        except Exception as e:
-            skipped_due_date_conversion_error += 1
-            logging.debug(  # استخدم debug هنا لتجنب إغراق السجلات إذا كانت هناك أخطاء كثيرة في التواريخ
-                f"خطأ في تحويل التواريخ (سيتم تخطيه) للمستخدم '{username_processed}' في الصف {index + 2} بورقة '{excel_sheet_name}': {e}. البيانات: {original_row_data_for_logging}")
-            continue
-
-        # تحديد أنواع الاشتراكات للسجل الحالي
-        current_record_sub_types = []
-        if default_sub_type_id:
-            current_record_sub_types.append(default_sub_type_id)
-        elif excel_sheet_name.lower() == 'both':
-            current_record_sub_types.extend([1, 2])  # افترض أن 1 و 2 هما معرفات الأنواع
-
-        for sub_type_id_for_record in current_record_sub_types:
-            record_key = (username_processed, sub_type_id_for_record)
-            current_record_data = (
-            excel_sheet_name, username_processed, sub_type_id_for_record, start_date, expiry_date, False)
-
-            if record_key not in best_records_map:
-                best_records_map[record_key] = current_record_data
-            else:
-                # هناك سجل موجود لنفس المستخدم والنوع، قارن expiry_date
-                existing_record_data = best_records_map[record_key]
-                existing_expiry_date = existing_record_data[4]  # expiry_date هو العنصر الخامس
-
-                if expiry_date > existing_expiry_date:
-                    logging.info(
-                        f"تكرار لـ ({username_processed}, type:{sub_type_id_for_record}) من ورقة '{excel_sheet_name}'. "
-                        f"السجل الجديد (Expiry: {expiry_date.strftime('%Y-%m-%d')}) أحدث من القديم (Expiry: {existing_expiry_date.strftime('%Y-%m-%d')}). سيتم تحديثه."
-                        f" بيانات الصف الحالي من Excel: {original_row_data_for_logging}"
-                    )
-                    best_records_map[record_key] = current_record_data
-                else:
-                    logging.info(
-                        f"تكرار لـ ({username_processed}, type:{sub_type_id_for_record}) من ورقة '{excel_sheet_name}'. "
-                        f"السجل الجديد (Expiry: {expiry_date.strftime('%Y-%m-%d')}) ليس أحدث من القديم (Expiry: {existing_expiry_date.strftime('%Y-%m-%d')}). سيتم تجاهل السجل الجديد."
-                        f" بيانات الصف الحالي من Excel: {original_row_data_for_logging}"
-                    )
-
-    if skipped_due_missing_data > 0:
-        logging.warning(f"ورقة '{excel_sheet_name}': تم تخطي {skipped_due_missing_data} صف/صفوف بسبب بيانات مفقودة.")
-    if skipped_due_empty_username > 0:
-        logging.warning(
-            f"ورقة '{excel_sheet_name}': تم تخطي {skipped_due_empty_username} صف/صفوف بسبب اسم مستخدم فارغ.")
-    if skipped_due_date_conversion_error > 0:
-        logging.warning(
-            f"ورقة '{excel_sheet_name}': تم تخطي {skipped_due_date_conversion_error} صف/صفوف بسبب خطأ في تحويل التاريخ.")
-
-    records_to_insert_final = list(best_records_map.values())
-
-    if records_to_insert_final:
-        # القيد unique_legacy_user_sub_type يجب أن يكون على (username, subscription_type_id)
-        query = """
-            INSERT INTO legacy_subscriptions (original_excel_sheet, username, subscription_type_id, start_date, expiry_date, processed)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT ON CONSTRAINT unique_legacy_user_sub_type
-            DO UPDATE SET
-                start_date = EXCLUDED.start_date,
-                expiry_date = EXCLUDED.expiry_date,
-                original_excel_sheet = EXCLUDED.original_excel_sheet,
-                processed = EXCLUDED.processed; 
-                
-        """
-        # لاحظ أن ترتيب الأعمدة في VALUES يجب أن يطابق ترتيبها في records_to_insert_final
-        # records_to_insert_final يحتوي على: (original_excel_sheet, username_processed, sub_type_id_for_record, start_date, expiry_date, False)
-        # الاستعلام INSERT يحتاج: (original_excel_sheet, username=$2, subscription_type_id=$3, start_date=$4, expiry_date=$5, processed=$6)
-        # يجب تعديل ترتيب الأعمدة في VALUES أو في بناء records_to_insert_final.
-        # دعنا نعدل بناء records_to_insert_final ليناسب الاستعلام.
-
-        # بناء السجلات للإدخال بالترتيب الصحيح لـ INSERT:
-        # (original_excel_sheet, username, subscription_type_id, start_date, expiry_date, processed_flag)
-        # هذا هو الترتيب الذي استخدمناه في best_records_map[record_key] = current_record_data
-        # current_record_data = (excel_sheet_name, username_processed, sub_type_id_for_record, start_date, expiry_date, False)
-        # الاستعلام INSERT VALUES($1, $2, $3, $4, $5, $6)
-        # $1 = original_excel_sheet
-        # $2 = username
-        # $3 = subscription_type_id
-        # $4 = start_date
-        # $5 = expiry_date
-        # $6 = processed
-        # الترتيب في current_record_data:
-        # 0: excel_sheet_name (original_excel_sheet) -> $1
-        # 1: username_processed (username) -> $2
-        # 2: sub_type_id_for_record (subscription_type_id) -> $3
-        # 3: start_date -> $4
-        # 4: expiry_date -> $5
-        # 5: False (processed) -> $6
-        # الترتيب يبدو صحيحًا.
-
-        try:
-            await conn.executemany(query, records_to_insert_final)
-            logging.info(
-                f"تم إدخال/تحديث {len(records_to_insert_final)} سجل/سجلات فريد/ة (بناءً على أحدث تاريخ انتهاء) من ورقة '{excel_sheet_name}'.")
-        except Exception as e:
-            logging.error(f"خطأ أثناء إدخال/تحديث دفعة من السجلات من ورقة '{excel_sheet_name}': {e}", exc_info=True)
-    else:
-        logging.info(f"لا توجد سجلات صالحة للإدخال من ورقة '{excel_sheet_name}' بعد معالجة التكرارات.")
+# طباعة للتحقق (للتصحيح)
+logging.debug(f"Loaded DATABASE_URI = {DATABASE_URI}")
+logging.debug(f"Loaded SUBSCRIBE_API_URL = {SUBSCRIBE_API_URL}")
+logging.debug(f"Loaded WEBHOOK_SECRET = {WEBHOOK_SECRET}")
 
 
-async def main_importer():
-    if not os.path.exists(EXCEL_FILE_PATH):
-        logging.error(f"ملف الإكسل غير موجود في المسار: {EXCEL_FILE_PATH}")
-        return
+if not all([DATABASE_URI, SUBSCRIBE_API_URL, WEBHOOK_SECRET]):
+    missing_vars = []
+    if not DATABASE_URI: missing_vars.append("DATABASE_URI (from config.py or DATABASE_URI_FALLBACK env var)")
+    if not SUBSCRIBE_API_URL: missing_vars.append("SUBSCRIBE_API_URL env var")
+    if not WEBHOOK_SECRET: missing_vars.append("WEBHOOK_SECRET env var")
+    logging.critical(f"❌ متغيرات بيئة مطلوبة غير موجودة: {', '.join(missing_vars)}. يرجى تعيينها.")
+    exit(1)
+
+
+
+async def process_missed_overpayments():
     conn = None
+    processed_count = 0
+    failed_count = 0
+    skipped_count = 0
+    # قائمة لتخزين تفاصيل النجاح والفشل
+    successful_renewals = []
+    failed_renewals = []
+
     try:
         conn = await asyncpg.connect(DATABASE_URI)
-        logging.info("تم الاتصال بقاعدة البيانات بنجاح.")
+        logging.info("✅ متصل بقاعدة البيانات.")
 
-        # --- مهم: امسح الجدول قبل كل تشغيل إذا كنت تريد نتائج متسقة مع هذا المنطق ---
-        # لأنه إذا كان هناك بيانات قديمة في الجدول، فإن منطق ON CONFLICT سيتفاعل معها.
-        # إذا كنت تريد أن يعكس الجدول فقط "أفضل" السجلات من تشغيل Excel الحالي.
-        logging.info("مسح جدول legacy_subscriptions قبل الاستيراد...")
-        await conn.execute(
-            "TRUNCATE TABLE legacy_subscriptions RESTART IDENTITY;")  # RESTART IDENTITY لإعادة تعيين auto-incrementing ID
-        logging.info("تم مسح جدول legacy_subscriptions.")
-        # --------------------------------------------------------------------------
+        # --- الخطوة 1: تحديد الدفعات المتأثرة ---
+        # استخدام الاستعلام الذي قدمته والذي يعمل يدويًا
+        query_affected_payments = """
+        SELECT
+            p.id AS payment_db_id,
+            p.telegram_id,
+            p.username,
+            p.full_name,
+            p.subscription_plan_id,
+            sp.name AS plan_name,
+            sp.price AS plan_price,
+            p.amount_received,
+            p.amount AS original_expected_amount,
+            (p.amount_received - sp.price) AS overpayment_amount,
+            p.status,
+            p.tx_hash,
+            p.payment_token,
+            p.created_at,
+            p.processed_at,
+            p.error_message
+        FROM
+            payments p
+        JOIN
+            subscription_plans sp ON p.subscription_plan_id = sp.id
+        WHERE
+            p.status = 'completed'
+            AND p.tx_hash IS NOT NULL
+            AND p.amount_received IS NOT NULL
+            AND p.amount_received > sp.price
+        ORDER BY
+            p.created_at ASC; -- معالجة الأقدم أولاً لتكون أكثر عدلاً إذا كان هناك حدود
+        """
+        # ملاحظة: إذا كان الاستعلام اليدوي الذي يعمل لك يتضمن ORDER BY p.created_at DESC
+        # فقم بتغييره هنا أيضًا ليتطابق. ASC يعني الأقدم أولاً.
 
-        xls = pd.ExcelFile(EXCEL_FILE_PATH)
-        sheet_mappings = {"Forex": 1, "Crypto": 2, "Both": None}
+        logging.info("🚀 تنفيذ استعلام جلب الدفعات المتأثرة...")
+        affected_payments = await conn.fetch(query_affected_payments)
+        logging.info(f"🔍 تم العثور على {len(affected_payments)} دفعة زائدة محتملة لمعالجتها بناءً على الاستعلام.")
 
-        for sheet_name_in_excel, sub_type_id in sheet_mappings.items():
-            if sheet_name_in_excel in xls.sheet_names:
-                logging.info(f"قراءة ورقة: {sheet_name_in_excel}...")
-                df = pd.read_excel(xls, sheet_name=sheet_name_in_excel)
-                await import_sheet_to_legacy(conn, sheet_name_in_excel, df, default_sub_type_id=sub_type_id)
-            else:
-                logging.warning(f"الورقة '{sheet_name_in_excel}' غير موجودة في ملف الإكسل. سيتم تخطيها.")
-        logging.info("انتهت عملية استيراد بيانات الإكسل.")
+        if not affected_payments:
+            logging.info("🏁 لا توجد دفعات لمعالجتها بناءً على المعايير الحالية.")
+            return
+
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {WEBHOOK_SECRET}",
+                "Content-Type": "application/json"
+            }
+
+            for payment in affected_payments:
+                logging.info(
+                    f"\n🔄 بدء معالجة الدفعة: DB_ID={payment['payment_db_id']}, Username='{payment['username']}', tx_hash={payment['tx_hash']}")
+
+                # التحقق من البيانات الأساسية قبل المتابعة
+                required_fields = ['tx_hash', 'telegram_id', 'subscription_plan_id', 'payment_token']
+                missing_fields = [field for field in required_fields if not payment[field]]
+
+                if missing_fields:
+                    logging.warning(
+                        f"⚠️ تخطي الدفعة (DB ID: {payment['payment_db_id']}) بسبب نقص البيانات: {', '.join(missing_fields)}.")
+                    skipped_count += 1
+                    failed_renewals.append({
+                        "payment_db_id": payment['payment_db_id'],
+                        "username": payment['username'],
+                        "tx_hash": payment['tx_hash'],
+                        "reason": f"Missing data: {', '.join(missing_fields)}"
+                    })
+                    continue
+
+                payload = {
+                    "telegram_id": int(payment['telegram_id']),
+                    "subscription_plan_id": int(payment['subscription_plan_id']),
+                    "payment_id": str(payment['tx_hash']),
+                    "payment_token": str(payment['payment_token']),
+                    "username": str(payment['username']) if payment['username'] else None,
+                    "full_name": str(payment['full_name']) if payment['full_name'] else None,
+                }
+
+                logging.info(f"📞 استدعاء API الاشتراك بالبيانات: {json.dumps(payload, indent=2)}")
+
+                try:
+                    async with session.post(SUBSCRIBE_API_URL, json=payload, headers=headers, timeout=30) as response:
+                        response_status = response.status
+                        response_text = await response.text()
+
+                        if response_status == 200:
+                            logging.info(
+                                f"✅ نجح استدعاء API الاشتراك لـ tx_hash: {payment['tx_hash']}. الحالة: {response_status}. الاستجابة (أول 200 حرف): {response_text[:200]}...")
+                            processed_count += 1
+                            successful_renewals.append({
+                                "payment_db_id": payment['payment_db_id'],
+                                "username": payment['username'],
+                                "tx_hash": payment['tx_hash'],
+                                "api_response_status": response_status
+                            })
+
+                            # تحديث سجل الدفع في قاعدة البيانات
+                            # يمكنك تعديل error_message لتكون أكثر وضوحًا
+                            update_message = f"Manually processed via script on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - API OK."
+                            await conn.execute(
+                                "UPDATE payments SET processed_at = NOW(), error_message = $2 WHERE id = $1",
+                                payment['payment_db_id'], update_message
+                            )
+                            logging.info(
+                                f"   تم تحديث سجل الدفع (DB ID: {payment['payment_db_id']}) بالرسالة: {update_message}")
+
+                        else:
+                            logging.error(
+                                f"❌ فشل استدعاء API الاشتراك لـ tx_hash: {payment['tx_hash']}. الحالة: {response_status}, التفاصيل: {response_text}")
+                            failed_count += 1
+                            failed_renewals.append({
+                                "payment_db_id": payment['payment_db_id'],
+                                "username": payment['username'],
+                                "tx_hash": payment['tx_hash'],
+                                "reason": f"API call failed with status {response_status}",
+                                "api_response_status": response_status,
+                                "api_response_text": response_text
+                            })
+                            await conn.execute(
+                                "UPDATE payments SET error_message = $2 WHERE id = $1",
+                                payment['payment_db_id'],
+                                f"Manual script API call failed: {response_status} - {response_text[:500]}"
+                            )
+                            logging.warning(f"   تم تحديث error_message لسجل الدفع (DB ID: {payment['payment_db_id']})")
+
+                except aiohttp.ClientError as e:
+                    logging.exception(
+                        f"❌ خطأ في الاتصال (ClientError) بـ API الاشتراك لـ tx_hash: {payment['tx_hash']}. الخطأ: {str(e)}")
+                    failed_count += 1
+                    failed_renewals.append({
+                        "payment_db_id": payment['payment_db_id'],
+                        "username": payment['username'],
+                        "tx_hash": payment['tx_hash'],
+                        "reason": f"aiohttp.ClientError: {str(e)}",
+                    })
+                    await conn.execute(
+                        "UPDATE payments SET error_message = $2 WHERE id = $1",
+                        payment['payment_db_id'],
+                        f"Manual script API connection error: {str(e)[:500]}"
+                    )
+                except asyncio.TimeoutError:
+                    logging.exception(
+                        f"❌ انتهت مهلة الاتصال (TimeoutError) بـ API الاشتراك لـ tx_hash: {payment['tx_hash']}.")
+                    failed_count += 1
+                    failed_renewals.append({
+                        "payment_db_id": payment['payment_db_id'],
+                        "username": payment['username'],
+                        "tx_hash": payment['tx_hash'],
+                        "reason": "asyncio.TimeoutError",
+                    })
+                    await conn.execute(
+                        "UPDATE payments SET error_message = $2 WHERE id = $1",
+                        payment['payment_db_id'],
+                        "Manual script API timeout error"
+                    )
+                except Exception as e:
+                    logging.exception(
+                        f"❌ خطأ عام غير متوقع أثناء معالجة tx_hash: {payment['tx_hash']}. الخطأ: {str(e)}")  # .exception يطبع تتبع الخطأ
+                    failed_count += 1
+                    failed_renewals.append({
+                        "payment_db_id": payment['payment_db_id'],
+                        "username": payment['username'],
+                        "tx_hash": payment['tx_hash'],
+                        "reason": f"Unexpected error: {str(e)}",
+                        "error_type": type(e).__name__
+                    })
+                    await conn.execute(
+                        "UPDATE payments SET error_message = $2 WHERE id = $1",
+                        payment['payment_db_id'],
+                        f"Manual script unexpected error: {str(e)[:500]}"
+                    )
+
+                await asyncio.sleep(0.5)  # انتظار بسيط بين الطلبات لتجنب إغراق الـ API
+
+    except asyncpg.PostgresError as e:
+        logging.exception(f"❌ خطأ في قاعدة البيانات أثناء الاتصال أو الاستعلام الأولي: {e}")
     except Exception as e:
-        logging.error(f"حدث خطأ غير متوقع أثناء عملية الاستيراد: {e}", exc_info=True)
+        logging.exception(f"❌ خطأ عام في السكربت قبل بدء حلقة المعالجة: {e}")
     finally:
         if conn:
             await conn.close()
-            logging.info("تم إغلاق الاتصال بقاعدة البيانات.")
+            logging.info("📪 تم إغلاق الاتصال بقاعدة البيانات.")
+
+        logging.info(f"\n--- ملخص المعالجة ---")
+        logging.info(
+            f"   إجمالي الدفعات التي تم جلبها: {len(affected_payments) if 'affected_payments' in locals() and affected_payments is not None else 'N/A'}")
+        logging.info(f"   تمت معالجة الاشتراكات بنجاح: {processed_count}")
+        logging.info(f"   فشلت معالجة الاشتراكات: {failed_count}")
+        logging.info(f"   تم تخطي الاشتراكات (بيانات ناقصة): {skipped_count}")
+
+        if successful_renewals:
+            logging.info("\n--- تفاصيل الاشتراكات التي تم تجديدها بنجاح ---")
+            for item in successful_renewals:
+                logging.info(
+                    f"  - DB ID: {item['payment_db_id']}, Username: '{item['username']}', tx_hash: {item['tx_hash']}, API Status: {item['api_response_status']}")
+
+        if failed_renewals:
+            logging.warning("\n--- تفاصيل الاشتراكات التي فشل تجديدها ---")
+            for item in failed_renewals:
+                logging.warning(
+                    f"  - DB ID: {item['payment_db_id']}, Username: '{item['username']}', tx_hash: {item['tx_hash']}, Reason: {item['reason']}")
+                if "api_response_status" in item:
+                    logging.warning(
+                        f"    API Status: {item['api_response_status']}, API Response: {item.get('api_response_text', '')[:300]}")
 
 
 if __name__ == "__main__":
-    import asyncio
+    from datetime import datetime  # لاستخدامها في رسالة التحديث
 
-    asyncio.run(main_importer())
+    # تأكد من أنك تقوم بتشغيل هذا في بيئة تم فيها تحميل متغيرات البيئة بشكل صحيح
+    # إذا كنت تستخدم .env، قم بإلغاء تعليق الأسطر التالية:
+    # from dotenv import load_dotenv
+    # load_dotenv()
+    asyncio.run(process_missed_overpayments())
