@@ -101,8 +101,8 @@ async def initialize_app():
         app.db_pool = await asyncpg.create_pool(
             **DATABASE_CONFIG,
             init=_on_connect,
-            min_size=1,
-            max_size=10,
+            min_size=5,
+            max_size=50,
         )
         logging.info("✅ Database pool created with pgvector support")
 

@@ -276,7 +276,8 @@ async def parse_transactions(provider: LiteBalancer):
                         telegram_ids=[telegram_id]
                     )
 
-                    await update_payment_with_txhash(
+                    # ***** تعديل مهم هنا *****
+                    updated_payment_data = await update_payment_with_txhash(
                         conn,
                         pending_payment['payment_token'],
                         tx_hash_hex,
