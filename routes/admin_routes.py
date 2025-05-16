@@ -1594,23 +1594,50 @@ async def get_payments():
     except Exception as e:
         logging.error("Error fetching payments: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
-
 @admin_routes.route("/incoming-transactions", methods=["GET"])
 @role_required("admin")
 async def get_incoming_transactions():
     try:
-        search_term = request.args.get("search", "").strip()  # .strip() لإزالة المسافات
+        search_term = request.args.get("search", "").strip()
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
 
-        base_query = """
-            FROM incoming_transactions it
-            WHERE 1=1
-        """
-        count_query_sql = "SELECT COUNT(*) " + base_query
-        data_query_sql = """
+        base_query_from = "FROM incoming_transactions it"
+        
+        where_clauses_sql_parts = []
+        query_params = [] 
+
+        if search_term:
+            search_like_term = f"%{search_term}%"
+            
+            search_conditions = []
+            
+            # TX Hash
+            search_conditions.append(f"it.txhash ILIKE ${len(query_params) + 1}")
+            query_params.append(search_like_term)
+            
+            # Sender Address
+            search_conditions.append(f"it.sender_address ILIKE ${len(query_params) + 1}")
+            query_params.append(search_like_term)
+            
+            # Memo
+            search_conditions.append(f"it.memo ILIKE ${len(query_params) + 1}")
+            query_params.append(search_like_term)
+
+            # Payment Token  <--- تمت الإضافة هنا
+            search_conditions.append(f"it.payment_token ILIKE ${len(query_params) + 1}")
+            query_params.append(search_like_term)
+
+            where_clauses_sql_parts.append(f"({ ' OR '.join(search_conditions) })")
+
+        where_sql = ""
+        if where_clauses_sql_parts:
+            where_sql = "WHERE " + " AND ".join(where_clauses_sql_parts)
+
+        count_query_sql = f"SELECT COUNT(*) {base_query_from} {where_sql}"
+        
+        data_query_sql_select_part = """
             SELECT 
                 it.txhash,
                 it.sender_address,
@@ -1619,37 +1646,37 @@ async def get_incoming_transactions():
                 it.processed,
                 it.received_at,
                 it.memo
-        """ + base_query
+        """
+        data_query_sql_ordered = f"""
+            {data_query_sql_select_part}
+            {base_query_from}
+            {where_sql}
+            ORDER BY it.received_at DESC
+        """
 
-        params = []
-        count_params = []
+        limit_placeholder = f"${len(query_params) + 1}"
+        offset_placeholder = f"${len(query_params) + 2}"
+        data_query_sql_final = f"{data_query_sql_ordered} LIMIT {limit_placeholder} OFFSET {offset_placeholder}"
+        
+        data_query_final_params = list(query_params) 
+        data_query_final_params.append(page_size)
+        data_query_final_params.append(offset)
 
-        where_clauses = []
+        count_query_params = list(query_params)
 
-        if search_term:
-            # ل postgres، المعاملات المرقمة تبدأ من $1
-            # سنستخدم نفس المعامل للبحث في عدة حقول
-            search_param_placeholder = f"${len(params) + 1}"
-            where_clauses.append(
-                f"(it.txhash ILIKE {search_param_placeholder} OR it.sender_address ILIKE {search_param_placeholder} OR it.memo ILIKE {search_param_placeholder})")
-            params.append(f"%{search_term}%")
-            # نفس المعاملات لـ count_params
-            count_params.append(f"%{search_term}%")
-
-        if where_clauses:
-            data_query_sql += " AND " + " AND ".join(where_clauses)
-            count_query_sql += " AND " + " AND ".join(where_clauses)  # استخدام نفس where_clauses لـ count
-
-        # إضافة الترتيب والتجزئة فقط لاستعلام البيانات
-        data_query_sql += f" ORDER BY it.received_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
-        params.append(page_size)
-        params.append(offset)
+        # --- DEBUGGING LOGS ---
+        logging.info(f"Search Term: '{search_term}'")
+        logging.info(f"Final Count Query SQL: {count_query_sql}")
+        logging.info(f"Final Count Query Params: {count_query_params}")
+        logging.info(f"Final Data Query SQL: {data_query_sql_final}")
+        logging.info(f"Final Data Query Params: {data_query_final_params}")
+        # --- END DEBUGGING LOGS ---
 
         async with current_app.db_pool.acquire() as connection:
-            total_count_record = await connection.fetchrow(count_query_sql, *count_params)
+            total_count_record = await connection.fetchrow(count_query_sql, *count_query_params)
             total_count = total_count_record[0] if total_count_record else 0
 
-            rows = await connection.fetch(data_query_sql, *params)
+            rows = await connection.fetch(data_query_sql_final, *data_query_final_params)
 
         return jsonify({
             "data": [dict(row) for row in rows],
@@ -1660,9 +1687,12 @@ async def get_incoming_transactions():
 
     except Exception as e:
         logging.error("Error fetching incoming transactions: %s", e, exc_info=True)
+        try:
+            logging.debug(f"Failed Count Query: {count_query_sql} with params: {count_query_params}")
+            logging.debug(f"Failed Data Query: {data_query_sql_final} with params: {data_query_final_params}")
+        except NameError:
+            pass
         return jsonify({"error": "Internal server error"}), 500
-
-
 # =====================================
 # 3. API لتعديل اشتراك مستخدم
 # =====================================
