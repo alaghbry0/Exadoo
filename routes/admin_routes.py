@@ -1600,12 +1600,17 @@ async def get_payments():
 @role_required("admin")
 async def get_incoming_transactions():
     try:
-        search_term = request.args.get("search", "")
+        search_term = request.args.get("search", "").strip()  # .strip() لإزالة المسافات
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
 
-        query = """
+        base_query = """
+            FROM incoming_transactions it
+            WHERE 1=1
+        """
+        count_query_sql = "SELECT COUNT(*) " + base_query
+        data_query_sql = """
             SELECT 
                 it.txhash,
                 it.sender_address,
@@ -1614,24 +1619,45 @@ async def get_incoming_transactions():
                 it.processed,
                 it.received_at,
                 it.memo
-            FROM incoming_transactions it
-            WHERE 1=1
-        """
+        """ + base_query
+
         params = []
+        count_params = []
 
-        # إضافة شرط البحث إذا تم تمرير search_term
+        where_clauses = []
+
         if search_term:
-            query += f" AND (it.txhash ILIKE ${len(params) + 1} OR it.sender_address ILIKE ${len(params) + 1} OR it.memo ILIKE ${len(params) + 1})"
+            # ل postgres، المعاملات المرقمة تبدأ من $1
+            # سنستخدم نفس المعامل للبحث في عدة حقول
+            search_param_placeholder = f"${len(params) + 1}"
+            where_clauses.append(
+                f"(it.txhash ILIKE {search_param_placeholder} OR it.sender_address ILIKE {search_param_placeholder} OR it.memo ILIKE {search_param_placeholder})")
             params.append(f"%{search_term}%")
+            # نفس المعاملات لـ count_params
+            count_params.append(f"%{search_term}%")
 
-        # ترتيب النتائج وتطبيق التجزئة
-        query += f" ORDER BY it.received_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+        if where_clauses:
+            data_query_sql += " AND " + " AND ".join(where_clauses)
+            count_query_sql += " AND " + " AND ".join(where_clauses)  # استخدام نفس where_clauses لـ count
+
+        # إضافة الترتيب والتجزئة فقط لاستعلام البيانات
+        data_query_sql += f" ORDER BY it.received_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
         params.append(page_size)
         params.append(offset)
 
         async with current_app.db_pool.acquire() as connection:
-            rows = await connection.fetch(query, *params)
-        return jsonify([dict(row) for row in rows])
+            total_count_record = await connection.fetchrow(count_query_sql, *count_params)
+            total_count = total_count_record[0] if total_count_record else 0
+
+            rows = await connection.fetch(data_query_sql, *params)
+
+        return jsonify({
+            "data": [dict(row) for row in rows],
+            "totalCount": total_count,
+            "page": page,
+            "pageSize": page_size
+        })
+
     except Exception as e:
         logging.error("Error fetching incoming transactions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
