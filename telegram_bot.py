@@ -348,18 +348,21 @@ async def start_command(message: types.Message):
     bot_user_info = await bot.get_me() # جلب معلومات البوت
     bot_display_name = bot_user_info.username if bot_user_info and bot_user_info.username else "Exaado"
 
+    # رسالة ترحيب ثابتة
     welcome_text = (
-        f"👋 مرحبًا {full_name}!\n\n"
-        f"مرحبًا بك في **@{bot_display_name}**\n"
+        # f"{final_welcome_message_intro}" # تم الإزالة
+        f"👋 مرحبًا {full_name}!\n\n" # استخدم full_name الذي تم تعيين قيمة افتراضية له
+        f"مرحبًا بك في **@Exaado**  \n"
         "هنا يمكنك إدارة اشتراكاتك في قنواتنا بسهولة.\n\n"
         "نتمنى لك تجربة رائعة! 🚀"
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔹 فتح التطبيق 🔹",
-                              web_app=WebAppInfo(url=app_url_for_button))],
+                              web_app=WebAppInfo(url=WEB_APP_URL))],
     ])
     await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
+
 
 
 
