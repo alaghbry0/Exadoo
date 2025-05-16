@@ -10,6 +10,7 @@ from functools import wraps
 import jwt
 import asyncpg
 import asyncio
+from utils.db_utils import remove_users_from_channel
 
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
@@ -19,7 +20,6 @@ async def create_db_pool():
 
 # إنشاء Blueprint مع بادئة URL
 admin_routes = Blueprint("admin_routes", __name__, url_prefix="/api/admin")
-
 
 
 def role_required(required_role):
@@ -50,9 +50,9 @@ def role_required(required_role):
     return decorator
 
 
-@admin_routes.route("/users", methods=["GET"])
+@admin_routes.route("/users_panel", methods=["GET"])
 @role_required("owner")
-async def get_users():
+async def get_users_panel():
     """جلب قائمة المستخدمين من جدول panel_users"""
     async with current_app.db_pool.acquire() as connection:
         users = await connection.fetch("SELECT email, display_name, role FROM panel_users")
@@ -141,6 +141,173 @@ async def remove_user():
     return jsonify({"message": f"User {email} removed successfully"}), 200
 
 
+# ضف هذه الدوال إلى ملف الـ admin_routes في الخادم الخلفي
+
+@admin_routes.route("/users", methods=["GET"])
+@role_required("admin")
+async def get_users():
+    try:
+        # --- معالجة المعلمات من الطلب ---
+        page = int(request.args.get("page", 1))
+        page_size = int(request.args.get("page_size", 20))
+        search_term = request.args.get("search", "").strip()
+
+        # معالجة الترتيب
+        ordering = request.args.get("ordering", "-id")  # افتراضيًا الأحدث حسب id
+        sort_field_map = {
+            "id": "u.id",
+            "telegram_id": "u.telegram_id",
+            "username": "u.username",
+            "full_name": "u.full_name",
+        }
+
+        order_by_clause = "ORDER BY u.id DESC"  # افتراضي
+        if ordering:
+            sort_order = "DESC" if ordering.startswith("-") else "ASC"
+            field_key = ordering.lstrip("-")
+            if field_key in sort_field_map:
+                order_by_clause = f"ORDER BY {sort_field_map[field_key]} {sort_order}"
+            else:
+                logging.warning(f"Unsupported sort field: {field_key}")
+
+        # --- بناء الاستعلام ---
+        params = []
+        conditions = []
+
+        # فلتر البحث
+        if search_term:
+            search_pattern = f"%{search_term}%"
+            conditions.append(
+                f"""(u.telegram_id::TEXT ILIKE ${len(params) + 1} OR 
+                     u.full_name ILIKE ${len(params) + 1} OR 
+                     u.username ILIKE ${len(params) + 1})"""
+            )
+            params.append(search_pattern)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        # --- استعلام العدد الإجمالي ---
+        count_query = f"""
+            SELECT COUNT(u.id) AS total_count
+            FROM users u
+            WHERE {where_clause}
+        """
+
+        # --- استعلام البيانات ---
+        offset_val = (page - 1) * page_size
+        data_query_params = list(params)  # نسخة من params للـ data query
+        data_query_params.extend([page_size, offset_val])
+
+        data_query = f"""
+            SELECT u.id, u.telegram_id, u.username, u.full_name, u.wallet_address, u.ton_wallet_address, u.wallet_app,
+            (SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id) as subscription_count,
+            (SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id AND s.is_active = true) as active_subscription_count
+            FROM users u
+            WHERE {where_clause}
+            {order_by_clause}
+            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+        """
+
+        async with current_app.db_pool.acquire() as conn:
+            # استعلام العدد
+            count_row = await conn.fetchrow(count_query, *params)
+            total_items = count_row['total_count'] if count_row else 0
+
+            # استعلام البيانات
+            items_data = []
+            if total_items > 0 and offset_val < total_items:
+                rows = await conn.fetch(data_query, *data_query_params)
+                items_data = [dict(row) for row in rows]
+
+        return jsonify({
+            "data": items_data,
+            "total_count": total_items,
+            "page": page,
+            "page_size": page_size
+        })
+
+    except ValueError as ve:
+        logging.error(f"Value error in /users: {str(ve)}", exc_info=True)
+        return jsonify({"error": "Invalid request parameters"}), 400
+    except asyncpg.PostgresError as pe:
+        logging.error(f"Database error in /users: {str(pe)}", exc_info=True)
+        return jsonify({"error": "Database operation failed"}), 500
+    except Exception as e:
+        logging.error(f"Unexpected error in /users: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@admin_routes.route("/users/<int:telegram_id>", methods=["GET"])
+@role_required("admin")
+async def get_user_details(telegram_id):
+    try:
+        async with current_app.db_pool.acquire() as conn:
+            # جلب بيانات المستخدم الأساسية
+            user_query = """
+                SELECT u.id, u.telegram_id, u.username, u.full_name, u.wallet_address, 
+                       u.ton_wallet_address, u.wallet_app
+                FROM users u
+                WHERE u.telegram_id = $1
+            """
+            user_data = await conn.fetchrow(user_query, telegram_id)
+
+            if not user_data:
+                return jsonify({"error": "User not found"}), 404
+
+            user_result = dict(user_data)
+
+            # جلب الاشتراكات
+            subscriptions_query = """
+                SELECT s.id, s.channel_id, s.expiry_date, s.is_active, s.start_date,
+                       s.subscription_type_id, st.name as subscription_type_name
+                FROM subscriptions s
+                LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
+                WHERE s.telegram_id = $1
+                ORDER BY s.expiry_date DESC
+            """
+            subscriptions_data = await conn.fetch(subscriptions_query, telegram_id)
+            user_result["subscriptions"] = [dict(row) for row in subscriptions_data]
+
+            # حساب إجمالي المدفوعات
+            payments_query = """
+                SELECT COALESCE(SUM(amount), 0) as total_payments,
+                       COUNT(*) as payment_count
+                FROM payments
+                WHERE telegram_id = $1 AND status = 'completed'
+            """
+            payment_data = await conn.fetchrow(payments_query, telegram_id)
+
+            if payment_data:
+                user_result["payment_stats"] = {
+                    "total_payments": float(payment_data["total_payments"]) if payment_data["total_payments"] else 0,
+                    "payment_count": payment_data["payment_count"]
+                }
+            else:
+                user_result["payment_stats"] = {
+                    "total_payments": 0,
+                    "payment_count": 0
+                }
+
+            # جلب آخر المدفوعات
+            recent_payments_query = """
+                SELECT id, amount, created_at, status, payment_method, payment_token, currency
+                FROM payments
+                WHERE telegram_id = $1
+                ORDER BY created_at DESC
+                LIMIT 5
+            """
+            recent_payments = await conn.fetch(recent_payments_query, telegram_id)
+            user_result["recent_payments"] = [dict(row) for row in recent_payments]
+
+            return jsonify(user_result)
+
+    except asyncpg.PostgresError as pe:
+        logging.error(f"Database error in /users/{telegram_id}: {str(pe)}", exc_info=True)
+        return jsonify({"error": "Database operation failed"}), 500
+    except Exception as e:
+        logging.error(f"Unexpected error in /users/{telegram_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
 #######################################
 # نقاط API لإدارة أنواع الاشتراكات (subscription_types)
 #######################################
@@ -189,7 +356,7 @@ async def create_subscription_type():
                 valid_secondary_channels.append({"channel_id": ch_id, "channel_name": ch_name})
             except ValueError:
                 return jsonify({
-                                   "error": f"Invalid channel_id '{ch_data['channel_id']}' in secondary_channels. Must be an integer."}), 400
+                    "error": f"Invalid channel_id '{ch_data['channel_id']}' in secondary_channels. Must be an integer."}), 400
 
         async with current_app.db_pool.acquire() as connection:
             async with connection.transaction():  # استخدام Transaction لضمان سلامة البيانات
@@ -291,7 +458,7 @@ async def update_subscription_type(type_id: int):
                     ch_id = int(ch_data["channel_id"])
                     if new_main_channel_id is not None and ch_id == new_main_channel_id:  # التحقق مقابل الـ ID الجديد إذا تم توفيره
                         return jsonify({
-                                           "error": f"Secondary channel ID {ch_id} cannot be the same as the new main channel ID."}), 400
+                            "error": f"Secondary channel ID {ch_id} cannot be the same as the new main channel ID."}), 400
                     # إذا لم يتم توفير new_main_channel_id، يجب التحقق مقابل الـ ID الرئيسي الحالي من قاعدة البيانات (خطوة إضافية)
 
                     valid_new_secondary_channels.append({
@@ -316,7 +483,7 @@ async def update_subscription_type(type_id: int):
                 for sec_ch in valid_new_secondary_channels:
                     if sec_ch["channel_id"] == current_main_channel_id_db:
                         return jsonify({
-                                           "error": f"Secondary channel ID {sec_ch['channel_id']} conflicts with the effective main channel ID."}), 400
+                            "error": f"Secondary channel ID {sec_ch['channel_id']} conflicts with the effective main channel ID."}), 400
 
                 # 2. تحديث subscription_types
                 query_type_update = """
@@ -436,7 +603,7 @@ async def delete_subscription_type(type_id: int):
                 "SELECT COUNT(*) FROM subscriptions WHERE subscription_type_id = $1", type_id)
             if active_subs_count > 0:
                 return jsonify({
-                                   "error": f"Cannot delete. There are {active_subs_count} active subscriptions linked to this type."}), 409  # Conflict
+                    "error": f"Cannot delete. There are {active_subs_count} active subscriptions linked to this type."}), 409  # Conflict
 
             await connection.execute("DELETE FROM subscription_types WHERE id = $1", type_id)
         return jsonify({"message": "Subscription type and its associated channels deleted successfully"}), 200
@@ -514,6 +681,7 @@ async def get_subscription_type(type_id: int):
     except Exception as e:
         logging.error("Error fetching subscription type %s: %s", type_id, e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
 
 #######################################
 # نقاط API لإدارة خطط الاشتراك (subscription_plans)
@@ -669,114 +837,184 @@ async def get_subscription_plan(plan_id: int):
 
 @admin_routes.route("/subscriptions", methods=["GET"])
 @role_required("admin")
-async def get_subscriptions():
+async def get_subscriptions_endpoint():  # تم تغيير الاسم لتمييزه عن دالة الواجهة الأمامية
     try:
-        # الحصول على المتغيرات من استعلام URL
-        user_id = request.args.get("user_id")
-        channel_id = request.args.get("channel_id")
-        status = request.args.get("status")  # active أو inactive
-        start_date = request.args.get("start_date")
-        end_date = request.args.get("end_date")
+        # --- Parameters from Request ---
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
-        offset = (page - 1) * page_size
         search_term = request.args.get("search", "").strip()
-        source = request.args.get("source")
-        subscription_type_id_filter = request.args.get("type")
 
-        # استعلام SQL الأساسي
-        base_query = """
-            SELECT
-                s.*,
-                u.full_name,
-                u.username,
-                sp.name AS subscription_plan_name,
-                st.name AS subscription_type_name
-            FROM subscriptions s
-            LEFT JOIN users u ON s.telegram_id = u.telegram_id
-            LEFT JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
-            LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
-            WHERE 1=1
-        """
+        # الفرز (ordering من الواجهة الأمامية مثل "-id" أو "expiry_date")
+        ordering = request.args.get("ordering", "-id")  # افتراضيًا الأحدث حسب id
+        sort_field_map = {
+            "id": "s.id",
+            "telegram_id": "s.telegram_id",
+            "username": "u.username",  # يتطلب JOIN
+            "full_name": "u.full_name",  # يتطلب JOIN
+            "expiry_date": "s.expiry_date",
+            "is_active": "s.is_active",
+            "subscription_type_name": "st.name",  # يتطلب JOIN
+            "source": "s.source",
+            # أضف أي حقول فرز أخرى تدعمها
+        }
+
+        order_by_clause = "ORDER BY s.id DESC"  # افتراضي
+        if ordering:
+            sort_order = "DESC" if ordering.startswith("-") else "ASC"
+            field_key = ordering.lstrip("-")
+            if field_key in sort_field_map:
+                order_by_clause = f"ORDER BY {sort_field_map[field_key]} {sort_order}"
+            else:
+                logging.warning(f"Unsupported sort field: {field_key}")
+                # يمكنك إرجاع خطأ 400 هنا أو استخدام الفرز الافتراضي
+
+        # الفلاتر
+        status_filter = request.args.get(
+            "status")  # "active", "inactive", أو "true", "false" من الواجهة الأمامية القديمة
+        type_filter = request.args.get("type")  # subscription_type_id
+        source_filter = request.args.get("source")
+        start_date_filter = request.args.get("startDate")  # YYYY-MM-DD
+        end_date_filter = request.args.get("endDate")  # YYYY-MM-DD
+
+        # --- Build Query ---
         params = []
-        conditions = []
+        conditions = []  # قائمة بالشروط (WHERE clauses)
 
-        # بناء الشروط الديناميكية
-        if user_id:
-            conditions.append(f"s.telegram_id = ${len(params)+1}")
-            params.append(user_id)
-        if channel_id:
-            conditions.append(f"s.channel_id = ${len(params)+1}")
-            params.append(channel_id)
-        if status:
-            status_bool = "true" if status.lower() == "active" else "false"
-            conditions.append(f"s.is_active = {status_bool}")
-        if start_date:
-            conditions.append(f"s.expiry_date >= ${len(params)+1}::timestamptz")
-            params.append(start_date)
-        if end_date:
-            conditions.append(f"s.expiry_date <= ${len(params)+1}::timestamptz")
-            params.append(end_date)
+        # Filter: Search Term
         if search_term:
+            search_pattern = f"%{search_term}%"
+            # البحث في telegram_id كـ TEXT، وفي full_name و username من جدول users
+            # يتطلب JOIN مع users إذا لم يكن موجودًا بالفعل
             conditions.append(
-                f"(u.full_name ILIKE ${len(params)+1} OR "
-                f"u.username ILIKE ${len(params)+1} OR "
-                f"s.telegram_id::TEXT ILIKE ${len(params)+1})"
+                f"""(s.telegram_id::TEXT ILIKE ${len(params) + 1} OR 
+                     u.full_name ILIKE ${len(params) + 1} OR 
+                     u.username ILIKE ${len(params) + 1})"""
             )
-            params.append(f"%{search_term}%")
-        if source:
-            conditions.append(f"s.source = ${len(params)+1}")
-            params.append(source)
-        if subscription_type_id_filter:
+            params.append(search_pattern)
+
+        # Filter: Status (is_active)
+        if status_filter is not None:
+            # الواجهة الأمامية ترسل "true" أو "false" كسلسلة نصية للفلتر
+            # أو قد ترسل "active" / "inactive"
+            is_active_bool = None
+            if isinstance(status_filter, str):
+                if status_filter.lower() == "true" or status_filter.lower() == "active":
+                    is_active_bool = True
+                elif status_filter.lower() == "false" or status_filter.lower() == "inactive":
+                    is_active_bool = False
+
+            if is_active_bool is not None:
+                conditions.append(f"s.is_active = ${len(params) + 1}")
+                params.append(is_active_bool)
+            else:
+                logging.warning(f"Invalid status filter value: {status_filter}")
+
+        # Filter: Subscription Type ID
+        if type_filter:
             try:
-                conditions.append(f"s.subscription_type_id = ${len(params)+1}")
-                params.append(int(subscription_type_id_filter))
+                conditions.append(f"s.subscription_type_id = ${len(params) + 1}")
+                params.append(int(type_filter))
             except ValueError:
-                logging.warning(f"Invalid subscription_type_id: {subscription_type_id_filter}")
+                logging.warning(f"Invalid subscription_type_id filter: {type_filter}")
+                # يمكنك إرجاع خطأ 400 هنا
 
-        # بناء الاستعلام النهائي
-        query = base_query
-        if conditions:
-            query += " AND " + " AND ".join(conditions)
+        # Filter: Source
+        if source_filter:
+            conditions.append(f"s.source ILIKE ${len(params) + 1}")  # ILIKE لتكون غير حساسة لحالة الأحرف
+            params.append(f"%{source_filter}%")  # بحث جزئي إذا أردت، أو = للبحث المطابق
 
-        # استعلام العد المحسن
+        # Filter: Date Range (expiry_date)
+        if start_date_filter:
+            try:
+                # تأكد من أن التاريخ بالصيغة الصحيحة أو قم بتحويله
+                # dayjs في الواجهة الأمامية يرسل YYYY-MM-DD
+                conditions.append(f"s.expiry_date >= ${len(params) + 1}::date")
+                params.append(start_date_filter)
+            except ValueError:
+                logging.warning(f"Invalid startDate filter: {start_date_filter}")
+
+        if end_date_filter:
+            try:
+                # إضافة يوم واحد لجعل النطاق شاملاً لليوم المحدد
+                # أو تعديل المقارنة إلى < اليوم التالي
+                # أو استخدام ::date إذا كان expiry_date يخزن الوقت أيضًا وتريد مقارنة الأيام فقط
+                conditions.append(
+                    f"s.expiry_date <= (${len(params) + 1}::date + INTERVAL '1 day' - INTERVAL '1 second')")
+                # أو ببساطة: conditions.append(f"s.expiry_date <= ${len(params) + 1}::date") إذا كان الوقت في expiry_date دائمًا 00:00:00
+                # أو إذا كان الواجهة الأمامية ترسل نهاية اليوم
+                params.append(end_date_filter)
+            except ValueError:
+                logging.warning(f"Invalid endDate filter: {end_date_filter}")
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        # --- Base SELECT and JOINs ---
+        # يتم تحديد الأعمدة المطلوبة هنا
+        select_columns = """
+            s.id, s.user_id, s.expiry_date, s.is_active, s.channel_id, 
+            s.subscription_type_id, s.telegram_id, s.start_date, 
+            s.updated_at, s.payment_id, s.subscription_plan_id, s.source,
+            u.full_name, u.username, 
+            st.name AS subscription_type_name,
+            sp.name AS subscription_plan_name 
+        """
+        # إذا لم تكن دائمًا بحاجة لـ sp.name، يمكنك إزالة الـ JOIN
+
+        from_clause = """
+            FROM subscriptions s
+            LEFT JOIN users u ON s.telegram_id = u.telegram_id  -- أو s.user_id = u.id إذا كان هذا هو الربط الصحيح
+            LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
+            LEFT JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
+        """
+
+        # --- Count Query ---
+        # استخدام نفس الـ JOINs والـ WHERE clause للاستعلام عن العدد لضمان الدقة
         count_query = f"""
-            SELECT COUNT(*) AS total_count 
-            FROM ({query.replace('s.*, u.full_name, u.username', 's.id')}) AS subquery
-        """.split("ORDER BY")[0]
+            SELECT COUNT(s.id) AS total_count
+            {from_clause}
+            WHERE {where_clause}
+        """
 
-        # إضافة التجزئة والترتيب
-        paginated_query = query + f" ORDER BY s.expiry_date DESC LIMIT ${len(params)+1} OFFSET ${len(params)+2}"
-        params.extend([page_size, offset])
+        # --- Data Query ---
+        offset_val = (page - 1) * page_size
+        data_query_params = list(params)  # نسخة من params للـ data query
+        data_query_params.extend([page_size, offset_val])
+
+        data_query = f"""
+            SELECT {select_columns}
+            {from_clause}
+            WHERE {where_clause}
+            {order_by_clause}
+            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2} 
+        """
+        # الـ placeholders لـ LIMIT و OFFSET هي بعد params الأصلية
 
         async with current_app.db_pool.acquire() as conn:
-            # تنفيذ استعلام العد
-            try:
-                count_params = params[:-2]
-                count_row = await conn.fetchrow(count_query, *count_params)
-                total = count_row['total_count'] if count_row else 0
-            except asyncpg.UndefinedColumnError:
-                total = 0
-                logging.warning("Count query column mismatch, falling back to 0")
+            # Execute count query (using original params, without limit/offset)
+            count_row = await conn.fetchrow(count_query, *params)
+            total_items_for_filter = count_row['total_count'] if count_row else 0
 
-            # تنفيذ الاستعلام الرئيسي
-            rows = await conn.fetch(paginated_query, *params)
+            # Execute data query only if there's data to fetch
+            items_data = []
+            if total_items_for_filter > 0 and offset_val < total_items_for_filter:
+                rows = await conn.fetch(data_query, *data_query_params)
+                items_data = [dict(row) for row in rows]
 
-        # بناء النتيجة
-        results = [dict(row) for row in rows]
-        for item in results:
-            item['total_count'] = total
+        return jsonify({
+            "data": items_data,
+            "total_count": total_items_for_filter,
+            "page": page,
+            "page_size": page_size
+        })
 
-        return jsonify(results)
-
-    except ValueError as ve:
-        logging.error(f"Validation error: {str(ve)}")
+    except ValueError as ve:  # مثل تحويل page أو page_size إلى int
+        logging.error(f"Value error in /subscriptions: {str(ve)}", exc_info=True)
         return jsonify({"error": "Invalid request parameters"}), 400
     except asyncpg.PostgresError as pe:
-        logging.error(f"Database error: {str(pe)}")
+        logging.error(f"Database error in /subscriptions: {str(pe)}", exc_info=True)
         return jsonify({"error": "Database operation failed"}), 500
     except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}", exc_info=True)
+        logging.error(f"Unexpected error in /subscriptions: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
@@ -818,19 +1056,19 @@ async def get_pending_subscriptions_stats():
                 GROUP BY status;
             """
             rows = await connection.fetch(query)
-            
+
             stats = {row['status']: row['count'] for row in rows}
             # تأكد من القيم الافتراضية للحالات التي نهتم بها
             stats.setdefault('pending', 0)
             stats.setdefault('complete', 0)
             # يمكنك إضافة 'rejected' إذا كنت لا تزال تستخدمها
-            # stats.setdefault('rejected', 0) 
+            # stats.setdefault('rejected', 0)
 
             # العدد الإجمالي للاشتراكات المعلقة (بجميع حالاتها)
             total_all_query = "SELECT COUNT(*) FROM pending_subscriptions;"
             total_all_count = await connection.fetchval(total_all_query)
             stats['total_all'] = total_all_count or 0
-            
+
         return jsonify(stats)
 
     except Exception as e:
@@ -838,52 +1076,52 @@ async def get_pending_subscriptions_stats():
         return jsonify({"error": "Internal server error"}), 500
 
 
-# تعديل واجهة API للحصول على pending_subscriptions لدعم الفلترة بشكل أفضل
 @admin_routes.route("/pending_subscriptions", methods=["GET"])
 @role_required("admin")
-async def get_pending_subscriptions():
+async def get_all_pending_subscriptions():  # تم تغيير اسم الدالة ليعكس وظيفتها بشكل أفضل
     try:
-        # الفلتر status: يمكن أن يكون "all", "pending", "complete"
-        status_filter = request.args.get("status", "all") # الافتراضي هو "all" إذا لم يحدد
+        status_filter = request.args.get("status", "all").lower()
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
         search_term = request.args.get("search", "").strip()
 
         params = []
-        conditions = ["1=1"] # Starting with a base condition
+        conditions = []  # نبدأ بقائمة فارغة للشروط
 
-        # بناء جزء WHERE بشكل ديناميكي
-        if status_filter and status_filter.lower() != "all":
+        if status_filter != "all":
             conditions.append(f"ps.status = ${len(params) + 1}")
             params.append(status_filter)
 
         if search_term:
-            # ILIKE للبحث غير الحساس لحالة الأحرف
-            # تأكد من أن أعمدة البحث مفهرسة جيدًا في قاعدة البيانات للأداء
-            search_condition = f"""
-                (u.full_name ILIKE ${len(params) + 1} OR 
-                 u.username ILIKE ${len(params) + 1} OR 
-                 ps.telegram_id::TEXT ILIKE ${len(params) + 1}) 
-            """ # استخدام نفس placeholder لأن القيمة نفسها
-            conditions.append(search_condition)
+            # البحث في ps.telegram_id مباشرة، وفي u.full_name و u.username من خلال JOIN
+            # استخدام نفس الـ placeholder والقيمة للـ ILIKE المتعددة صحيح
+            search_param_index = len(params) + 1
+            conditions.append(f"""
+                (u.full_name ILIKE ${search_param_index} OR 
+                 u.username ILIKE ${search_param_index} OR 
+                 ps.telegram_id::TEXT ILIKE ${search_param_index})
+            """)
             params.append(f"%{search_term}%")
-            # إذا كنت تستخدم placeholders مختلفة لكل ILIKE (وهو أكثر أمانًا ودقة)
-            # params.extend([f"%{search_term}%", f"%{search_term}%", f"%{search_term}%"])
-            # وفي هذه الحالة، عدّادات placeholder ستكون ${len(params)+1}, ${len(params)+2}, ${len(params)+3}
 
+        # إذا لم تكن هناك شروط، استخدم "1=1" لتجنب خطأ SQL
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        where_clause = " AND ".join(conditions)
-
-        # استعلام جلب البيانات
         data_query = f"""
             SELECT
-                ps.*,
+                ps.id, 
+                ps.user_db_id,
+                ps.telegram_id, 
+                ps.channel_id, 
+                ps.subscription_type_id,
+                ps.found_at,
+                ps.status,
+                ps.admin_reviewed_at,
                 u.full_name,
                 u.username,
                 st.name AS subscription_type_name
             FROM pending_subscriptions ps
-            LEFT JOIN users u ON ps.telegram_id = u.telegram_id
+            LEFT JOIN users u ON ps.user_db_id = u.id  -- الربط بـ user_db_id لجلب full_name و username
             LEFT JOIN subscription_types st ON ps.subscription_type_id = st.id
             WHERE {where_clause}
             ORDER BY ps.found_at DESC 
@@ -891,22 +1129,20 @@ async def get_pending_subscriptions():
         """
         data_params = params + [page_size, offset]
 
-        # استعلام جلب العدد الإجمالي للبيانات المفلترة (مهم للـ pagination)
         count_query = f"""
             SELECT COUNT(ps.id)
             FROM pending_subscriptions ps
-            LEFT JOIN users u ON ps.telegram_id = u.telegram_id 
+            LEFT JOIN users u ON ps.user_db_id = u.id -- نفس الـ JOIN مطلوب لتطبيق فلتر البحث بشكل صحيح
             WHERE {where_clause}
         """
-        # params للـ count هي نفسها بدون page_size و offset
 
         async with current_app.db_pool.acquire() as connection:
             rows = await connection.fetch(data_query, *data_params)
-            total_count_for_filter = await connection.fetchval(count_query, *params) # استخدام params الأصلية للفلتر
+            total_count_for_filter = await connection.fetchval(count_query, *params)
 
         return jsonify({
             "data": [dict(row) for row in rows],
-            "total_count": total_count_for_filter or 0, # العدد الإجمالي بناءً على الفلتر
+            "total_count": total_count_for_filter or 0,
             "page": page,
             "page_size": page_size
         })
@@ -916,10 +1152,10 @@ async def get_pending_subscriptions():
         return jsonify({"error": "Internal server error"}), 500
 
 
-# واجهة API إضافية للتعامل مع إجراءات pending_subscriptions (قبول/رفض)
-@admin_routes.route("/pending_subscriptions/<int:id>/action", methods=["POST"])
+# واجهة API إضافية للتعامل مع إجراءات pending_subscriptions
+@admin_routes.route("/pending_subscriptions/<int:record_id>/action", methods=["POST"])  # تغيير 'id' إلى 'record_id'
 @role_required("admin")
-async def handle_pending_subscription(id):
+async def handle_single_pending_subscription(record_id: int):  # تغيير 'id' إلى 'record_id' وإضافة type hint
     try:
         if not request.is_json:
             return jsonify({"error": "Request body must be JSON"}), 415
@@ -929,43 +1165,160 @@ async def handle_pending_subscription(id):
             return jsonify({"error": "Invalid JSON payload"}), 400
 
         action = data.get('action')
-
-        # نتوقع الآن فقط 'mark_as_complete'
         if action != 'mark_as_complete':
             return jsonify({"error": f"Invalid action: '{action}'. Expected 'mark_as_complete'."}), 400
 
         async with current_app.db_pool.acquire() as connection:
+            # جلب ps.telegram_id و ps.channel_id مباشرة من pending_subscriptions
             pending_sub = await connection.fetchrow(
-                "SELECT * FROM pending_subscriptions WHERE id = $1", id
+                """
+                SELECT ps.id, ps.telegram_id, ps.channel_id, ps.status
+                FROM pending_subscriptions ps
+                WHERE ps.id = $1
+                """, record_id  # استخدام الاسم الجديد
             )
 
             if not pending_sub:
                 return jsonify({"error": "Pending subscription not found"}), 404
 
             if pending_sub['status'] == 'complete':
-                return jsonify({"success": True, "message": "Subscription already marked as complete."}), 200 # OK, no change
+                return jsonify({"success": True, "message": "Subscription already marked as complete."}), 200
 
             if pending_sub['status'] != 'pending':
-                return jsonify({"error": f"Subscription is not in 'pending' state (current: {pending_sub['status']}). Cannot mark as complete."}), 400
+                return jsonify({
+                    "error": f"Subscription is not in 'pending' state (current: {pending_sub['status']}). Cannot mark as complete."}), 400
 
-            # تم إزالة الجزء الخاص بإنشاء اشتراك جديد في جدول subscriptions
+            telegram_id_to_remove = pending_sub['telegram_id']
+            channel_id_to_remove_from = pending_sub['channel_id']
 
-            # تحديث حالة الاشتراك المعلق إلى 'complete'
-            await connection.execute("""
-                UPDATE pending_subscriptions
-                SET status = 'complete', admin_reviewed_at = NOW()
-                WHERE id = $1
-            """, id) # الحالة الجديدة 'complete'
+            # استخدام الهيكل المبسّط الذي اقترحته سابقًا
+            try:
+                bot_removed_user = await remove_users_from_channel(
+                    telegram_id=telegram_id_to_remove,
+                    channel_id=channel_id_to_remove_from
+                )
 
-        # تم تعديل رسالة النجاح لتعكس أننا فقط نحدث الحالة
-        return jsonify({"success": True, "message": "Pending subscription marked as complete."})
+                if not bot_removed_user:
+                    specific_error_msg = f"Bot failed to remove user {telegram_id_to_remove} from channel {channel_id_to_remove_from} or send notification."
+                    logging.warning(specific_error_msg + " Status will not be updated to complete.")
+                    return jsonify({"error": specific_error_msg, "bot_action_failed": True}), 500  # أو 422
 
-    except Exception as e:
-        logging.error("Error marking pending subscription as complete: %s", e, exc_info=True)
+                await connection.execute("""
+                    UPDATE pending_subscriptions
+                    SET status = 'complete', admin_reviewed_at = NOW()
+                    WHERE id = $1
+                """, record_id)  # استخدام الاسم الجديد
+
+                return jsonify({"success": True,
+                                "message": f"Pending subscription for user {telegram_id_to_remove} marked as complete. User removed and notified."})
+
+            except Exception as e:
+                exception_error_msg = f"Exception during bot action or DB update for sub {record_id} (User {telegram_id_to_remove}): {e}"
+                logging.error(exception_error_msg, exc_info=True)
+                return jsonify({"error": exception_error_msg, "bot_action_failed": True}), 500
+
+    except Exception as e:  # هذا يلتقط الأخطاء قبل الوصول إلى منطق المعالجة الرئيسي
+        logging.error(f"Error in handle_single_pending_subscription for ID {record_id}: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-    
 
 
+@admin_routes.route("/pending_subscriptions/bulk_action", methods=["POST"])
+@role_required("admin")
+async def handle_bulk_pending_subscriptions_action():  # تم تغيير الاسم قليلاً
+    try:
+        if not request.is_json:
+            return jsonify({"error": "Request body must be JSON"}), 415
+
+        data = await request.get_json()
+        if data is None:
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        action = data.get('action')
+        filter_criteria = data.get('filter', {})
+
+        if action != 'mark_as_complete':
+            return jsonify({"error": f"Invalid action: '{action}'. Expected 'mark_as_complete'."}), 400
+
+        async with current_app.db_pool.acquire() as connection:
+            query_conditions = ["ps.status = 'pending'"]
+            query_params = []
+
+            if 'channel_id' in filter_criteria:
+                query_conditions.append(f"ps.channel_id = ${len(query_params) + 1}")
+                query_params.append(filter_criteria['channel_id'])
+
+            if 'subscription_type_id' in filter_criteria:
+                query_conditions.append(f"ps.subscription_type_id = ${len(query_params) + 1}")
+                query_params.append(filter_criteria['subscription_type_id'])
+
+            where_clause = " AND ".join(query_conditions)
+
+            # جلب ps.telegram_id و ps.channel_id مباشرة
+            query = f"""
+                SELECT ps.id, ps.telegram_id, ps.channel_id
+                FROM pending_subscriptions ps 
+                WHERE {where_clause}
+            """
+            pending_subs_to_process = await connection.fetch(query, *query_params)
+
+            if not pending_subs_to_process:
+                return jsonify({"success": True, "message": "No pending subscriptions match the criteria."}), 200
+
+            succeeded_updates = 0
+            failed_bot_actions = 0
+            processed_candidates = len(pending_subs_to_process)
+            failures_details = []
+
+            for sub_data in pending_subs_to_process:
+                sub_id = sub_data['id']
+                telegram_id_to_remove = sub_data['telegram_id']
+                channel_id_to_remove_from = sub_data['channel_id']
+
+                try:
+                    bot_removed_user = await remove_users_from_channel(
+
+                        telegram_id=telegram_id_to_remove,
+                        channel_id=channel_id_to_remove_from
+                    )
+                    if bot_removed_user:
+                        await connection.execute("""
+                            UPDATE pending_subscriptions
+                            SET status = 'complete', admin_reviewed_at = NOW()
+                            WHERE id = $1
+                        """, sub_id)
+                        succeeded_updates += 1
+                        logging.info(f"Bulk: Successfully processed sub_id {sub_id} (User {telegram_id_to_remove})")
+                    else:
+                        failed_bot_actions += 1
+                        bot_error_info = f"Bot action failed for user {telegram_id_to_remove} in channel {channel_id_to_remove_from}."
+                        logging.warning(f"Bulk: {bot_error_info} Sub_id {sub_id} not marked complete.")
+                        failures_details.append(
+                            {"sub_id": sub_id, "telegram_id": telegram_id_to_remove, "error": bot_error_info})
+
+                except Exception as e:
+                    failed_bot_actions += 1
+                    bot_error_info = f"Exception during bot action or DB update for sub {sub_id} (User {telegram_id_to_remove}): {str(e)}"
+                    logging.error(f"Bulk: {bot_error_info}", exc_info=True)
+                    failures_details.append(
+                        {"sub_id": sub_id, "telegram_id": telegram_id_to_remove, "error": bot_error_info})
+
+            result_message = (
+                f"Bulk processing: Candidates: {processed_candidates}. "
+                f"Succeeded: {succeeded_updates}. Failures: {failed_bot_actions}."
+            )
+            return jsonify({
+                "success": True,
+                "message": result_message,
+                "details": {
+                    "total_candidates": processed_candidates,
+                    "successful_updates": succeeded_updates,
+                    "failed_bot_or_db_updates": failed_bot_actions,
+                    "failures_log": failures_details
+                }
+            })
+    except Exception as e:
+        logging.error("Error in bulk_action: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error during bulk processing"}), 500
 
 
 @admin_routes.route("/legacy_subscriptions", methods=["GET"])
@@ -979,15 +1332,15 @@ async def get_legacy_subscriptions():
         search_term = request.args.get("search", "")
         sort_field = request.args.get("sort_field", "expiry_date")
         sort_order = request.args.get("sort_order", "desc")
-        
+
         stats_only = request.args.get("stats_only", "false").lower() == "true"
-        
+
         base_query = """
             FROM legacy_subscriptions ls
             LEFT JOIN subscription_types st ON ls.subscription_type_id = st.id
             WHERE 1=1
         """
-        
+
         # المعلمات الخاصة بشروط التصفية فقط
         filter_params = []
         filter_conditions = ""
@@ -998,11 +1351,11 @@ async def get_legacy_subscriptions():
 
         if search_term:
             # تأكد من أن لديك عمودًا مناسبًا للبحث عن الاسم الكامل، أو عدل الاستعلام
-            filter_conditions += f" AND (ls.username ILIKE ${len(filter_params) + 1} OR ls.full_name ILIKE ${len(filter_params) + 2})" # لاحظ أن هذا يضيف عنصرين نائبين
-            search_pattern = f"%{search_term}%"
-            filter_params.append(search_pattern) # لـ username
-            filter_params.append(search_pattern) # لـ full_name
-        
+            filter_conditions += (
+                f" AND ls.username ILIKE ${len(filter_params) + 1}"
+            )
+            filter_params.append(f"%{search_term}%")
+
         if stats_only:
             stats_query = f"""
                 SELECT 
@@ -1020,16 +1373,16 @@ async def get_legacy_subscriptions():
                 "not_processed": stats["not_processed"] if stats else 0,
                 "total": stats["total"] if stats else 0
             })
-        
+
         count_query = f"""
             SELECT COUNT(*) as total_count
             {base_query}
             {filter_conditions}
         """
-        
+
         # الآن نبني المعلمات الكاملة لـ data_query
-        data_query_params = list(filter_params) # ابدأ بنسخة من filter_params
-        
+        data_query_params = list(filter_params)  # ابدأ بنسخة من filter_params
+
         data_query = f"""
             SELECT
                 ls.*,
@@ -1043,23 +1396,23 @@ async def get_legacy_subscriptions():
             ORDER BY ls.{sort_field} {sort_order}
             LIMIT ${len(data_query_params) + 1} OFFSET ${len(data_query_params) + 2}
         """
-        
+
         data_query_params.append(page_size)
         data_query_params.append(offset)
-        
-        total_count_val = 0 # قيمة افتراضية
+
+        total_count_val = 0  # قيمة افتراضية
         result = []
 
         async with current_app.db_pool.acquire() as connection:
             # تنفيذ استعلام العد باستخدام filter_params (التي لا تحتوي على page_size/offset)
             count_row = await connection.fetchrow(count_query, *filter_params)
             total_count_val = count_row["total_count"] if count_row else 0
-            
+
             # تنفيذ استعلام البيانات باستخدام data_query_params (التي تحتوي على كل شيء)
-            if total_count_val > 0: # لا تجلب البيانات إذا لم يكن هناك شيء
-                 rows = await connection.fetch(data_query, *data_query_params)
-                 result = [dict(row) for row in rows]
-        
+            if total_count_val > 0:  # لا تجلب البيانات إذا لم يكن هناك شيء
+                rows = await connection.fetch(data_query, *data_query_params)
+                result = [dict(row) for row in rows]
+
         # إضافة total_count مرة واحدة إلى الاستجابة بدلاً من كل صف
         # الواجهة الأمامية في React كانت تتوقع totalCount ك prop منفصل، وهو أفضل.
         # إذا كنت تريد إعادته مع كل صف، يمكنك إضافته هنا:
@@ -1070,8 +1423,7 @@ async def get_legacy_subscriptions():
         # إذا كان هذا هو المطلوب:
         if result:
             for row_data in result:
-                 row_data["total_count"] = total_count_val
-
+                row_data["total_count"] = total_count_val
 
         # ولكن عادةً ما يكون من الأفضل إرسال إجمالي عدد العناصر المطابقة مرة واحدة
         # return jsonify({"subscriptions": result, "total_items_for_filter": total_count_val})
@@ -1082,6 +1434,7 @@ async def get_legacy_subscriptions():
         logging.error("Error fetching legacy subscriptions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # واجهة API للحصول على إحصائيات legacy_subscriptions (تبقى كما هي إذا كنت تستدعيها بشكل منفصل)
 # ولكن الكود الجديد في الواجهة الأمامية يجلب الإحصائيات من خلال getLegacySubscriptions نفسه
 # لذا قد لا تكون هذه الـ endpoint ضرورية إذا اعتمدت على الواجهة الأمامية الجديدة
@@ -1090,7 +1443,7 @@ async def get_legacy_subscriptions():
 async def get_legacy_subscription_stats():
     try:
         # يمكنك إضافة فلاتر هنا إذا كنت تريد إحصائيات مفلترة
-        processed_filter = request.args.get("processed") # "true", "false", or None
+        processed_filter = request.args.get("processed")  # "true", "false", or None
 
         query_base = "FROM legacy_subscriptions"
         query_conditions = ""
@@ -1099,17 +1452,17 @@ async def get_legacy_subscription_stats():
         if processed_filter is not None:
             query_conditions += " WHERE processed = $1"
             params.append(processed_filter.lower() == "true")
-        
+
         # استعلام واحد للإحصائيات
         query = f"""
             SELECT 
-                COUNT(*) FILTER (WHERE processed = true { 'AND processed = $1' if processed_filter == 'true' else '' } { 'AND processed = $1' if processed_filter == 'false' else '' } ) AS processed_true,
-                COUNT(*) FILTER (WHERE processed = false { 'AND processed = $1' if processed_filter == 'true' else '' } { 'AND processed = $1' if processed_filter == 'false' else '' } ) AS processed_false,
+                COUNT(*) FILTER (WHERE processed = true {'AND processed = $1' if processed_filter == 'true' else ''} {'AND processed = $1' if processed_filter == 'false' else ''} ) AS processed_true,
+                COUNT(*) FILTER (WHERE processed = false {'AND processed = $1' if processed_filter == 'true' else ''} {'AND processed = $1' if processed_filter == 'false' else ''} ) AS processed_false,
                 COUNT(*) AS total
             {query_base} {query_conditions}
         """
         # تبسيط منطق الإحصائيات إذا كانت الـ endpoint مخصصة فقط للإحصائيات الإجمالية أو المفلترة
-        
+
         # إذا كنت تريد فقط الإحصائيات الإجمالية (غير مفلترة):
         if processed_filter is None:
             query = """
@@ -1119,18 +1472,17 @@ async def get_legacy_subscription_stats():
                     COUNT(*) AS total
                 FROM legacy_subscriptions
             """
-            params = [] # لا معلمات للاستعلام الإجمالي
+            params = []  # لا معلمات للاستعلام الإجمالي
         elif processed_filter == "true":
-             query = "SELECT COUNT(*) AS count FROM legacy_subscriptions WHERE processed = true"
+            query = "SELECT COUNT(*) AS count FROM legacy_subscriptions WHERE processed = true"
         elif processed_filter == "false":
-             query = "SELECT COUNT(*) AS count FROM legacy_subscriptions WHERE processed = false"
-
+            query = "SELECT COUNT(*) AS count FROM legacy_subscriptions WHERE processed = false"
 
         async with current_app.db_pool.acquire() as connection:
             # هذا الجزء يحتاج إلى تعديل بناءً على ما إذا كنت تريد إحصائيات مفلترة أم لا من هذه الـ endpoint
             # الكود الأمامي الجديد يستدعي /legacy_subscriptions مع params للحصول على الأعداد من هناك
             # لذا، هذه الـ endpoint قد تكون للإحصائيات العامة فقط
-            
+
             # للحصول على إحصائيات عامة (كما كان في الأصل):
             overall_stats_query = """
                 SELECT 
@@ -1140,16 +1492,17 @@ async def get_legacy_subscription_stats():
                 FROM legacy_subscriptions
             """
             stats = await connection.fetchrow(overall_stats_query)
-        
+
         return jsonify({
-            "true": stats["processed_true"] if stats else 0, # مطابقة للمفتاح في React
-            "false": stats["processed_false"] if stats else 0, # مطابقة للمفتاح في React
+            "true": stats["processed_true"] if stats else 0,  # مطابقة للمفتاح في React
+            "false": stats["processed_false"] if stats else 0,  # مطابقة للمفتاح في React
             "total": stats["total"] if stats else 0
         })
-        
+
     except Exception as e:
         logging.error("Error fetching legacy subscription stats: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
 
 # =====================================
 # 2. API لجلب بيانات الدفعات مع دعم الفلاتر والتجزئة والتقارير المالية
@@ -1243,7 +1596,6 @@ async def get_payments():
         return jsonify({"error": "Internal server error"}), 500
 
 
-
 @admin_routes.route("/incoming-transactions", methods=["GET"])
 @role_required("admin")
 async def get_incoming_transactions():
@@ -1281,7 +1633,7 @@ async def get_incoming_transactions():
             rows = await connection.fetch(query, *params)
         return jsonify([dict(row) for row in rows])
     except Exception as e:
-        logging.error("Error fetching incoming transactions: %s", e, exc_info=True) 
+        logging.error("Error fetching incoming transactions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
@@ -1359,8 +1711,8 @@ async def add_subscription():
         username = data.get("username")
 
         # التحقق من وجود الحقول الأساسية
-        if not all([telegram_id, expiry_date, subscription_type_id, full_name, username]):
-            return jsonify({"error": "Missing required fields"}), 400
+        if not all([telegram_id, subscription_type_id, expiry_date]):
+            return jsonify({"error": "Missing required fields: telegram_id, subscription_type_id, expiry_date"}), 400
 
         # تحويل telegram_id إلى رقم (int)
         try:
@@ -1438,7 +1790,6 @@ async def add_subscription():
 @admin_routes.route("/subscriptions/export", methods=["GET"])
 @role_required("admin")
 async def export_subscriptions():
-    
     try:
         subscription_type_id = request.args.get("subscription_type_id")
         start_date = request.args.get("start_date")

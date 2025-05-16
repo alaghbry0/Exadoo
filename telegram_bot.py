@@ -12,9 +12,9 @@ from dotenv import load_dotenv
 from quart import Blueprint, current_app, request, jsonify
 from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, get_active_subscription_types,get_subscription_type_details_by_id, add_subscription_for_legacy, add_pending_subscription
 import asyncpg
+from aiogram.enums import ChatMemberStatus
 from functools import partial
 from typing import Optional
-
 from datetime import datetime, timezone, timedelta
 
 
@@ -129,92 +129,145 @@ async def handle_legacy_user(
     return migrated_count > 0
 
 
+async def add_pending_subscription_fixed( # تم تغيير الاسم للتوضيح
+        connection: asyncpg.Connection,
+        user_db_id: int,
+        telegram_id: int,
+        channel_id: int,
+        subscription_type_id: int
+) -> bool:
+    """
+    يضيف اشتراكًا معلقًا للمراجعة.
+    يستخدم ON CONFLICT (telegram_id, channel_id) DO NOTHING.
+    يعود True إذا تم إدراج صف جديد، False إذا لم يتم إدراج أي شيء (بسبب التعارض).
+    """
+    try:
+        record_id = await connection.fetchval(
+            """
+            INSERT INTO pending_subscriptions (user_db_id, telegram_id, channel_id, subscription_type_id, status)
+            VALUES ($1, $2, $3, $4, 'pending')
+            ON CONFLICT (telegram_id, channel_id) DO NOTHING
+            RETURNING id; 
+            """,
+            user_db_id,
+            telegram_id,
+            channel_id,
+            subscription_type_id,
+        )
+
+        if record_id is not None:
+            logging.info(f"Successfully added pending subscription with ID {record_id} for TGID {telegram_id}, channel {channel_id}.")
+            return True
+        else:
+            logging.info(f"Pending subscription for TGID {telegram_id}, channel {channel_id} likely already exists (ON CONFLICT DO NOTHING triggered).")
+            return False
+    except Exception as e:
+        logging.error(
+            f"❌ Error in add_pending_subscription_fixed for user_db_id {user_db_id} (TG: {telegram_id}), channel {channel_id}: {e}",
+            exc_info=True
+        )
+        return False
+
+
 async def handle_telegram_list_user(
         conn: asyncpg.Connection,
         telegram_id: int,
         user_db_id: int,
         full_name: str,
-        member_statuses: dict
+        member_statuses: dict,
+        # bot_instance,  # <-- لم نعد بحاجة لتمريره، سنستخدم `bot` العام
+        admin_tg_id # لا يزال يُمرر أو يمكن استخدام ADMIN_ID العام
 ):
-    admin_telegram_id = ADMIN_ID
+    # admin_telegram_id = admin_tg_id # استخدام الوسيطة الممررة
+    admin_telegram_id = ADMIN_ID # استخدام العام
     added_to_pending_count = 0
+    # افترض أن get_active_subscription_types معرفة ومتاحة
     active_subscription_types = await get_active_subscription_types(conn)
+
+    non_active_member_statuses = [
+        ChatMemberStatus.LEFT,
+        ChatMemberStatus.KICKED,
+        ChatMemberStatus.RESTRICTED
+    ]
 
     for sub_type in active_subscription_types:
         managed_channel_id = sub_type['channel_id']
         subscription_type_id = sub_type['id']
         channel_name = sub_type['name']
-        member_status = member_statuses.get(managed_channel_id)
+        member_status_obj = member_statuses.get(managed_channel_id)
 
-        if member_status and member_status.status not in ["left", "kicked", "restricted", "banned"]:
-            existing_actual_sub = await conn.fetchrow(
-                "SELECT id, source FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2 LIMIT 1",
+        if member_status_obj and member_status_obj.status not in non_active_member_statuses:
+            current_channel_subscription = await get_subscription(conn, telegram_id, managed_channel_id)
+
+            if current_channel_subscription and current_channel_subscription.get('is_active', False):
+                logging.info(f"User TGID {telegram_id} has an ACTIVE subscription for channel {channel_name} ({managed_channel_id}). Skipping pending logic.")
+                continue
+            
+            logging.info(
+                f"User TGID {telegram_id} (Name: {full_name}) found in channel {channel_name} ({managed_channel_id}). Subscription status: {'INACTIVE' if current_channel_subscription else 'NOT FOUND'}. Needs review for pending.")
+
+            status_of_pending_add = "الرجاء المراجعة واتخاذ الإجراء."
+            existing_pending_sub = await conn.fetchrow(
+                "SELECT id, status FROM pending_subscriptions WHERE telegram_id = $1 AND channel_id = $2",
                 telegram_id, managed_channel_id
             )
-            if existing_actual_sub:
-                logging.info(f"User TGID {telegram_id} has actual sub. Skipping.")
-                continue
 
-            # --- هنا يبدأ منطق الإشعار ---
-            logging.info(
-                f"User TGID {telegram_id} (Name: {full_name}) found in channel {channel_name} without active sub. Needs review.")
-
-            status_of_pending_add = "الرجاء المراجعة واتخاذ الإجراء."  # رسالة افتراضية
-            was_newly_added = False
-
-            try:
-                was_newly_added = await add_pending_subscription(
-                    connection=conn,
-                    user_db_id=user_db_id,
-                    telegram_id=telegram_id,
-                    channel_id=managed_channel_id,
-                    subscription_type_id=subscription_type_id
-                )
-
-                if was_newly_added:
-                    added_to_pending_count += 1
-                    logging.info(f"User TGID {telegram_id} added to PENDING for channel {channel_name}.")
-                    status_of_pending_add = "تمت إضافته إلى قائمة الاشتراكات المعلقة للمراجعة."
-                else:
-                    # التحقق مما إذا كان موجودًا بالفعل أم فشل لسبب آخر
-                    is_already_pending = await conn.fetchval(
-                        "SELECT 1 FROM pending_subscriptions WHERE telegram_id = $1 AND channel_id = $2",
-                        telegram_id, managed_channel_id
-                    )
-                    if is_already_pending:
-                        logging.info(f"User TGID {telegram_id} already in PENDING for channel {channel_name}.")
-                        status_of_pending_add = "موجود مسبقًا في قائمة الاشتراكات المعلقة."
-                    else:
-                        logging.error(
-                            f"Failed to add TGID {telegram_id} to PENDING for channel {channel_name} (returned False, not found).")
-                        status_of_pending_add = "فشلت محاولة إضافته إلى `pending_subscriptions` (لم يكن موجودًا مسبقًا)."
-
-            except Exception as e:
-                logging.error(f"EXCEPTION while processing PENDING for TGID {telegram_id}, channel {channel_name}: {e}",
-                              exc_info=True)
-                status_of_pending_add = f"حدث خطأ أثناء محاولة إضافته إلى `pending_subscriptions`: {str(e)}."
-
-            # --- إرسال الإشعار الآن ---
-            admin_message = (
-                f"👤 مراجعة مستخدم:\n"
-                f"الاسم: {full_name} (ID: `{telegram_id}`)\n"
-                f"القناة: {channel_name} (`{managed_channel_id}`)\n"
-                f"تم العثور عليه في القناة وليس لديه اشتراك مسجل.\n"
-                f"الحالة بخصوص الإضافة للمعلقة: {status_of_pending_add}"
-            )
-
-            if admin_telegram_id:
-                try:
-                    await bot.send_message(admin_telegram_id, admin_message, parse_mode="Markdown")
-                except Exception as e_admin_msg:
-                    logging.error(f"Failed to send admin notification for user {telegram_id}: {e_admin_msg}")
+            if existing_pending_sub:
+                logging.info(f"User TGID {telegram_id} already in PENDING for channel {channel_name} with status '{existing_pending_sub['status']}'. No new entry will be added.")
+                status_of_pending_add = f"موجود مسبقًا في قائمة الاشتراكات المعلقة (الحالة: {existing_pending_sub['status']})."
             else:
-                logging.warning("ADMIN_TELEGRAM_ID not set. Cannot send admin notification.")
+                try:
+                    # استخدام الدالة المصححة
+                    was_newly_added = await add_pending_subscription_fixed(
+                        connection=conn,
+                        user_db_id=user_db_id,
+                        telegram_id=telegram_id,
+                        channel_id=managed_channel_id,
+                        subscription_type_id=subscription_type_id
+                    )
+                    if was_newly_added:
+                        added_to_pending_count += 1
+                        logging.info(f"User TGID {telegram_id} newly added to PENDING for channel {channel_name}.")
+                        status_of_pending_add = "تمت إضافته حديثًا إلى قائمة الاشتراكات المعلقة للمراجعة."
+                    else:
+                        # هذا يعني أن add_pending_subscription_fixed أعادت False (بسبب ON CONFLICT أو خطأ آخر)
+                        logging.error(
+                            f"Failed to add TGID {telegram_id} to PENDING for channel {channel_name} (add_pending_subscription_fixed returned False). This means it likely already existed, or an error occurred within the function.")
+                        status_of_pending_add = "لم تتم الإضافة إلى الاشتراكات المعلقة (قد يكون موجودًا مسبقًا أو حدث خطأ)."
+                except asyncpg.exceptions.UniqueViolationError: # هذا لا يجب أن يحدث إذا كان ON CONFLICT يعمل
+                    logging.warning(f"UniqueViolationError (should be handled by ON CONFLICT) for TGID {telegram_id}, PENDING for {channel_name}.")
+                    status_of_pending_add = "خطأ تفرد غير متوقع (يفترض أن ON CONFLICT يعالجه)."
+                except Exception as e:
+                    logging.error(f"EXCEPTION while adding to PENDING for TGID {telegram_id}, channel {channel_name}: {e}", exc_info=True)
+                    status_of_pending_add = f"حدث خطأ أثناء محاولة إضافته إلى `pending_subscriptions`: {str(e)}."
+            
+            # نرسل الإشعار فقط إذا لم يكن المستخدم موجودًا مسبقًا في pending بحالة 'pending'
+            # أو إذا تمت إضافته حديثًا
+            should_notify_admin = not (existing_pending_sub and existing_pending_sub['status'] == 'pending') or (status_of_pending_add == "تمت إضافته حديثًا إلى قائمة الاشتراكات المعلقة للمراجعة.")
 
+            if should_notify_admin:
+                admin_message = (
+                    f"👤 مراجعة مستخدم:\n"
+                    f"الاسم: {full_name} (TG ID: `{telegram_id}`, DB ID: `{user_db_id}`)\n"
+                    f"القناة: {channel_name} (`{managed_channel_id}`)\n"
+                    f"الاشتراك الحالي: {'غير نشط' if current_channel_subscription else 'غير موجود'}\n"
+                    f"الحالة بخصوص الإضافة للمعلقة: {status_of_pending_add}"
+                )
+                if admin_telegram_id:
+                    try:
+                        await bot.send_message(admin_telegram_id, admin_message, parse_mode="Markdown") # استخدام `bot` العام
+                    except Exception as e_admin_msg:
+                        logging.error(f"Failed to send admin notification for user {telegram_id}: {e_admin_msg}")
+                else:
+                    logging.warning("ADMIN_ID not set. Cannot send admin notification.")
+        
+        elif member_status_obj:
+            logging.info(f"User TGID {telegram_id} status in channel {channel_name} is '{member_status_obj.status}'. Skipping pending logic.")
+        else:
+            logging.warning(f"No member status could be determined for user TGID {telegram_id} in channel {channel_name} ({managed_channel_id}). Skipping.")
     return added_to_pending_count > 0
 
-# معالج أمر /start
-# يجب تمرير الاعتماديات (bot, db_pool, web_app_url, admin_telegram_id) عند تسجيل هذا المعالج
+
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     user = message.from_user
@@ -223,8 +276,13 @@ async def start_command(message: types.Message):
     full_name = user.full_name or "مستخدم تيليجرام"
     username_clean = username_raw.lower().replace('@', '').strip() if username_raw else ""
 
+    # bot_instance = bot # لم نعد بحاجة لهذا، سنستخدم `bot` مباشرة
+    db_pool = current_app.db_pool # انتبه: هذا يعتمد على أن current_app.db_pool معرف بشكل صحيح في سياق Quart.
+                                  # إذا كان هذا الكود يعمل خارج سياق طلب Quart، ستحتاج لطريقة أخرى لتمرير db_pool.
+    # admin_id_for_notifications = ADMIN_ID # يمكن استخدام ADMIN_ID مباشرة
+    app_url_for_button = WEB_APP_URL
 
-    async with current_app.db_pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         async with conn.transaction():
             await add_user(conn, telegram_id, username=username_raw, full_name=full_name)
             user_db_id = await get_user_db_id_by_telegram_id(conn, telegram_id)
@@ -235,30 +293,32 @@ async def start_command(message: types.Message):
                 return
 
             managed_channels = await get_active_subscription_types(conn)
-            # if not managed_channels: # لا داعي للقلق هنا، سيتعامل الكود أدناه مع القائمة الفارغة
-            #     logging.warning("No active subscription types (managed channels) found in the database.")
-
             legacy_already_fully_migrated = await check_if_legacy_migration_done(conn, user_db_id)
-            # processed_legacy_this_time = False # لم نعد بحاجة لتتبع هذا لإرسال رسالة للمستخدم
 
             if username_clean and not legacy_already_fully_migrated:
                 logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}, User: {username_clean}) - Attempting legacy migration.")
-                processed_this_time = await handle_legacy_user(conn, telegram_id, user_db_id, username_clean) # أزلت bot من الوسائط
+                processed_this_time = await handle_legacy_user(conn, telegram_id, user_db_id, username_clean)
                 if processed_this_time:
-                    # user_message_parts.append("✅ تم تحديث بيانات اشتراكك السابق بنجاح!") # تم الإزالة
-                    logging.info(f"Legacy migration successful for user {user_db_id}.") # سجل داخلي فقط
-                    legacy_already_fully_migrated = True # مهم للمنطق التالي
+                    logging.info(f"Legacy migration successful for user {user_db_id}.")
+                    legacy_already_fully_migrated = True
 
             member_statuses = {}
-            is_member_any_managed_channel = False
-            if managed_channels: # فقط إذا كانت هناك قنوات مُدارة
+            is_member_any_managed_channel_actively = False
+            
+            non_active_member_statuses_for_start = [
+                ChatMemberStatus.LEFT,
+                ChatMemberStatus.KICKED,
+                ChatMemberStatus.RESTRICTED
+            ]
+
+            if managed_channels:
                 for channel_info in managed_channels:
                     try:
-                        member_status = await bot.get_chat_member(chat_id=channel_info['channel_id'], user_id=telegram_id)
+                        member_status = await bot.get_chat_member(chat_id=channel_info['channel_id'], user_id=telegram_id) # استخدام `bot` العام
                         member_statuses[channel_info['channel_id']] = member_status
-                        if member_status.status not in ["left", "kicked", "restricted", "banned"]:
-                            is_member_any_managed_channel = True
-                    except TelegramAPIError as e:
+                        if member_status.status not in non_active_member_statuses_for_start:
+                            is_member_any_managed_channel_actively = True
+                    except TelegramAPIError as e: # يجب استيراد TelegramAPIError
                         if "user not found" in e.message.lower() or "chat not found" in e.message.lower() or "bot is not a member" in e.message.lower():
                             logging.warning(f"Could not get chat member status for user {telegram_id} in channel {channel_info['channel_id']}: {e.message}")
                         else:
@@ -267,64 +327,47 @@ async def start_command(message: types.Message):
                     except Exception as e_gen:
                         logging.error(f"Generic error getting chat member for user {telegram_id} in channel {channel_info['channel_id']}: {e_gen}", exc_info=True)
                         member_statuses[channel_info['channel_id']] = None
-
-            active_subs_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM subscriptions WHERE user_id = $1 AND is_active = TRUE AND expiry_date > NOW()",
-                user_db_id
-            )
-
-            if is_member_any_managed_channel and not legacy_already_fully_migrated and active_subs_count == 0:
+            
+            if is_member_any_managed_channel_actively and not legacy_already_fully_migrated:
                 any_legacy_record_exists_for_username = False
                 if username_clean:
                     any_legacy_record_exists_for_username = await conn.fetchval(
                         "SELECT 1 FROM legacy_subscriptions WHERE username = $1 LIMIT 1", username_clean
                     )
+                
                 if not any_legacy_record_exists_for_username:
-                    logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}) is member, no active subs, no legacy. Handling as 'telegram_list'.")
-                    await handle_telegram_list_user( # لم نعد نهتم بالقيمة المرجعة هنا للرسالة
-                        conn,   telegram_id, user_db_id, full_name, member_statuses
+                    logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}) is an active member. No legacy record. Checking channels via handle_telegram_list_user.")
+                    await handle_telegram_list_user(
+                        conn, telegram_id, user_db_id, full_name, member_statuses,
+                        # bot_instance=bot, # لم نعد نمرره
+                        admin_tg_id=ADMIN_ID 
                     )
-                    # if handled_as_telegram_list: # تم الإزالة
-                        # user_message_parts.append("ℹ️ تم التعرف على عضويتك في إحدى قنواتنا. سيقوم المسؤول بمراجعة حالة اشتراكك قريبًا.")
                 else:
-                    logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}) is member, no active subs, but a legacy record (possibly processed) exists for username '{username_clean}'. Skipping 'telegram_list'.")
+                    logging.info(f"UserDBID {user_db_id} (TGID: {telegram_id}) is member, but a legacy record exists. Skipping 'telegram_list'.")
 
-            # لا حاجة لهذا الجزء إذا كانت الرسالة ثابتة
-            # if not user_message_parts:
-            #     if active_subs_count > 0 and not processed_legacy_this_time:
-            #          user_message_parts.append("✨ أهلاً بعودتك! اشتراكاتك الحالية نشطة.")
+    bot_user_info = await bot.get_me() # جلب معلومات البوت
+    bot_display_name = bot_user_info.username if bot_user_info and bot_user_info.username else "Exaado"
 
-    # --- نهاية منطق قاعدة البيانات والمعاملة ---
-
-    # بناء الرسالة النهائية - تم التبسيط
-    # final_welcome_message_intro = "\n".join(user_message_parts) # تم الإزالة
-    # if final_welcome_message_intro: # تم الإزالة
-    #     final_welcome_message_intro += "\n\n---\n\n" # تم الإزالة
-
-    # رسالة ترحيب ثابتة
     welcome_text = (
-        # f"{final_welcome_message_intro}" # تم الإزالة
-        f"👋 مرحبًا {full_name}!\n\n" # استخدم full_name الذي تم تعيين قيمة افتراضية له
-        f"مرحبًا بك في **@Exaado**  \n"
+        f"👋 مرحبًا {full_name}!\n\n"
+        f"مرحبًا بك في **@{bot_display_name}**\n"
         "هنا يمكنك إدارة اشتراكاتك في قنواتنا بسهولة.\n\n"
         "نتمنى لك تجربة رائعة! 🚀"
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔹 فتح التطبيق 🔹",
-                              web_app=WebAppInfo(url=WEB_APP_URL))],
+                              web_app=WebAppInfo(url=app_url_for_button))],
     ])
     await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
+
 
 
 # إضافة معالج لطلبات الانضمام
 @dp.chat_join_request()
 async def handle_join_request(join_request: ChatJoinRequest):
-    """
-    معالجة طلبات الانضمام للقنوات الرئيسية والفرعية والتحقق من الاشتراكات.
-    """
     user_id = join_request.from_user.id
-    requested_chat_id = join_request.chat.id  # القناة التي يحاول المستخدم الانضمام إليها
+    requested_chat_id = join_request.chat.id
     username = join_request.from_user.username or "لا يوجد اسم مستخدم"
     full_name = join_request.from_user.full_name or "لا يوجد اسم كامل"
 
@@ -333,8 +376,6 @@ async def handle_join_request(join_request: ChatJoinRequest):
 
     try:
         async with current_app.db_pool.acquire() as connection:
-            # 1. تحديد نوع الاشتراك والقناة الرئيسية بناءً على القناة التي يُطلب الانضمام إليها
-            #    وأيضاً الحصول على اسم القناة المنضم إليها فعلياً
             channel_data = await connection.fetchrow(
                 """
                 SELECT 
@@ -356,30 +397,41 @@ async def handle_join_request(join_request: ChatJoinRequest):
                 return
 
             main_channel_id_for_subscription_check = channel_data['main_channel_id_for_subscription']
-            # اسم القناة التي انضم إليها المستخدم فعلياً
-            actual_joined_channel_name = channel_data[
-                                             'joined_channel_name'] or join_request.chat.title or f"القناة {requested_chat_id}"
-            # اسم باقة الاشتراك (مثال: "Fx Exaado" أو "CRYPTO Exaado")
-            # subscription_package_name = channel_data['subscription_package_name']
+            actual_joined_channel_name = channel_data['joined_channel_name'] or join_request.chat.title or f"القناة {requested_chat_id}"
+            # subscription_package_name = channel_data['subscription_package_name'] # يمكنك استخدام هذا إذا احتجت إليه
 
             logging.info(
                 f"🔍 القناة المطلوبة {requested_chat_id} ({actual_joined_channel_name}) تابعة لنوع الاشتراك ID: {channel_data['subscription_type_id']}. القناة الرئيسية للتحقق من الاشتراك هي: {main_channel_id_for_subscription_check}")
 
-            # 2. البحث عن اشتراك نشط للمستخدم في القناة الرئيسية المرتبطة بهذا النوع من الاشتراك
             subscription = await get_subscription(connection, user_id, main_channel_id_for_subscription_check)
 
-            if subscription and subscription.get('is_active', False):  # استخدام .get للأمان
+            if subscription and subscription.get('is_active', False):
                 logging.info(
                     f"✅ تم العثور على اشتراك نشط للمستخدم {user_id} المرتبط بالباقة التي تشمل القناة {requested_chat_id}")
 
                 try:
+                    # محاولة رفع الحظر عن المستخدم (كإجراء احترازي) قبل الموافقة
+                    try:
+                        logging.info(f"ℹ️ محاولة رفع الحظر عن المستخدم {user_id} من القناة {requested_chat_id} كإجراء احترازي.")
+                        await bot.unban_chat_member(
+                            chat_id=requested_chat_id,
+                            user_id=user_id,
+                            only_if_banned=True  # يحاول فقط إذا كان المستخدم محظورًا بالفعل
+                        )
+                        logging.info(f"🛡️ تمت محاولة رفع الحظر (إذا كان موجودًا) عن {user_id} في {requested_chat_id}.")
+                    except Exception as unban_error:
+                        # سجل الخطأ ولكن لا توقف العملية بالضرورة
+                        logging.warning(f"⚠️ خطأ أثناء محاولة رفع الحظر عن المستخدم {user_id} من القناة {requested_chat_id}: {unban_error}. سنستمر في محاولة قبول الطلب.")
+
+                    # قبول طلب الانضمام
                     await bot.approve_chat_join_request(
-                        chat_id=requested_chat_id,  # قبول الطلب للقناة التي طلب المستخدم الانضمام إليها
+                        chat_id=requested_chat_id,
                         user_id=user_id
                     )
                     logging.info(
                         f"👍 تم قبول طلب انضمام المستخدم {user_id} إلى القناة {requested_chat_id} ({actual_joined_channel_name})")
 
+                    # إرسال رسالة ترحيبية
                     try:
                         message_text = (
                             f"🎉 تهانينا، {full_name}!\n"
@@ -389,14 +441,19 @@ async def handle_join_request(join_request: ChatJoinRequest):
                         await bot.send_message(user_id, message_text)
                         logging.info(
                             f"✉️ تم إرسال رسالة ترحيبية للمستخدم {user_id} للانضمام إلى {actual_joined_channel_name}")
-                    except Exception as e:
+                    except Exception as e_msg:
                         logging.warning(
-                            f"⚠️ لم يتم إرسال رسالة الترحيب للمستخدم {user_id} بعد قبوله في {actual_joined_channel_name}: {e}")
+                            f"⚠️ لم يتم إرسال رسالة الترحيب للمستخدم {user_id} بعد قبوله في {actual_joined_channel_name}: {e_msg}")
 
-                except Exception as e:
+                except Exception as e_approve:
                     logging.error(
-                        f"❌ خطأ أثناء قبول طلب الانضمام للمستخدم {user_id} في القناة {requested_chat_id}: {e}")
-
+                        f"❌ خطأ أثناء قبول طلب الانضمام للمستخدم {user_id} في القناة {requested_chat_id}: {e_approve}")
+                    # في حال فشل القبول بشكل حرج، حاول الرفض كإجراء احتياطي
+                    try:
+                        await bot.decline_chat_join_request(chat_id=requested_chat_id, user_id=user_id)
+                        logging.info(f"🛡️ تم رفض طلب الانضمام للمستخدم {user_id} بعد فشل محاولة القبول.")
+                    except Exception as decline_fallback_error:
+                        logging.error(f"❌ فشل رفض طلب الانضمام بعد فشل القبول: {decline_fallback_error}")
             else:
                 logging.info(
                     f"🚫 لم يتم العثور على اشتراك نشط للمستخدم {user_id} يسمح بالانضمام إلى القناة {requested_chat_id} (التحقق تم عبر القناة الرئيسية {main_channel_id_for_subscription_check})")
@@ -407,17 +464,16 @@ async def handle_join_request(join_request: ChatJoinRequest):
                     )
                     logging.info(
                         f"👎 تم رفض طلب انضمام المستخدم {user_id} للقناة {requested_chat_id} لعدم وجود اشتراك نشط.")
-                except Exception as e:
-                    logging.error(f"❌ خطأ أثناء رفض طلب الانضمام للمستخدم {user_id} في القناة {requested_chat_id}: {e}")
+                except Exception as e_decline:
+                    logging.error(f"❌ خطأ أثناء رفض طلب الانضمام للمستخدم {user_id} في القناة {requested_chat_id}: {e_decline}")
 
-    except Exception as e:
-        logging.error(f"🚨 خطأ عام أثناء معالجة طلب الانضمام للمستخدم {user_id} للقناة {requested_chat_id}: {e}")
-        # في حالة حدوث خطأ، يمكن رفض الطلب كإجراء احترازي
+    except Exception as e_general:
+        logging.error(f"🚨 خطأ عام أثناء معالجة طلب الانضمام للمستخدم {user_id} للقناة {requested_chat_id}: {e_general}")
         try:
             await bot.decline_chat_join_request(chat_id=requested_chat_id, user_id=user_id)
             logging.info(f"🛡️ تم رفض طلب الانضمام للمستخدم {user_id} كإجراء احترازي بسبب خطأ عام.")
-        except Exception as decline_error:
-            logging.error(f"❌ فشل رفض طلب الانضمام بعد حدوث خطأ عام: {decline_error}")
+        except Exception as decline_error_general:
+            logging.error(f"❌ فشل رفض طلب الانضمام بعد حدوث خطأ عام: {decline_error_general}")
 
 
 # 🔹 وظيفة معدلة لمعالجة الدفع الناجح
