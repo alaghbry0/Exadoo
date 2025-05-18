@@ -143,98 +143,98 @@ async def remove_user():
 
 # ضف هذه الدوال إلى ملف الـ admin_routes في الخادم الخلفي
 
+# في ملف admin_routes.py
 @admin_routes.route("/users", methods=["GET"])
-@role_required("admin")
-async def get_users():
+@role_required("admin") # تأكد من تفعيل هذا الديكوريتور
+async def get_users_endpoint(): # تم تغيير الاسم
     try:
-        # --- معالجة المعلمات من الطلب ---
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
+        offset = (page - 1) * page_size
         search_term = request.args.get("search", "").strip()
 
-        # معالجة الترتيب
-        ordering = request.args.get("ordering", "-id")  # افتراضيًا الأحدث حسب id
-        sort_field_map = {
-            "id": "u.id",
-            "telegram_id": "u.telegram_id",
-            "username": "u.username",
-            "full_name": "u.full_name",
-        }
+       
+        order_by_clause = "ORDER BY u.id DESC"
 
-        order_by_clause = "ORDER BY u.id DESC"  # افتراضي
-        if ordering:
-            sort_order = "DESC" if ordering.startswith("-") else "ASC"
-            field_key = ordering.lstrip("-")
-            if field_key in sort_field_map:
-                order_by_clause = f"ORDER BY {sort_field_map[field_key]} {sort_order}"
-            else:
-                logging.warning(f"Unsupported sort field: {field_key}")
+        base_query_select = """
+            SELECT u.id, u.telegram_id, u.username, u.full_name, 
+                   u.wallet_address, u.ton_wallet_address, u.wallet_app,
+                   (SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id) as subscription_count,
+                   (SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id AND s.is_active = true) as active_subscription_count
+            FROM users u
+        """
+        count_base_query_select = "SELECT COUNT(u.id) as total FROM users u"
 
-        # --- بناء الاستعلام ---
-        params = []
-        conditions = []
+        where_clauses = ["1=1"]
+        where_params = []
 
-        # فلتر البحث
         if search_term:
             search_pattern = f"%{search_term}%"
-            conditions.append(
-                f"""(u.telegram_id::TEXT ILIKE ${len(params) + 1} OR 
-                     u.full_name ILIKE ${len(params) + 1} OR 
-                     u.username ILIKE ${len(params) + 1})"""
-            )
-            params.append(search_pattern)
+            search_conditions = [
+                f"u.telegram_id::TEXT ILIKE ${len(where_params) + 1}",
+                f"u.full_name ILIKE ${len(where_params) + 1}",
+                f"u.username ILIKE ${len(where_params) + 1}"
+            ]
+            current_param_idx = len(where_params)
+            search_conditions_sql = []
+            
+            search_conditions_sql.append(f"u.telegram_id::TEXT ILIKE ${current_param_idx + 1}")
+            where_params.append(search_pattern)
+            current_param_idx += 1
+            
+            search_conditions_sql.append(f"u.full_name ILIKE ${current_param_idx + 1}")
+            where_params.append(search_pattern)
+            current_param_idx += 1
+            
+            search_conditions_sql.append(f"u.username ILIKE ${current_param_idx + 1}")
+            where_params.append(search_pattern)
+            # current_param_idx += 1 # لا حاجة للزيادة هنا
 
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
+            where_clauses.append(f"({' OR '.join(search_conditions_sql)})")
 
-        # --- استعلام العدد الإجمالي ---
-        count_query = f"""
-            SELECT COUNT(u.id) AS total_count
-            FROM users u
-            WHERE {where_clause}
-        """
+        where_sql = " AND ".join(where_clauses) if len(where_clauses) > 1 else where_clauses[0]
 
-        # --- استعلام البيانات ---
-        offset_val = (page - 1) * page_size
-        data_query_params = list(params)  # نسخة من params للـ data query
-        data_query_params.extend([page_size, offset_val])
-
-        data_query = f"""
-            SELECT u.id, u.telegram_id, u.username, u.full_name, u.wallet_address, u.ton_wallet_address, u.wallet_app,
-            (SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id) as subscription_count,
-            (SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id AND s.is_active = true) as active_subscription_count
-            FROM users u
-            WHERE {where_clause}
+        query_final_params = list(where_params)
+        query = f"""
+            {base_query_select}
+            WHERE {where_sql}
             {order_by_clause}
-            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+            LIMIT ${len(query_final_params) + 1} OFFSET ${len(query_final_params) + 2}
         """
+        query_final_params.extend([page_size, offset])
 
+        count_query = f"{count_base_query_select} WHERE {where_sql}"
+        
+        items_data = []
+        total_records = 0
+        
         async with current_app.db_pool.acquire() as conn:
-            # استعلام العدد
-            count_row = await conn.fetchrow(count_query, *params)
-            total_items = count_row['total_count'] if count_row else 0
+            rows = await conn.fetch(query, *query_final_params)
+            items_data = [dict(row) for row in rows]
 
-            # استعلام البيانات
-            items_data = []
-            if total_items > 0 and offset_val < total_items:
-                rows = await conn.fetch(data_query, *data_query_params)
-                items_data = [dict(row) for row in rows]
+            count_row = await conn.fetchrow(count_query, *where_params)
+            total_records = count_row['total'] if count_row and count_row['total'] is not None else 0
+            
+        # الإحصائية هنا هي نفسها إجمالي عدد المستخدمين المطابقين للبحث
+        users_stat_count = total_records
 
         return jsonify({
             "data": items_data,
-            "total_count": total_items,
+            "total": total_records, # تم التغيير من total_count
             "page": page,
-            "page_size": page_size
+            "page_size": page_size,
+            "users_count": users_stat_count # إحصائية بسيطة
         })
 
     except ValueError as ve:
         logging.error(f"Value error in /users: {str(ve)}", exc_info=True)
-        return jsonify({"error": "Invalid request parameters"}), 400
+        return jsonify({"error": "Invalid request parameters", "details": str(ve)}), 400
     except asyncpg.PostgresError as pe:
         logging.error(f"Database error in /users: {str(pe)}", exc_info=True)
-        return jsonify({"error": "Database operation failed"}), 500
+        return jsonify({"error": "Database operation failed", "details": str(pe)}), 500
     except Exception as e:
         logging.error(f"Unexpected error in /users: {str(e)}", exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
 @admin_routes.route("/users/<int:telegram_id>", methods=["GET"])
@@ -837,185 +837,240 @@ async def get_subscription_plan(plan_id: int):
 
 @admin_routes.route("/subscriptions", methods=["GET"])
 @role_required("admin")
-async def get_subscriptions_endpoint():  # تم تغيير الاسم لتمييزه عن دالة الواجهة الأمامية
+async def get_subscriptions_endpoint():
     try:
-        # --- Parameters from Request ---
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
+        offset = (page - 1) * page_size
         search_term = request.args.get("search", "").strip()
 
-        # الفرز (ordering من الواجهة الأمامية مثل "-id" أو "expiry_date")
-        ordering = request.args.get("ordering", "-id")  # افتراضيًا الأحدث حسب id
-        sort_field_map = {
-            "id": "s.id",
-            "telegram_id": "s.telegram_id",
-            "username": "u.username",  # يتطلب JOIN
-            "full_name": "u.full_name",  # يتطلب JOIN
-            "expiry_date": "s.expiry_date",
-            "is_active": "s.is_active",
-            "subscription_type_name": "st.name",  # يتطلب JOIN
-            "source": "s.source",
-            # أضف أي حقول فرز أخرى تدعمها
-        }
+        # الفلاتر من الواجهة الأمامية الجديدة
+        status_filter = request.args.get("status")  # "active", "inactive", "all"
+        type_filter_id_str = request.args.get("subscription_type_id") # سيكون ID أو "all"
+        source_filter = request.args.get("source") # سيكون قيمة المصدر أو "all"
+        start_date_filter = request.args.get("start_date") # لـ expiry_date (YYYY-MM-DD)
+        end_date_filter = request.args.get("end_date")   # لـ expiry_date (YYYY-MM-DD)
+        
+        # الفرز: للتوحيد مع PaymentsPage، سنقوم بالفرز الافتراضي حاليًا.
+        # إذا أردت دعم الفرز من جانب الخادم لاحقًا، ستحتاج لتمرير sortModel من DataTable.
+        order_by_clause = "ORDER BY s.id DESC" # أو s.created_at DESC إذا كان لديك ومناسبًا
 
-        order_by_clause = "ORDER BY s.id DESC"  # افتراضي
-        if ordering:
-            sort_order = "DESC" if ordering.startswith("-") else "ASC"
-            field_key = ordering.lstrip("-")
-            if field_key in sort_field_map:
-                order_by_clause = f"ORDER BY {sort_field_map[field_key]} {sort_order}"
-            else:
-                logging.warning(f"Unsupported sort field: {field_key}")
-                # يمكنك إرجاع خطأ 400 هنا أو استخدام الفرز الافتراضي
-
-        # الفلاتر
-        status_filter = request.args.get(
-            "status")  # "active", "inactive", أو "true", "false" من الواجهة الأمامية القديمة
-        type_filter = request.args.get("type")  # subscription_type_id
-        source_filter = request.args.get("source")
-        start_date_filter = request.args.get("startDate")  # YYYY-MM-DD
-        end_date_filter = request.args.get("endDate")  # YYYY-MM-DD
-
-        # --- Build Query ---
-        params = []
-        conditions = []  # قائمة بالشروط (WHERE clauses)
-
-        # Filter: Search Term
-        if search_term:
-            search_pattern = f"%{search_term}%"
-            # البحث في telegram_id كـ TEXT، وفي full_name و username من جدول users
-            # يتطلب JOIN مع users إذا لم يكن موجودًا بالفعل
-            conditions.append(
-                f"""(s.telegram_id::TEXT ILIKE ${len(params) + 1} OR 
-                     u.full_name ILIKE ${len(params) + 1} OR 
-                     u.username ILIKE ${len(params) + 1})"""
-            )
-            params.append(search_pattern)
-
-        # Filter: Status (is_active)
-        if status_filter is not None:
-            # الواجهة الأمامية ترسل "true" أو "false" كسلسلة نصية للفلتر
-            # أو قد ترسل "active" / "inactive"
-            is_active_bool = None
-            if isinstance(status_filter, str):
-                if status_filter.lower() == "true" or status_filter.lower() == "active":
-                    is_active_bool = True
-                elif status_filter.lower() == "false" or status_filter.lower() == "inactive":
-                    is_active_bool = False
-
-            if is_active_bool is not None:
-                conditions.append(f"s.is_active = ${len(params) + 1}")
-                params.append(is_active_bool)
-            else:
-                logging.warning(f"Invalid status filter value: {status_filter}")
-
-        # Filter: Subscription Type ID
-        if type_filter:
-            try:
-                conditions.append(f"s.subscription_type_id = ${len(params) + 1}")
-                params.append(int(type_filter))
-            except ValueError:
-                logging.warning(f"Invalid subscription_type_id filter: {type_filter}")
-                # يمكنك إرجاع خطأ 400 هنا
-
-        # Filter: Source
-        if source_filter:
-            conditions.append(f"s.source ILIKE ${len(params) + 1}")  # ILIKE لتكون غير حساسة لحالة الأحرف
-            params.append(f"%{source_filter}%")  # بحث جزئي إذا أردت، أو = للبحث المطابق
-
-        # Filter: Date Range (expiry_date)
-        if start_date_filter:
-            try:
-                # تأكد من أن التاريخ بالصيغة الصحيحة أو قم بتحويله
-                # dayjs في الواجهة الأمامية يرسل YYYY-MM-DD
-                conditions.append(f"s.expiry_date >= ${len(params) + 1}::date")
-                params.append(start_date_filter)
-            except ValueError:
-                logging.warning(f"Invalid startDate filter: {start_date_filter}")
-
-        if end_date_filter:
-            try:
-                # إضافة يوم واحد لجعل النطاق شاملاً لليوم المحدد
-                # أو تعديل المقارنة إلى < اليوم التالي
-                # أو استخدام ::date إذا كان expiry_date يخزن الوقت أيضًا وتريد مقارنة الأيام فقط
-                conditions.append(
-                    f"s.expiry_date <= (${len(params) + 1}::date + INTERVAL '1 day' - INTERVAL '1 second')")
-                # أو ببساطة: conditions.append(f"s.expiry_date <= ${len(params) + 1}::date") إذا كان الوقت في expiry_date دائمًا 00:00:00
-                # أو إذا كان الواجهة الأمامية ترسل نهاية اليوم
-                params.append(end_date_filter)
-            except ValueError:
-                logging.warning(f"Invalid endDate filter: {end_date_filter}")
-
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-
-        # --- Base SELECT and JOINs ---
-        # يتم تحديد الأعمدة المطلوبة هنا
-        select_columns = """
-            s.id, s.user_id, s.expiry_date, s.is_active, s.channel_id, 
-            s.subscription_type_id, s.telegram_id, s.start_date, 
-            s.updated_at, s.payment_id, s.subscription_plan_id, s.source,
-            u.full_name, u.username, 
-            st.name AS subscription_type_name,
-            sp.name AS subscription_plan_name 
-        """
-        # إذا لم تكن دائمًا بحاجة لـ sp.name، يمكنك إزالة الـ JOIN
-
-        from_clause = """
+        base_query_select = """
+            SELECT
+                s.id, s.user_id, s.expiry_date, s.is_active, s.channel_id, 
+                s.subscription_type_id, s.telegram_id, s.start_date, 
+                s.updated_at, s.payment_id, s.subscription_plan_id, s.source,
+                u.full_name, u.username, 
+                st.name AS subscription_type_name,
+                sp.name AS subscription_plan_name 
             FROM subscriptions s
-            LEFT JOIN users u ON s.telegram_id = u.telegram_id  -- أو s.user_id = u.id إذا كان هذا هو الربط الصحيح
+            LEFT JOIN users u ON s.telegram_id = u.telegram_id
             LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
             LEFT JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
         """
-
-        # --- Count Query ---
-        # استخدام نفس الـ JOINs والـ WHERE clause للاستعلام عن العدد لضمان الدقة
-        count_query = f"""
-            SELECT COUNT(s.id) AS total_count
-            {from_clause}
-            WHERE {where_clause}
+        
+        count_base_query_select = """
+            SELECT COUNT(s.id) as total
+            FROM subscriptions s
+            LEFT JOIN users u ON s.telegram_id = u.telegram_id
+            LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
+            LEFT JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
         """
+        
+        where_clauses = ["1=1"]
+        where_params = []
 
-        # --- Data Query ---
-        offset_val = (page - 1) * page_size
-        data_query_params = list(params)  # نسخة من params للـ data query
-        data_query_params.extend([page_size, offset_val])
+        # 1. فلتر الحالة (is_active)
+        if status_filter and status_filter.lower() != "all":
+            is_active_bool = status_filter.lower() == "active" # أو true إذا كانت الواجهة ترسلها
+            where_clauses.append(f"s.is_active = ${len(where_params) + 1}")
+            where_params.append(is_active_bool)
 
-        data_query = f"""
-            SELECT {select_columns}
-            {from_clause}
-            WHERE {where_clause}
+        # 2. فلتر نوع الاشتراك (subscription_type_id)
+        if type_filter_id_str and type_filter_id_str.strip().lower() != "all":
+            try:
+                type_id_val = int(type_filter_id_str)
+                where_clauses.append(f"s.subscription_type_id = ${len(where_params) + 1}")
+                where_params.append(type_id_val)
+            except ValueError:
+                logging.warning(f"Invalid subscription_type_id format: {type_filter_id_str}")
+
+        # 3. فلتر المصدر (source)
+        if source_filter and source_filter.strip().lower() != "all":
+            # إذا كان المصدر يمكن أن يكون فارغًا أو NULL في القاعدة وتريد فلترته
+            if source_filter.strip().lower() == "none" or source_filter.strip().lower() == "null":
+                 where_clauses.append(f"(s.source IS NULL OR s.source = '')")
+            else:
+                where_clauses.append(f"s.source ILIKE ${len(where_params) + 1}")
+                where_params.append(source_filter) # يمكنك إضافة % إذا أردت بحث جزئي: f"%{source_filter}%"
+
+        # 4. فلاتر تاريخ الانتهاء (expiry_date)
+        if start_date_filter and start_date_filter.strip():
+            where_clauses.append(f"s.expiry_date >= ${len(where_params) + 1}::DATE")
+            where_params.append(start_date_filter)
+
+        if end_date_filter and end_date_filter.strip():
+            where_clauses.append(f"s.expiry_date < (${len(where_params) + 1}::DATE + INTERVAL '1 day')") # غير شامل لليوم التالي
+            where_params.append(end_date_filter)
+
+        # 5. فلتر البحث (Search term)
+        if search_term:
+            search_pattern = f"%{search_term}%"
+            search_conditions = []
+            # يجب أن تبدأ معاملات البحث من حيث انتهت where_params
+            current_param_idx = len(where_params)
+
+            # البحث في telegram_id كـ TEXT
+            search_conditions.append(f"s.telegram_id::TEXT ILIKE ${current_param_idx + 1}")
+            where_params.append(search_pattern) # أضف المعامل إلى where_params
+            current_param_idx += 1
+            
+            # البحث في full_name
+            search_conditions.append(f"u.full_name ILIKE ${current_param_idx + 1}")
+            where_params.append(search_pattern)
+            current_param_idx += 1
+            
+            # البحث في username
+            search_conditions.append(f"u.username ILIKE ${current_param_idx + 1}")
+            where_params.append(search_pattern)
+            # لا حاجة لزيادة current_param_idx هنا لأنه آخر معامل بحث
+
+            where_clauses.append(f"({' OR '.join(search_conditions)})")
+
+        # --- بناء جملة WHERE النهائية ---
+        where_sql = " AND ".join(where_clauses) if len(where_clauses) > 1 else where_clauses[0] #
+        
+        # --- استعلام البيانات الرئيسي ---
+        query_final_params = list(where_params) # انسخ where_params لإنشاء query_final_params
+        query = f"""
+            {base_query_select}
+            WHERE {where_sql}
             {order_by_clause}
-            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2} 
+            LIMIT ${len(query_final_params) + 1} OFFSET ${len(query_final_params) + 2}
         """
-        # الـ placeholders لـ LIMIT و OFFSET هي بعد params الأصلية
+        query_final_params.extend([page_size, offset])
+        
+        # --- استعلام العد ---
+        # count_params يجب أن تكون مطابقة لـ where_params المستخدمة في جملة WHERE للاستعلام الرئيسي
+        count_query = f"""
+            {count_base_query_select}
+            WHERE {where_sql}
+        """
+        
+        # --- إحصائية لعدد الاشتراكات النشطة (المفلترة بنفس الفلاتر الرئيسية، ما عدا فلتر الحالة is_active نفسه) ---
+        # نبني where_clauses و where_params جديدة لهذا الإحصاء
+        stat_where_clauses = []
+        stat_where_params = []
+        param_counter_for_stat = 1
+
+        # أضف جميع الفلاتر ما عدا فلتر الحالة s.is_active
+        if type_filter_id_str and type_filter_id_str.strip().lower() != "all":
+            try:
+                stat_where_clauses.append(f"s.subscription_type_id = ${param_counter_for_stat}")
+                stat_where_params.append(int(type_filter_id_str))
+                param_counter_for_stat +=1
+            except ValueError: pass
+        
+        if source_filter and source_filter.strip().lower() != "all":
+            if source_filter.strip().lower() == "none" or source_filter.strip().lower() == "null":
+                 stat_where_clauses.append(f"(s.source IS NULL OR s.source = '')")
+            else:
+                stat_where_clauses.append(f"s.source ILIKE ${param_counter_for_stat}")
+                stat_where_params.append(source_filter)
+                param_counter_for_stat +=1
+
+        if start_date_filter and start_date_filter.strip():
+            stat_where_clauses.append(f"s.expiry_date >= ${param_counter_for_stat}::DATE")
+            stat_where_params.append(start_date_filter)
+            param_counter_for_stat +=1
+        
+        if end_date_filter and end_date_filter.strip():
+            stat_where_clauses.append(f"s.expiry_date < (${param_counter_for_stat}::DATE + INTERVAL '1 day')")
+            stat_where_params.append(end_date_filter)
+            param_counter_for_stat +=1
+
+        if search_term:
+            search_pattern_stat = f"%{search_term}%" # استخدام نفس النمط
+            stat_search_conditions = []
+            
+            stat_search_conditions.append(f"s.telegram_id::TEXT ILIKE ${param_counter_for_stat}")
+            stat_where_params.append(search_pattern_stat)
+            param_counter_for_stat += 1
+            
+            stat_search_conditions.append(f"u.full_name ILIKE ${param_counter_for_stat}")
+            stat_where_params.append(search_pattern_stat)
+            param_counter_for_stat += 1
+            
+            stat_search_conditions.append(f"u.username ILIKE ${param_counter_for_stat}")
+            stat_where_params.append(search_pattern_stat)
+            param_counter_for_stat += 1
+            stat_where_clauses.append(f"({' OR '.join(stat_search_conditions)})")
+            
+        # أضف شرط أن الاشتراك نشط دائمًا لهذا الإحصاء
+        stat_where_clauses.append(f"s.is_active = ${param_counter_for_stat}")
+        stat_where_params.append(True)
+        # param_counter_for_stat += 1 # لا داعي للزيادة هنا
+
+        active_subscriptions_stat_where_sql = " AND ".join(stat_where_clauses) if stat_where_clauses else "1=1"
+        # إذا لم يكن هناك أي فلاتر أخرى، فقط is_active = true
+        if not stat_where_clauses: # يعني فقط s.is_active = $1
+            active_subscriptions_stat_where_sql = f"s.is_active = $1" # المعامل هو True
+
+        # تأكد من أن active_subscriptions_stat_where_sql ليست فارغة إذا لم تكن هناك أي شروط أخرى غير is_active
+        if not active_subscriptions_stat_where_sql.strip() and True in stat_where_params : # فقط is_active = true
+             active_subscriptions_stat_where_sql = f"s.is_active = $1"
+
+        active_subscriptions_stat_query = f"""
+            SELECT COUNT(s.id) as active_total
+            FROM subscriptions s
+            LEFT JOIN users u ON s.telegram_id = u.telegram_id
+            LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
+            LEFT JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
+            WHERE {active_subscriptions_stat_where_sql if active_subscriptions_stat_where_sql.strip() else 's.is_active = TRUE'} 
+        """ # استخدام TRUE إذا كان where_sql فارغًا لضمان جلب جميع النشطين
+        # إذا كان stat_where_params فارغًا بسبب عدم وجود فلاتر، فإن active_subscriptions_stat_where_sql سيكون فارغًا أيضًا.
+        # في هذه الحالة، نريد عد جميع الاشتراكات النشطة.
+        # إذا كان active_subscriptions_stat_where_sql فارغًا، و stat_where_params فارغًا أيضًا، هذا يعني لا فلاتر أخرى، فقط is_active=true
+        if not active_subscriptions_stat_where_sql.strip() and not stat_where_params:
+            active_subscriptions_stat_query = active_subscriptions_stat_query.replace("WHERE  AND", "WHERE") # تنظيف بسيط
+            # لا يمكن أن يكون active_subscriptions_stat_where_sql فارغًا إذا كان stat_where_params يحتوي على True
+            # الحالة الوحيدة التي يكون فيها فارغًا هي عدم وجود أي فلاتر أخرى + لم يتم إضافة is_active = true بعد
+            # لكن الكود أعلاه يضيف is_active = true دائمًا.
+            # الأمان:
+            if not stat_where_params and "WHERE " == active_subscriptions_stat_query.strip()[-6:]: # إذا انتهى بـ WHERE وفراغ
+                 active_subscriptions_stat_query = active_subscriptions_stat_query.replace("WHERE ", "WHERE s.is_active = TRUE ")
+
+        items_data = []
+        total_records = 0
+        active_subscriptions_total_stat = 0
 
         async with current_app.db_pool.acquire() as conn:
-            # Execute count query (using original params, without limit/offset)
-            count_row = await conn.fetchrow(count_query, *params)
-            total_items_for_filter = count_row['total_count'] if count_row else 0
-
-            # Execute data query only if there's data to fetch
-            items_data = []
-            if total_items_for_filter > 0 and offset_val < total_items_for_filter:
-                rows = await conn.fetch(data_query, *data_query_params)
-                items_data = [dict(row) for row in rows]
+            rows = await conn.fetch(query, *query_final_params)
+            items_data = [dict(row) for row in rows]
+            
+            count_row = await conn.fetchrow(count_query, *where_params)
+            total_records = count_row['total'] if count_row and count_row['total'] is not None else 0
+            
+            active_stat_row = await conn.fetchrow(active_subscriptions_stat_query, *stat_where_params)
+            active_subscriptions_total_stat = active_stat_row['active_total'] if active_stat_row and active_stat_row['active_total'] is not None else 0
 
         return jsonify({
             "data": items_data,
-            "total_count": total_items_for_filter,
+            "total": total_records,
             "page": page,
-            "page_size": page_size
+            "page_size": page_size,
+            "active_subscriptions_count": active_subscriptions_total_stat
         })
 
-    except ValueError as ve:  # مثل تحويل page أو page_size إلى int
+    except ValueError as ve:
         logging.error(f"Value error in /subscriptions: {str(ve)}", exc_info=True)
-        return jsonify({"error": "Invalid request parameters"}), 400
+        return jsonify({"error": "Invalid request parameters", "details": str(ve)}), 400
     except asyncpg.PostgresError as pe:
         logging.error(f"Database error in /subscriptions: {str(pe)}", exc_info=True)
-        return jsonify({"error": "Database operation failed"}), 500
+        return jsonify({"error": "Database operation failed", "details": str(pe)}), 500
     except Exception as e:
         logging.error(f"Unexpected error in /subscriptions: {str(e)}", exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
 # واجهة API جديدة للحصول على قائمة مصادر الاشتراكات المتاحة
@@ -1078,78 +1133,117 @@ async def get_pending_subscriptions_stats():
 
 @admin_routes.route("/pending_subscriptions", methods=["GET"])
 @role_required("admin")
-async def get_all_pending_subscriptions():  # تم تغيير اسم الدالة ليعكس وظيفتها بشكل أفضل
+async def get_pending_subscriptions_endpoint(): # تم تغيير الاسم ليناسب endpoint
     try:
-        status_filter = request.args.get("status", "all").lower()
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
         search_term = request.args.get("search", "").strip()
+        
+        # الفلاتر الجديدة
+        status_filter = request.args.get("status", "all").lower() # "pending", "complete", "all"
+        # يمكنك إضافة فلاتر تاريخ لـ found_at إذا لزم الأمر
+        # start_date_filter = request.args.get("start_date")
+        # end_date_filter = request.args.get("end_date")
 
-        params = []
-        conditions = []  # نبدأ بقائمة فارغة للشروط
+        order_by_clause = "ORDER BY ps.found_at DESC"
 
-        if status_filter != "all":
-            conditions.append(f"ps.status = ${len(params) + 1}")
-            params.append(status_filter)
-
-        if search_term:
-            # البحث في ps.telegram_id مباشرة، وفي u.full_name و u.username من خلال JOIN
-            # استخدام نفس الـ placeholder والقيمة للـ ILIKE المتعددة صحيح
-            search_param_index = len(params) + 1
-            conditions.append(f"""
-                (u.full_name ILIKE ${search_param_index} OR 
-                 u.username ILIKE ${search_param_index} OR 
-                 ps.telegram_id::TEXT ILIKE ${search_param_index})
-            """)
-            params.append(f"%{search_term}%")
-
-        # إذا لم تكن هناك شروط، استخدم "1=1" لتجنب خطأ SQL
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-
-        data_query = f"""
+        base_query_select = """
             SELECT
-                ps.id, 
-                ps.user_db_id,
-                ps.telegram_id, 
-                ps.channel_id, 
-                ps.subscription_type_id,
-                ps.found_at,
-                ps.status,
+                ps.id, ps.user_db_id, ps.telegram_id, ps.channel_id, 
+                ps.subscription_type_id, ps.found_at, ps.status,
                 ps.admin_reviewed_at,
-                u.full_name,
-                u.username,
+                u.full_name, u.username,
                 st.name AS subscription_type_name
             FROM pending_subscriptions ps
-            LEFT JOIN users u ON ps.user_db_id = u.id  -- الربط بـ user_db_id لجلب full_name و username
+            LEFT JOIN users u ON ps.user_db_id = u.id
             LEFT JOIN subscription_types st ON ps.subscription_type_id = st.id
-            WHERE {where_clause}
-            ORDER BY ps.found_at DESC 
-            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
         """
-        data_params = params + [page_size, offset]
+        count_base_query_select = """
+            SELECT COUNT(ps.id) as total
+            FROM pending_subscriptions ps
+            LEFT JOIN users u ON ps.user_db_id = u.id
+            LEFT JOIN subscription_types st ON ps.subscription_type_id = st.id
+        """
+
+        where_clauses = ["1=1"]
+        where_params = []
+
+        # 1. فلتر الحالة (status)
+        if status_filter != "all":
+            where_clauses.append(f"ps.status = ${len(where_params) + 1}")
+            where_params.append(status_filter)
+        
+        # 2. فلتر البحث
+        if search_term:
+            search_pattern = f"%{search_term}%"
+            search_conditions = []
+            current_param_idx = len(where_params)
+
+            search_conditions.append(f"u.full_name ILIKE ${current_param_idx + 1}")
+            where_params.append(search_pattern)
+            current_param_idx += 1
+            
+            search_conditions.append(f"u.username ILIKE ${current_param_idx + 1}")
+            where_params.append(search_pattern)
+            current_param_idx += 1
+            
+            search_conditions.append(f"ps.telegram_id::TEXT ILIKE ${current_param_idx + 1}")
+            where_params.append(search_pattern)
+            
+            where_clauses.append(f"({' OR '.join(search_conditions)})")
+
+        where_sql = " AND ".join(where_clauses) if len(where_clauses) > 1 else where_clauses[0]
+
+        query_final_params = list(where_params)
+        query = f"""
+            {base_query_select}
+            WHERE {where_sql}
+            {order_by_clause}
+            LIMIT ${len(query_final_params) + 1} OFFSET ${len(query_final_params) + 2}
+        """
+        query_final_params.extend([page_size, offset])
 
         count_query = f"""
-            SELECT COUNT(ps.id)
-            FROM pending_subscriptions ps
-            LEFT JOIN users u ON ps.user_db_id = u.id -- نفس الـ JOIN مطلوب لتطبيق فلتر البحث بشكل صحيح
-            WHERE {where_clause}
+            {count_base_query_select}
+            WHERE {where_sql}
         """
+        
+        # إحصائية لعدد الاشتراكات المعلقة التي تطابق الفلتر الحالي (status, search)
+        # هذا هو نفس استعلام العد الرئيسي، لذا يمكن استخدام نتيجته مباشرة كإحصائية
+        # إذا أردت إحصائية مختلفة (مثلاً، إجمالي المعلقين بغض النظر عن فلتر البحث)، ستحتاج استعلامًا آخر.
+        # حاليًا، `total_records` سيكون هو نفسه `pending_count_for_current_filter`.
 
+        items_data = []
+        total_records = 0
+        
         async with current_app.db_pool.acquire() as connection:
-            rows = await connection.fetch(data_query, *data_params)
-            total_count_for_filter = await connection.fetchval(count_query, *params)
+            rows = await connection.fetch(query, *query_final_params)
+            items_data = [dict(row) for row in rows]
+
+            count_row = await connection.fetchrow(count_query, *where_params)
+            total_records = count_row['total'] if count_row and count_row['total'] is not None else 0
+            
+        # الإحصائية هنا هي نفسها `total_records` لأنها تعكس العدد المطابق للفلاتر الحالية
+        pending_count_stat = total_records 
 
         return jsonify({
-            "data": [dict(row) for row in rows],
-            "total_count": total_count_for_filter or 0,
+            "data": items_data,
+            "total": total_records,
             "page": page,
-            "page_size": page_size
+            "page_size": page_size,
+            "pending_count_for_filter": pending_count_stat 
         })
 
+    except ValueError as ve:
+        logging.error(f"Value error in /pending_subscriptions: {str(ve)}", exc_info=True)
+        return jsonify({"error": "Invalid request parameters", "details": str(ve)}), 400
+    except asyncpg.PostgresError as pe:
+        logging.error(f"Database error in /pending_subscriptions: {str(pe)}", exc_info=True)
+        return jsonify({"error": "Database operation failed", "details": str(pe)}), 500
     except Exception as e:
         logging.error("Error fetching pending subscriptions: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
 # واجهة API إضافية للتعامل مع إجراءات pending_subscriptions
@@ -1323,116 +1417,129 @@ async def handle_bulk_pending_subscriptions_action():  # تم تغيير الا�
 
 @admin_routes.route("/legacy_subscriptions", methods=["GET"])
 @role_required("admin")
-async def get_legacy_subscriptions():
+async def get_legacy_subscriptions_endpoint(): # تم تغيير الاسم
     try:
-        processed = request.args.get("processed")
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
-        search_term = request.args.get("search", "")
-        sort_field = request.args.get("sort_field", "expiry_date")
-        sort_order = request.args.get("sort_order", "desc")
+        search_term = request.args.get("search", "").strip()
 
-        stats_only = request.args.get("stats_only", "false").lower() == "true"
+        # الفلاتر الجديدة
+        processed_filter_str = request.args.get("processed") # "true", "false", "all"
+        # يمكنك إضافة فلاتر تاريخ لـ expiry_date إذا لزم الأمر
+        # start_date_filter = request.args.get("start_date")
+        # end_date_filter = request.args.get("end_date")
 
-        base_query = """
+        # الفرز: للتوحيد، نستخدم فرزًا افتراضيًا.
+        order_by_clause = "ORDER BY ls.expiry_date DESC" # أو ls.id DESC
+
+        base_query_select = """
+    SELECT
+        ls.id,
+        ls.username,
+        ls.subscription_type_id,
+        ls.start_date,
+        ls.expiry_date,
+        ls.processed,
+        st.name AS subscription_type_name
+    FROM legacy_subscriptions ls
+    LEFT JOIN subscription_types st ON ls.subscription_type_id = st.id
+"""
+        count_base_query_select = """
+            SELECT COUNT(ls.id) as total
             FROM legacy_subscriptions ls
             LEFT JOIN subscription_types st ON ls.subscription_type_id = st.id
-            WHERE 1=1
         """
 
-        # المعلمات الخاصة بشروط التصفية فقط
-        filter_params = []
-        filter_conditions = ""
+        where_clauses = ["1=1"]
+        where_params = []
 
-        if processed is not None:
-            filter_conditions += f" AND ls.processed = ${len(filter_params) + 1}"
-            filter_params.append(processed.lower() == "true")
+        # 1. فلتر المعالجة (processed)
+        if processed_filter_str and processed_filter_str.lower() != "all":
+            processed_bool = processed_filter_str.lower() == "true"
+            where_clauses.append(f"ls.processed = ${len(where_params) + 1}")
+            where_params.append(processed_bool)
 
+        # 2. فلتر البحث (search_term على username)
         if search_term:
-            # تأكد من أن لديك عمودًا مناسبًا للبحث عن الاسم الكامل، أو عدل الاستعلام
-            filter_conditions += (
-                f" AND ls.username ILIKE ${len(filter_params) + 1}"
-            )
-            filter_params.append(f"%{search_term}%")
+            search_pattern = f"%{search_term}%"
+            # البحث فقط في username لـ legacy_subscriptions كما كان في الكود الأصلي
+            # إذا أردت البحث في حقول أخرى، أضفها هنا
+            where_clauses.append(f"ls.username ILIKE ${len(where_params) + 1}")
+            where_params.append(search_pattern)
+        
+        where_sql = " AND ".join(where_clauses) if len(where_clauses) > 1 else where_clauses[0]
 
-        if stats_only:
-            stats_query = f"""
-                SELECT 
-                    COUNT(*) FILTER (WHERE ls.processed = true) AS processed_true,
-                    COUNT(*) FILTER (WHERE ls.processed = false) AS processed_false,
-                    COUNT(*) AS total
-                {base_query}
-                {filter_conditions}
-            """
-            async with current_app.db_pool.acquire() as connection:
-                # استخدم filter_params هنا لأنها لا تتضمن page_size أو offset
-                stats = await connection.fetchrow(stats_query, *filter_params)
-            return jsonify({
-                "processed": stats["processed_true"] if stats else 0,
-                "not_processed": stats["not_processed"] if stats else 0,
-                "total": stats["total"] if stats else 0
-            })
+        query_final_params = list(where_params)
+        query = f"""
+            {base_query_select}
+            WHERE {where_sql}
+            {order_by_clause}
+            LIMIT ${len(query_final_params) + 1} OFFSET ${len(query_final_params) + 2}
+        """
+        query_final_params.extend([page_size, offset])
 
         count_query = f"""
-            SELECT COUNT(*) as total_count
-            {base_query}
-            {filter_conditions}
+            {count_base_query_select}
+            WHERE {where_sql}
+        """
+        
+        # إحصائية لعدد الاشتراكات القديمة المعالجة (المفلترة بنفس فلتر البحث، ولكن دائمًا processed=true)
+        stat_where_clauses_processed = []
+        stat_where_params_processed = []
+        param_counter_stat_proc = 1
+
+        if search_term:
+            stat_where_clauses_processed.append(f"ls.username ILIKE ${param_counter_stat_proc}")
+            stat_where_params_processed.append(f"%{search_term}%")
+            param_counter_stat_proc += 1
+        
+        stat_where_clauses_processed.append(f"ls.processed = ${param_counter_stat_proc}")
+        stat_where_params_processed.append(True)
+
+        processed_stat_where_sql = " AND ".join(stat_where_clauses_processed) if stat_where_clauses_processed else "1=1"
+        # إذا لم يكن هناك بحث، فقط processed = true
+        if not search_term:
+            processed_stat_where_sql = "ls.processed = $1"
+
+        processed_legacy_stat_query = f"""
+            SELECT COUNT(ls.id) as processed_total
+            FROM legacy_subscriptions ls
+            WHERE {processed_stat_where_sql}
         """
 
-        # الآن نبني المعلمات الكاملة لـ data_query
-        data_query_params = list(filter_params)  # ابدأ بنسخة من filter_params
 
-        data_query = f"""
-            SELECT
-                ls.*,
-                st.name AS subscription_type_name
-                -- لا حاجة لإعادة حساب الإجماليات في كل صف هنا إذا كنا سنجلبها مرة واحدة
-                -- (SELECT COUNT(*) FROM legacy_subscriptions WHERE processed = true) AS total_processed,
-                -- (SELECT COUNT(*) FROM legacy_subscriptions WHERE processed = false) AS total_not_processed,
-                -- (SELECT COUNT(*) FROM legacy_subscriptions) AS total_all_subscriptions -- تم تغيير الاسم ليكون أوضح
-            {base_query}
-            {filter_conditions}
-            ORDER BY ls.{sort_field} {sort_order}
-            LIMIT ${len(data_query_params) + 1} OFFSET ${len(data_query_params) + 2}
-        """
-
-        data_query_params.append(page_size)
-        data_query_params.append(offset)
-
-        total_count_val = 0  # قيمة افتراضية
-        result = []
-
+        items_data = []
+        total_records = 0
+        processed_legacy_total_stat = 0
+        
         async with current_app.db_pool.acquire() as connection:
-            # تنفيذ استعلام العد باستخدام filter_params (التي لا تحتوي على page_size/offset)
-            count_row = await connection.fetchrow(count_query, *filter_params)
-            total_count_val = count_row["total_count"] if count_row else 0
+            rows = await connection.fetch(query, *query_final_params)
+            items_data = [dict(row) for row in rows]
 
-            # تنفيذ استعلام البيانات باستخدام data_query_params (التي تحتوي على كل شيء)
-            if total_count_val > 0:  # لا تجلب البيانات إذا لم يكن هناك شيء
-                rows = await connection.fetch(data_query, *data_query_params)
-                result = [dict(row) for row in rows]
+            count_row = await connection.fetchrow(count_query, *where_params)
+            total_records = count_row['total'] if count_row and count_row['total'] is not None else 0
+            
+            processed_stat_row = await connection.fetchrow(processed_legacy_stat_query, *stat_where_params_processed)
+            processed_legacy_total_stat = processed_stat_row['processed_total'] if processed_stat_row and processed_stat_row['processed_total'] is not None else 0
 
-        # إضافة total_count مرة واحدة إلى الاستجابة بدلاً من كل صف
-        # الواجهة الأمامية في React كانت تتوقع totalCount ك prop منفصل، وهو أفضل.
-        # إذا كنت تريد إعادته مع كل صف، يمكنك إضافته هنا:
-        # for row_dict in result:
-        #    row_dict["total_count"] = total_count_val # هذا هو العدد الإجمالي *المطابق للفلتر الحالي*
+        return jsonify({
+            "data": items_data,
+            "total": total_records,
+            "page": page,
+            "page_size": page_size,
+            "processed_legacy_count": processed_legacy_total_stat
+        })
 
-        # الواجهة الأمامية (الكود الذي قدمته لي) تتوقع أن يكون total_count في كل عنصر من legacySubscriptions
-        # إذا كان هذا هو المطلوب:
-        if result:
-            for row_data in result:
-                row_data["total_count"] = total_count_val
-
-        # ولكن عادةً ما يكون من الأفضل إرسال إجمالي عدد العناصر المطابقة مرة واحدة
-        # return jsonify({"subscriptions": result, "total_items_for_filter": total_count_val})
-        # بما أن الكود الأمامي يتوقع total_count في كل عنصر، سألتزم بذلك مؤقتًا.
-        return jsonify(result)
-
+    except ValueError as ve:
+        logging.error(f"Value error in /legacy_subscriptions: {str(ve)}", exc_info=True)
+        return jsonify({"error": "Invalid request parameters", "details": str(ve)}), 400
+    except asyncpg.PostgresError as pe:
+        logging.error(f"Database error in /legacy_subscriptions: {str(pe)}", exc_info=True)
+        return jsonify({"error": "Database operation failed", "details": str(pe)}), 500
     except Exception as e:
         logging.error("Error fetching legacy subscriptions: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 
 # واجهة API للحصول على إحصائيات legacy_subscriptions (تبقى كما هي إذا كنت تستدعيها بشكل منفصل)
@@ -1507,197 +1614,373 @@ async def get_legacy_subscription_stats():
 # =====================================
 # 2. API لجلب بيانات الدفعات مع دعم الفلاتر والتجزئة والتقارير المالية
 # =====================================
+
 @admin_routes.route("/payments", methods=["GET"])
 @role_required("admin")
 async def get_payments():
     try:
-        status = request.args.get("status")
-        user_id = request.args.get("user_id")
-        start_date = request.args.get("start_date")
-        end_date = request.args.get("end_date")
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
+        
+        # استخراج الفلاتر من الطلب
+        status_filter = request.args.get("status")
+        user_id_filter_str = request.args.get("user_id")
+        start_date_filter = request.args.get("start_date")
+        end_date_filter = request.args.get("end_date")
         search_term = request.args.get("search", "")
 
-        # الاستعلام الأساسي مع الحقول الجديدة
-        query = """
+        base_query_select = """
             SELECT 
-                p.*, 
+                p.id, p.user_id, p.subscription_plan_id, p.amount, p.created_at, 
+                p.status, p.tx_hash, p.telegram_id, p.username, p.full_name,
+                p.user_wallet_address, p.payment_method, p.payment_token,
+                p.currency, p.amount_received, p.error_message, p.expires_at,
+                p.processed_at,
                 sp.name AS plan_name,
-                st.name AS subscription_name
+                st.name AS subscription_type_name
             FROM payments p
-            JOIN subscription_plans sp ON p.subscription_plan_id = sp.id
-            JOIN subscription_types st ON sp.subscription_type_id = st.id
-            WHERE 1=1
+            LEFT JOIN subscription_plans sp ON p.subscription_plan_id = sp.id
+            LEFT JOIN subscription_types st ON sp.subscription_type_id = st.id
         """
-        params = []
+        
+        count_base_query_select = """
+            SELECT COUNT(p.id) as total
+            FROM payments p
+            LEFT JOIN subscription_plans sp ON p.subscription_plan_id = sp.id
+            LEFT JOIN subscription_types st ON sp.subscription_type_id = st.id
+        """
 
-        # تصفية الدفعات حسب الحالة المطلوبة (ناجحة أو فاشلة)
-        # في حالة البحث عن الدفعات المعلقة فقط، يمكن استخدام شرط منفصل (مثلاً: status = 'pending')
-        if status:
-            query += f" AND p.status = ${len(params) + 1}"
-            params.append(status)
+        where_clauses = ["1=1"]
+        # هذه هي المعاملات التي ستُستخدم في جملة WHERE فقط
+        # لن تحتوي على معاملات LIMIT أو OFFSET
+        where_params = [] 
+        
+        # 1. فلتر الحالة (Status)
+        if status_filter and status_filter.lower() != "all":
+            where_clauses.append(f"p.status = ${len(where_params) + 1}")
+            where_params.append(status_filter)
         else:
-            # جلب الدفعات الناجحة والفاشلة بشكل افتراضي
-            query += f" AND p.status IN ('completed', 'failed' )"
+            # إذا لم يتم تحديد فلتر حالة (أو كان 'all')
+            default_statuses = ["'completed'", "'failed'"]
+            # إذا كان هناك بحث، قم بتضمين 'pending' في نطاق البحث الافتراضي للحالة
+            if search_term:
+                default_statuses.append("'pending'")
+            where_clauses.append(f"p.status IN ({', '.join(default_statuses)})")
+            # لا توجد معاملات تُضاف هنا لـ where_params لأن الحالات مدمجة مباشرة في الاستعلام
 
-        if user_id:
-            query += f" AND p.user_id = ${len(params) + 1}"
-            params.append(user_id)
-        if start_date:
-            query += f" AND p.created_at >= ${len(params) + 1}"
-            params.append(start_date)
-        if end_date:
-            query += f" AND p.created_at <= ${len(params) + 1}"
-            params.append(end_date)
+        # 2. فلتر معرّف المستخدم (User ID)
+        if user_id_filter_str and user_id_filter_str.strip():
+            try:
+                user_id_val = int(user_id_filter_str)
+                where_clauses.append(f"p.user_id = ${len(where_params) + 1}")
+                where_params.append(user_id_val)
+            except ValueError:
+                logging.warning(f"Invalid user_id format received: {user_id_filter_str}")
+                # يمكنك اختيار إرجاع خطأ 400 أو تجاهل الفلتر
+                # return jsonify({"error": "Invalid user_id format"}), 400
+                
+        # 3. فلاتر التاريخ (Date filters)
+        if start_date_filter and start_date_filter.strip():
+            where_clauses.append(f"p.created_at >= ${len(where_params) + 1}::TIMESTAMP")
+            where_params.append(start_date_filter)
 
-        # إضافة شرط البحث باستخدام الحقول المطلوبة
+        if end_date_filter and end_date_filter.strip():
+            where_clauses.append(f"p.created_at <= ${len(where_params) + 1}::TIMESTAMP")
+            where_params.append(end_date_filter)
+
+        # 4. فلتر البحث (Search term)
+        # يجب أن يكون هذا بعد إضافة المعاملات الأخرى المحتملة إلى where_params
         if search_term:
-            query += f" AND (p.tx_hash ILIKE ${len(params) + 1} OR p.payment_token ILIKE ${len(params) + 1} OR p.username ILIKE ${len(params) + 1} OR p.telegram_id::TEXT ILIKE ${len(params) + 1})"
-            params.append(f"%{search_term}%")
+            search_pattern = f"%{search_term}%"
+            search_conditions = []
+            # المعاملات التي ستُضاف هنا هي فقط لمعايير البحث
+            
+            # يجب أن يبدأ ترقيم المعاملات من حيث انتهى where_params
+            current_param_index = len(where_params)
 
-        # ترتيب النتائج من الأحدث إلى الأقدم
-        query += f" ORDER BY p.created_at DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
-        params.append(page_size)
-        params.append(offset)
+            search_conditions.append(f"p.tx_hash ILIKE ${current_param_index + 1}")
+            where_params.append(search_pattern) # أضف المعامل إلى where_params
+            current_param_index += 1
 
+            search_conditions.append(f"p.payment_token ILIKE ${current_param_index + 1}")
+            where_params.append(search_pattern)
+            current_param_index += 1
+
+            search_conditions.append(f"p.username ILIKE ${current_param_index + 1}")
+            where_params.append(search_pattern)
+            current_param_index += 1
+            
+            # telegram_id هو BIGINT، لذا قم بتحويله إلى TEXT لـ ILIKE
+            search_conditions.append(f"p.telegram_id::TEXT ILIKE ${current_param_index + 1}")
+            where_params.append(search_pattern)
+            # current_param_index += 1 # لا حاجة لزيادته هنا لأنه آخر معامل بحث
+
+            where_clauses.append(f"({' OR '.join(search_conditions)})")
+
+        # --- بناء جملة WHERE النهائية ---
+        where_sql = " AND ".join(where_clauses)
+
+        # --- استعلام البيانات الرئيسي ---
+        # انسخ where_params لإنشاء query_final_params التي ستحتوي أيضًا على معاملات LIMIT و OFFSET
+        query_final_params = list(where_params) 
+        
+        query = f"""
+            {base_query_select}
+            WHERE {where_sql}
+            ORDER BY p.created_at DESC 
+            LIMIT ${len(query_final_params) + 1} OFFSET ${len(query_final_params) + 2}
+        """
+        query_final_params.append(page_size)
+        query_final_params.append(offset)
+
+        # --- استعلام العد ---
+        # count_params يجب أن تكون مطابقة لـ where_params المستخدمة في جملة WHERE للاستعلام الرئيسي
+        count_query = f"""
+            {count_base_query_select}
+            WHERE {where_sql}
+        """
+        
+        rows = []
+        total_records = 0
+        completed_payments_count = 0
+        
         async with current_app.db_pool.acquire() as connection:
-            rows = await connection.fetch(query, *params)
+            # تنفيذ استعلام البيانات
+            rows_result = await connection.fetch(query, *query_final_params)
+            rows = [dict(row) for row in rows_result] # تحويل السجلات إلى قواميس هنا
+            
+            # تنفيذ استعلام العدد
+            count_result_row = await connection.fetchrow(count_query, *where_params) # استخدم where_params هنا
+            if count_result_row and "total" in count_result_row:
+                total_records = count_result_row["total"]
+            
+            # إحصائية عدد المدفوعات المكتملة (هذه عالمية وليست مفلترة حاليًا)
+            # إذا أردت أن تكون مفلترة، ستحتاج لإضافة where_sql و where_params إليها أيضًا
+            completed_count_query_sql = """
+                SELECT COUNT(id) as completed_count
+                FROM payments
+                WHERE status = 'completed'
+            """
+            completed_count_result_row = await connection.fetchrow(completed_count_query_sql)
+            if completed_count_result_row and "completed_count" in completed_count_result_row:
+                completed_payments_count = completed_count_result_row["completed_count"]
 
         # التقارير المالية (مثال: إجمالي الإيرادات)
         total_revenue = 0
         if request.args.get("report") == "total_revenue":
-            rev_query = "SELECT SUM(amount) as total FROM payments WHERE 1=1"
+            # هذا الاستعلام حاليًا يستخدم فلاتر محدودة خاصة به.
+            # إذا أردت أن يتبع نفس الفلاتر الرئيسية، ستحتاج لتعديله ليشبه استعلام العد.
+            rev_query_clauses = ["1=1"]
             rev_params = []
-            if status:
-                rev_query += f" AND status = ${len(rev_params) + 1}"
-                rev_params.append(status)
-            if user_id:
-                rev_query += f" AND user_id = ${len(rev_params) + 1}"
-                rev_params.append(user_id)
-            if start_date:
-                rev_query += f" AND created_at >= ${len(rev_params) + 1}"
-                rev_params.append(start_date)
-            if end_date:
-                rev_query += f" AND created_at <= ${len(rev_params) + 1}"
-                rev_params.append(end_date)
+            if status_filter and status_filter.lower() != "all": # استخدام status_filter من بداية الدالة
+                rev_query_clauses.append(f"status = ${len(rev_params) + 1}")
+                rev_params.append(status_filter)
+            
+            # يمكنك إضافة فلاتر user_id و dates هنا بنفس الطريقة إذا كانت مطلوبة للإيرادات
+            if user_id_filter_str and user_id_filter_str.strip():
+                try:
+                    user_id_val_rev = int(user_id_filter_str)
+                    rev_query_clauses.append(f"user_id = ${len(rev_params) + 1}")
+                    rev_params.append(user_id_val_rev)
+                except ValueError:
+                    pass # تجاهل إذا كان غير صالح لهذا الاستعلام المحدد
+
+            if start_date_filter and start_date_filter.strip():
+                rev_query_clauses.append(f"created_at >= ${len(rev_params) + 1}::TIMESTAMP")
+                rev_params.append(start_date_filter)
+
+            if end_date_filter and end_date_filter.strip():
+                rev_query_clauses.append(f"created_at <= ${len(rev_params) + 1}::TIMESTAMP")
+                rev_params.append(end_date_filter)
+
+            rev_where_sql = " AND ".join(rev_query_clauses)
+            rev_query = f"SELECT SUM(amount) as total FROM payments WHERE {rev_where_sql}"
+            
             async with current_app.db_pool.acquire() as connection:
                 rev_row = await connection.fetchrow(rev_query, *rev_params)
-            total_revenue = rev_row["total"] if rev_row["total"] is not None else 0
+            if rev_row and rev_row["total"] is not None:
+                total_revenue = rev_row["total"]
+            else:
+                total_revenue = 0
+
 
         response = {
-            "data": [dict(row) for row in rows],
-            "total_revenue": total_revenue
+            "data": rows, # rows تم تحويلها إلى قواميس بالفعل
+            "total": total_records,
+            "page": page,
+            "page_size": page_size,
+            "completed_count": completed_payments_count,
+            "total_revenue": float(total_revenue) if total_revenue else 0.0 # تأكد من أن الإيرادات رقم عشري
         }
         return jsonify(response)
+
+    except ValueError as ve: # لالتقاط أخطاء تحويل page/page_size إلى int
+        logging.error(f"Invalid parameter format: {ve}", exc_info=True)
+        return jsonify({"error": "Invalid parameter format", "details": str(ve)}), 400
     except Exception as e:
         logging.error("Error fetching payments: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+        # في الإنتاج، قد لا ترغب في إرسال تفاصيل الخطأ للعميل
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
 @admin_routes.route("/incoming-transactions", methods=["GET"])
 @role_required("admin")
 async def get_incoming_transactions():
     try:
-        search_term = request.args.get("search", "").strip()
         page = int(request.args.get("page", 1))
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
-
-        base_query_from = "FROM incoming_transactions it"
         
-        where_clauses_sql_parts = []
-        query_params = [] 
+        # استخراج الفلاتر من الطلب
+        processed_filter_str = request.args.get("processed") # سيكون "true", "false", أو "all"
+        start_date_filter = request.args.get("start_date")
+        end_date_filter = request.args.get("end_date")
+        search_term = request.args.get("search", "").strip()
 
-        if search_term:
-            search_like_term = f"%{search_term}%"
-            
-            search_conditions = []
-            
-            # TX Hash
-            search_conditions.append(f"it.txhash ILIKE ${len(query_params) + 1}")
-            query_params.append(search_like_term)
-            
-            # Sender Address
-            search_conditions.append(f"it.sender_address ILIKE ${len(query_params) + 1}")
-            query_params.append(search_like_term)
-            
-            # Memo
-            search_conditions.append(f"it.memo ILIKE ${len(query_params) + 1}")
-            query_params.append(search_like_term)
-
-            # Payment Token  <--- تمت الإضافة هنا
-            search_conditions.append(f"it.payment_token ILIKE ${len(query_params) + 1}")
-            query_params.append(search_like_term)
-
-            where_clauses_sql_parts.append(f"({ ' OR '.join(search_conditions) })")
-
-        where_sql = ""
-        if where_clauses_sql_parts:
-            where_sql = "WHERE " + " AND ".join(where_clauses_sql_parts)
-
-        count_query_sql = f"SELECT COUNT(*) {base_query_from} {where_sql}"
-        
-        data_query_sql_select_part = """
+        base_query_select = """
             SELECT 
-                it.txhash,
-                it.sender_address,
-                it.amount,
-                it.payment_token,
-                it.processed,
-                it.received_at,
-                it.memo
+                it.txhash, it.sender_address, it.amount, it.payment_token, 
+                it.processed, it.received_at, it.memo, it.txhash_base64
+            FROM incoming_transactions it
         """
-        data_query_sql_ordered = f"""
-            {data_query_sql_select_part}
-            {base_query_from}
-            {where_sql}
-            ORDER BY it.received_at DESC
-        """
-
-        limit_placeholder = f"${len(query_params) + 1}"
-        offset_placeholder = f"${len(query_params) + 2}"
-        data_query_sql_final = f"{data_query_sql_ordered} LIMIT {limit_placeholder} OFFSET {offset_placeholder}"
         
-        data_query_final_params = list(query_params) 
-        data_query_final_params.append(page_size)
-        data_query_final_params.append(offset)
+        count_base_query_select = """
+            SELECT COUNT(it.txhash) as total
+            FROM incoming_transactions it
+        """
 
-        count_query_params = list(query_params)
+        where_clauses = ["1=1"]
+        where_params = [] 
+        
+        # 1. فلتر الحالة (Processed)
+        if processed_filter_str and processed_filter_str.lower() != "all":
+            try:
+                # تحويل "true" أو "false" إلى قيمة boolean
+                processed_val = processed_filter_str.lower() == "true"
+                where_clauses.append(f"it.processed = ${len(where_params) + 1}")
+                where_params.append(processed_val)
+            except ValueError:
+                logging.warning(f"Invalid processed filter value: {processed_filter_str}")
+        # إذا لم يتم تحديد فلتر (أو كان 'all')، لا نضيف شيئاً لـ where_clauses بخصوص processed
 
-        # --- DEBUGGING LOGS ---
-        logging.info(f"Search Term: '{search_term}'")
-        logging.info(f"Final Count Query SQL: {count_query_sql}")
-        logging.info(f"Final Count Query Params: {count_query_params}")
-        logging.info(f"Final Data Query SQL: {data_query_sql_final}")
-        logging.info(f"Final Data Query Params: {data_query_final_params}")
-        # --- END DEBUGGING LOGS ---
+        # 2. فلاتر التاريخ (Date filters on received_at)
+        if start_date_filter and start_date_filter.strip():
+            where_clauses.append(f"it.received_at >= ${len(where_params) + 1}::TIMESTAMP")
+            where_params.append(start_date_filter)
 
+        if end_date_filter and end_date_filter.strip():
+            where_clauses.append(f"it.received_at <= ${len(where_params) + 1}::TIMESTAMP")
+            where_params.append(end_date_filter)
+
+        # 3. فلتر البحث (Search term)
+        if search_term:
+            search_pattern = f"%{search_term}%"
+            search_conditions = []
+            current_param_index = len(where_params)
+
+            search_conditions.append(f"it.txhash ILIKE ${current_param_index + 1}")
+            where_params.append(search_pattern)
+            current_param_index += 1
+
+            search_conditions.append(f"it.sender_address ILIKE ${current_param_index + 1}")
+            where_params.append(search_pattern)
+            current_param_index += 1
+            
+            search_conditions.append(f"it.memo ILIKE ${current_param_index + 1}")
+            where_params.append(search_pattern)
+            current_param_index += 1
+
+            search_conditions.append(f"it.payment_token ILIKE ${current_param_index + 1}")
+            where_params.append(search_pattern)
+            # current_param_index += 1 # لا حاجة لزيادته هنا
+
+            where_clauses.append(f"({' OR '.join(search_conditions)})")
+
+        # --- بناء جملة WHERE النهائية ---
+        where_sql = " AND ".join(where_clauses) if len(where_clauses) > 1 else where_clauses[0]
+
+        # --- استعلام البيانات الرئيسي ---
+        query_final_params = list(where_params) 
+        query = f"""
+            {base_query_select}
+            WHERE {where_sql}
+            ORDER BY it.received_at DESC 
+            LIMIT ${len(query_final_params) + 1} OFFSET ${len(query_final_params) + 2}
+        """
+        query_final_params.append(page_size)
+        query_final_params.append(offset)
+
+        # --- استعلام العد ---
+        count_query = f"""
+            {count_base_query_select}
+            WHERE {where_sql}
+        """
+        
+        rows_data = []
+        total_records = 0
+        processed_transactions_count = 0 # لحساب عدد المعاملات المعالجة
+        
         async with current_app.db_pool.acquire() as connection:
-            total_count_record = await connection.fetchrow(count_query_sql, *count_query_params)
-            total_count = total_count_record[0] if total_count_record else 0
+            # تنفيذ استعلام البيانات
+            rows_result = await connection.fetch(query, *query_final_params)
+            rows_data = [dict(row) for row in rows_result]
+            
+            # تنفيذ استعلام العدد الكلي (المفلتر)
+            count_result_row = await connection.fetchrow(count_query, *where_params)
+            if count_result_row and "total" in count_result_row:
+                total_records = count_result_row["total"]
+            
+            # إحصائية عدد المعاملات المعالجة (يمكن أن تكون مفلترة أو غير مفلترة)
+            # لجعلها مفلترة، أضف where_sql و where_params. حاليًا هي غير مفلترة.
+            # لجعلها تتبع نفس الفلاتر (باستثناء فلتر processed نفسه إذا أردت إجمالي المعالج بغض النظر عن الفلتر الحالي):
+            processed_count_where_clauses = list(where_clauses) # ابدأ بنسخة من الفلاتر الرئيسية
+            processed_count_where_params = list(where_params)
 
-            rows = await connection.fetch(data_query_sql_final, *data_query_final_params)
+            # تأكد من أن فلتر `processed` موجود ويشير إلى `true`
+            # إذا كان الفلتر الرئيسي لـ `processed` هو 'all' أو 'false'، فسنحتاج لتجاوزه هنا
+            # أو بناء where_clauses جديدة خصيصًا لهذا العد
+            
+            # أبسط طريقة هي عد المعاملات المعالجة التي تطابق الفلاتر *الأخرى*
+            specific_processed_where_clauses = [wc for wc in where_clauses if "it.processed" not in wc]
+            specific_processed_where_params = [wp for i, wp in enumerate(where_params) if "it.processed" not in where_clauses[i+1]] # (i+1) لأن where_clauses[0] هو '1=1'
 
-        return jsonify({
-            "data": [dict(row) for row in rows],
-            "totalCount": total_count,
+            specific_processed_where_clauses.append(f"it.processed = ${len(specific_processed_where_params) + 1}")
+            specific_processed_where_params.append(True)
+            
+            processed_count_where_sql = " AND ".join(specific_processed_where_clauses) if len(specific_processed_where_clauses) > 1 else specific_processed_where_clauses[0]
+
+            processed_count_query_sql = f"""
+                SELECT COUNT(it.txhash) as processed_count
+                FROM incoming_transactions it
+                WHERE {processed_count_where_sql}
+            """
+            processed_count_result_row = await connection.fetchrow(processed_count_query_sql, *specific_processed_where_params)
+            if processed_count_result_row and "processed_count" in processed_count_result_row:
+                processed_transactions_count = processed_count_result_row["processed_count"]
+
+
+        response = {
+            "data": rows_data,
+            "total": total_records, # تم التغيير من totalCount إلى total
             "page": page,
-            "pageSize": page_size
-        })
+            "page_size": page_size, # تم التغيير من pageSize إلى page_size
+            "processed_count": processed_transactions_count, # إحصائية جديدة
+        }
+        return jsonify(response)
 
+    except ValueError as ve: 
+        logging.error(f"Invalid parameter format: {ve}", exc_info=True)
+        return jsonify({"error": "Invalid parameter format", "details": str(ve)}), 400
     except Exception as e:
         logging.error("Error fetching incoming transactions: %s", e, exc_info=True)
-        try:
-            logging.debug(f"Failed Count Query: {count_query_sql} with params: {count_query_params}")
-            logging.debug(f"Failed Data Query: {data_query_sql_final} with params: {data_query_final_params}")
-        except NameError:
-            pass
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+    
+    
 # =====================================
 # 3. API لتعديل اشتراك مستخدم
 # =====================================
 @admin_routes.route("/subscriptions/<int:subscription_id>", methods=["PUT"])
-@role_required("admin")  # ✅ استخدام @role_required("admin")
+@role_required("admin") 
 async def update_subscription(subscription_id):
     try:
         data = await request.get_json()
