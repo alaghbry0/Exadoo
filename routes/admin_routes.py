@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from quart import Blueprint, request, jsonify, abort, current_app
+from quart import Blueprint, request, jsonify, abort, current_app, send_file
 from config import DATABASE_CONFIG, SECRET_KEY
 from auth import get_current_user
 from datetime import datetime
@@ -11,6 +11,8 @@ import jwt
 import asyncpg
 import asyncio
 from utils.db_utils import remove_users_from_channel
+import io
+import pandas as pd
 
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
@@ -2415,3 +2417,184 @@ async def delete_terms_conditions(terms_id):
     except Exception as e:
         logging.error("Error deleting terms and conditions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+    
+
+AVAILABLE_EXPORT_FIELDS_MAP = {
+    "id": {"db_col": "u.id", "header": "ID"},
+    "telegram_id": {"db_col": "u.telegram_id", "header": "معرف تليجرام"},
+    "username": {"db_col": "CONCAT('@', u.username)", "header": "اسم المستخدم"},
+    "full_name": {"db_col": "u.full_name", "header": "الاسم الكامل"},
+    "wallet_address": {"db_col": "u.wallet_address", "header": "عنوان المحفظة (EVM)"},
+    "ton_wallet_address": {"db_col": "u.ton_wallet_address", "header": "عنوان محفظة TON"},
+    "wallet_app": {"db_col": "u.wallet_app", "header": "تطبيق المحفظة"},
+    "subscription_count": {
+        "db_col": "(SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id)",
+        "header": "إجمالي الاشتراكات"
+    },
+    "active_subscription_count": {
+        "db_col": "(SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id AND s.is_active = true)",
+        "header": "الاشتراكات النشطة"
+    },
+    "created_at": {"db_col": "u.created_at", "header": "تاريخ الإنشاء"},
+    # يمكنك إضافة المزيد من الحقول هنا
+    # "last_login": {"db_col": "u.last_login_at", "header": "آخر تسجيل دخول"},
+}
+
+
+@admin_routes.route("/users/export", methods=["POST"])
+@role_required("admin")
+async def export_users_endpoint():
+    try:
+        data = await request.get_json()
+        if data is None: # تحقق إذا كانت البيانات JSON فارغة أو غير صالحة
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        requested_field_keys = data.get('fields', [])  # قائمة بمفاتيح الحقول المطلوبة من الواجهة الأمامية
+        user_type_filter = data.get('user_type', 'all')  # 'all', 'active_subscribers', 'any_subscribers' (كانت 'with_subscription')
+        search_term = data.get('search', "").strip()
+
+        # تحديد الحقول التي سيتم الاستعلام عنها من قاعدة البيانات
+        # والمفاتيح التي ستستخدم كـ alias في SQL (وهي نفسها مفاتيح requested_field_keys)
+        fields_to_query_map = {} # { 'alias_key': 'db_col_expression', ... }
+
+        if not requested_field_keys: # إذا لم يتم تحديد حقول، استخدم كل الحقول المتاحة
+            for key, details in AVAILABLE_EXPORT_FIELDS_MAP.items():
+                fields_to_query_map[key] = details["db_col"]
+        else:
+            for key in requested_field_keys:
+                if key in AVAILABLE_EXPORT_FIELDS_MAP:
+                    fields_to_query_map[key] = AVAILABLE_EXPORT_FIELDS_MAP[key]["db_col"]
+                else:
+                    logging.warning(f"Requested field '{key}' not available for export and will be ignored.")
+        
+        if not fields_to_query_map:
+            return jsonify({"error": "No valid fields selected or available for export"}), 400
+
+        # بناء جملة SELECT الديناميكية
+        # استخدام الـ key كـ alias للعمود ليتم استخدامه لاحقاً في DataFrame
+        select_clauses = [f'{db_expr} AS "{alias_key}"' for alias_key, db_expr in fields_to_query_map.items()]
+        dynamic_select_sql = ", ".join(select_clauses)
+        
+        base_query_from = "FROM users u"
+        
+        # بناء شروط WHERE
+        where_clauses = ["1=1"]
+        query_params = [] # تم تغيير الاسم من where_params ليكون أوضح
+        param_idx = 1 # لترقيم متغيرات SQL ($1, $2, ...)
+
+        # فلتر نوع المستخدم
+        if user_type_filter == "active_subscribers": # استخدام نفس المفاتيح من الواجهة الأمامية
+            where_clauses.append("(SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id AND s.is_active = true) > 0")
+        elif user_type_filter == "any_subscribers": # تغيير 'with_subscription' إلى 'any_subscribers' ليكون أوضح
+            where_clauses.append("(SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id) > 0")
+        
+        # فلتر البحث
+        if search_term:
+            search_pattern = f"%{search_term}%"
+            # يتم إضافة الشروط إلى where_clauses وإضافة القيم إلى query_params
+            # التأكد من أن ترقيم الـ placeholder ($) يتزايد بشكل صحيح
+            search_conditions_parts = []
+            
+            search_conditions_parts.append(f"u.telegram_id::TEXT ILIKE ${param_idx}")
+            query_params.append(search_pattern)
+            param_idx += 1
+            
+            search_conditions_parts.append(f"u.full_name ILIKE ${param_idx}")
+            query_params.append(search_pattern)
+            param_idx += 1
+            
+            search_conditions_parts.append(f"u.username ILIKE ${param_idx}")
+            query_params.append(search_pattern)
+            param_idx += 1 # زيادة العداد بعد آخر استخدام
+
+            where_clauses.append(f"({' OR '.join(search_conditions_parts)})")
+
+        where_sql = " AND ".join(where_clauses)
+        order_by_clause = "ORDER BY u.id DESC" # أو أي ترتيب آخر تفضله
+        
+        final_query = f"SELECT {dynamic_select_sql} {base_query_from} WHERE {where_sql} {order_by_clause}"
+        logging.debug(f"Export query: {final_query} with params: {query_params}")
+
+        # جلب البيانات من قاعدة البيانات
+        async with current_app.db_pool.acquire() as conn:
+            rows = await conn.fetch(final_query, *query_params)
+            # تحويل سجلات asyncpg مباشرة إلى قائمة من القواميس
+            # المفاتيح في القواميس ستكون هي الـ alias_key التي حددناها
+            users_data_list = [dict(row) for row in rows]
+
+        if not users_data_list:
+            # يمكنك إرجاع ملف Excel فارغ مع العناوين أو رسالة خطأ
+            # هنا نرجع رسالة بأن لا يوجد بيانات
+            return jsonify({"message": "No data found matching your criteria for export."}), 404
+
+
+        # تحويل البيانات إلى DataFrame
+        df = pd.DataFrame(users_data_list)
+
+        # إعادة تسمية الأعمدة في DataFrame لتكون العناوين النهائية في ملف Excel
+        # مفاتيح df.columns ستكون هي الـ alias_key من SQL
+        excel_column_headers = {
+            alias_key: AVAILABLE_EXPORT_FIELDS_MAP[alias_key]["header"]
+            for alias_key in df.columns # الأعمدة الموجودة فعليًا في الـ DataFrame
+            if alias_key in AVAILABLE_EXPORT_FIELDS_MAP # تأكد أن الـ alias_key معرف
+        }
+        df.rename(columns=excel_column_headers, inplace=True)
+        
+        # إنشاء buffer في الذاكرة لملف Excel
+        excel_buffer = io.BytesIO()
+        
+        with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+            df.to_excel(writer, sheet_name='Users Data', index=False) # اسم الورقة
+            
+            workbook = writer.book
+            worksheet = writer.sheets['Users Data']
+            
+            # تنسيق عناوين الأعمدة (Header)
+            header_format = workbook.add_format({
+                'bold': True,
+                'text_wrap': True,
+                'valign': 'top',
+                'fg_color': '#D7E4BC', # لون أخضر فاتح مختلف قليلاً
+                'border': 1,
+                'align': 'center'
+            })
+            
+            # تطبيق التنسيق على صف العناوين
+            for col_num, value in enumerate(df.columns.values): # df.columns الآن تحتوي على العناوين النهائية
+                worksheet.write(0, col_num, value, header_format)
+            
+            # تحديد عرض الأعمدة تلقائيًا بناءً على المحتوى
+            for i, col_name_excel in enumerate(df.columns): # col_name_excel هو العنوان النهائي
+                # الحصول على اسم العمود الأصلي (alias_key) للوصول إلى بياناته في df قبل إعادة التسمية
+                # أو ببساطة استخدم df[col_name_excel] إذا كانت إعادة التسمية قد حدثت
+                # df[col_name_excel] هو العمود بالاسم الجديد (header)
+                column_data = df[col_name_excel]
+                max_len = max(
+                    column_data.astype(str).map(len).max(), # أطول قيمة في العمود
+                    len(str(col_name_excel)) # طول اسم العمود نفسه
+                )
+                adjusted_width = (max_len + 2) * 1.2 # إضافة مساحة إضافية وتعديل بسيط
+                worksheet.set_column(i, i, min(adjusted_width, 50)) # تحديد حد أقصى للعرض (مثلاً 50)
+
+        excel_buffer.seek(0) # الرجوع لبداية الـ buffer
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"users_export_{timestamp}.xlsx"
+        
+        return await send_file(
+            excel_buffer,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            attachment_filename=filename, # في Quart، اسم البارامتر هو attachment_filename
+            # cache_timeout=0 # Quart's send_file لا يأخذ cache_timeout بنفس الطريقة، يمكن تجاهله أو التعامل معه بطرق أخرى إذا لزم الأمر
+        )
+
+    except ValueError as ve: # مثل خطأ في تحويل JSON
+        logging.error(f"Value error in /users/export: {str(ve)}", exc_info=True)
+        return jsonify({"error": "Invalid request parameters", "details": str(ve)}), 400
+    except asyncpg.PostgresError as pe:
+        logging.error(f"Database error in /users/export: {str(pe)}", exc_info=True)
+        return jsonify({"error": "Database operation failed", "details": str(pe)}), 500
+    except Exception as e:
+        logging.error(f"Unexpected error in /users/export: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
