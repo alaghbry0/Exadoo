@@ -192,6 +192,7 @@ async def subscribe():
 
                 current_channel_invite_link = invite_result["invite_link"]
                 total_channels_links_generated += 1
+                auto_subscription_source = "Automatically"
 
                 if is_current_channel_main:
                     main_invite_link_generated = current_channel_invite_link
@@ -204,12 +205,19 @@ async def subscribe():
 
                     if existing_main_sub_record:
                         success_update = await update_subscription(
-                            # ensure update_subscription returns a boolean or raises error
-                            connection, telegram_id, main_channel_id, current_subscription_type_id,
-                            subscription_plan_id_from_request, calculated_new_expiry_date, calculated_start_date,
-                            True, payment_id_from_request, main_invite_link_generated
-                            # Always update main channel's invite link
+                            connection=connection,
+                            telegram_id=telegram_id,
+                            channel_id=main_channel_id,
+                            subscription_type_id=current_subscription_type_id,
+                            new_expiry_date=calculated_new_expiry_date,  # <-- الترتيب الصحيح
+                            start_date=calculated_start_date,  # <-- الترتيب الصحيح
+                            is_active=True,
+                            subscription_plan_id=subscription_plan_id_from_request,  # <-- الترتيب الصحيح
+                            payment_id=payment_id_from_request,
+                            invite_link=main_invite_link_generated,
+                            source=auto_subscription_source  # إضافة source
                         )
+
                         if not success_update:
                             logging.critical(f"❌ Failed to update main subscription record for {telegram_id}")
                             return jsonify({"error": "Failed to update main subscription record."}), 500
@@ -218,9 +226,17 @@ async def subscribe():
                             f"🔄 Main subscription renewed for user {telegram_id} in channel {current_channel_name} until {calculated_new_expiry_date}")
                     else:
                         newly_created_main_sub_id = await add_subscription(
-                            connection, telegram_id, main_channel_id, current_subscription_type_id,
-                            subscription_plan_id_from_request, calculated_start_date, calculated_new_expiry_date,
-                            True, payment_id_from_request, main_invite_link_generated,
+                            connection=connection,
+                            telegram_id=telegram_id,
+                            channel_id=main_channel_id,
+                            subscription_type_id=current_subscription_type_id,
+                            start_date=calculated_start_date,  # <-- الترتيب الصحيح
+                            expiry_date=calculated_new_expiry_date,  # <-- الترتيب الصحيح
+                            is_active=True,
+                            subscription_plan_id=subscription_plan_id_from_request,  # <-- الترتيب الصحيح
+                            payment_id=payment_id_from_request,
+                            invite_link=main_invite_link_generated,
+                            source=auto_subscription_source,  # إضافة source
                             returning_id=True
                         )
                         if not newly_created_main_sub_id:

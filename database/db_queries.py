@@ -167,43 +167,43 @@ async def add_subscription(
     telegram_id: int,
     channel_id: int,
     subscription_type_id: int,
-    subscription_plan_id: int,
     start_date: datetime,
     expiry_date: datetime,
     is_active: bool = True,
-    payment_id: str = None,
+    subscription_plan_id: int = None, # اجعلها تقبل None
+    payment_id: str = None,          # اجعلها تقبل None
     invite_link: str = None,
-    returning_id: bool = False # <-- أضف المعامل هنا مع قيمة افتراضية
+    source: str = "unknown",         # إضافة source
+    returning_id: bool = False
 ):
     try:
+        # تأكد من أن جدول subscriptions يسمح بقيم NULL لـ subscription_plan_id و payment_id
         query = """
-            INSERT INTO subscriptions 
-            (telegram_id, channel_id, subscription_type_id, subscription_plan_id, 
-             start_date, expiry_date, is_active, payment_id, invite_link, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            INSERT INTO subscriptions
+            (telegram_id, channel_id, subscription_type_id, subscription_plan_id,
+             start_date, expiry_date, is_active, payment_id, invite_link, source, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
         """
         params = [
-            telegram_id, channel_id, subscription_type_id, subscription_plan_id,
-            start_date, expiry_date, is_active, payment_id, invite_link
+            telegram_id, channel_id, subscription_type_id, subscription_plan_id, # يمكن أن يكون None
+            start_date, expiry_date, is_active, payment_id, invite_link, source  # يمكن أن يكون None
         ]
 
         if returning_id:
-            query += " RETURNING id" # أضف RETURNING id إلى الاستعلام
-            # استخدم fetchval للحصول على القيمة المرجعة (الـ id)
+            query += " RETURNING id"
             new_subscription_id = await connection.fetchval(query, *params)
-            logging.info(f"✅ Subscription added with ID {new_subscription_id} for user {telegram_id} (Channel: {channel_id})")
-            return new_subscription_id # أرجع الـ ID
+            logging.info(f"✅ Subscription added with ID {new_subscription_id} for user {telegram_id} (Channel: {channel_id}, Source: {source})")
+            return new_subscription_id
         else:
             await connection.execute(query, *params)
-            logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id})")
-            return True # السلوك القديم إذا لم يتم طلب إرجاع ID
+            logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id}, Source: {source})")
+            return True
 
     except Exception as e:
         logging.error(f"❌ Error adding subscription for {telegram_id} (Channel: {channel_id}): {e}", exc_info=True)
         if returning_id:
-            return None # أرجع None في حالة الخطأ إذا كان من المفترض إرجاع ID
+            return None
         return False
-
 
 
 # 1. تعديل دالة update_subscription (إزالة التعليقات الداخلية)
@@ -212,48 +212,49 @@ async def update_subscription(
     telegram_id: int,
     channel_id: int,
     subscription_type_id: int,
-    subscription_plan_id: int,
     new_expiry_date: datetime,
     start_date: datetime,
     is_active: bool = True,
-    payment_id: str = None,
-    invite_link: str = None  # <-- إضافة invite_link
+    subscription_plan_id: int | None = None,
+    payment_id: str | None = None,
+    invite_link: str | None = None,
+    source: str | None = None
 ):
     try:
-        if payment_id or invite_link:  # ✅ تحديث إذا كان هناك invite_link أو payment_id
-            await connection.execute("""
-                UPDATE subscriptions SET
-                    subscription_type_id = $1,
-                    subscription_plan_id = $2,                
-                    expiry_date = $3,
-                    start_date = $4,
-                    is_active = $5,
-                    payment_id = $6,
-                    invite_link = $7,
-                    updated_at = NOW()
-                WHERE telegram_id = $8 AND channel_id = $9
-            """, subscription_type_id, subscription_plan_id, new_expiry_date,
-                start_date, is_active, payment_id, invite_link, telegram_id, channel_id)
-        else:  # ✅ تحديث بدون تعديل `payment_id` أو `invite_link`
-            await connection.execute("""
-                UPDATE subscriptions SET
-                    subscription_type_id = $1,
-                    subscription_plan_id = $2,                 
-                    expiry_date = $3,
-                    start_date = $4,
-                    is_active = $5,
-                    updated_at = NOW()
-                WHERE telegram_id = $6 AND channel_id = $7
-            """, subscription_type_id, new_expiry_date, start_date,
-                is_active, telegram_id, channel_id)
+        # بناء جملة SET بشكل ديناميكي لتحديث source فقط إذا تم توفيره
+        set_clauses = [
+            "subscription_type_id = $1",
+            "subscription_plan_id = $2", # سيمرر None كـ NULL إذا كان subscription_plan_id هو None
+            "expiry_date = $3",
+            "start_date = $4",
+            "is_active = $5",
+            "payment_id = $6",          # سيمرر None كـ NULL إذا كان payment_id هو None
+            "invite_link = $7",
+            "updated_at = NOW()"
+        ]
+        params = [
+            subscription_type_id, subscription_plan_id, new_expiry_date,
+            start_date, is_active, payment_id, invite_link
+        ]
 
-        logging.info(f"✅ Subscription updated for {telegram_id} (Channel: {channel_id})")
+        if source: # فقط قم بتحديث source إذا تم توفيره، وإلا اتركه كما هو
+            set_clauses.append(f"source = ${len(params) + 1}")
+            params.append(source)
+
+        query = f"""
+            UPDATE subscriptions SET
+                {', '.join(set_clauses)}
+            WHERE telegram_id = ${len(params) + 1} AND channel_id = ${len(params) + 2}
+        """
+        params.extend([telegram_id, channel_id])
+
+        await connection.execute(query, *params)
+        logging.info(f"✅ Subscription updated for {telegram_id} (Channel: {channel_id})" + (f" Source: {source}" if source else ""))
         return True
 
     except Exception as e:
-        logging.error(f"❌ Error updating subscription for {telegram_id}: {e}")
+        logging.error(f"❌ Error updating subscription for {telegram_id} (Channel: {channel_id}): {e}", exc_info=True)
         return False
-
 
 
 async def get_subscription(connection, telegram_id: int, channel_id: int):
@@ -346,7 +347,6 @@ async def add_scheduled_task(connection, task_type: str, telegram_id: int, chann
             f"❌ Error adding scheduled task '{task_type}' for user {telegram_id} and channel {channel_id}: {e}")
         return False
 
-
 async def get_pending_tasks(connection, channel_id: int = None):
     """
     🔹 جلب المهام المعلقة التي يجب تنفيذها، مع التأكد من ضبط `execute_at` بتوقيت UTC.
@@ -386,6 +386,80 @@ async def get_pending_tasks(connection, channel_id: int = None):
     except Exception as e:
         logging.error(f"❌ Error retrieving pending tasks (channel_id: {channel_id}): {e}")
         return []
+
+
+# helpers.py (أو داخل نفس الملف قبل الـ endpoint)
+
+async def cancel_subscription_db(
+    connection,
+    subscription_id: int,
+    cancellation_time: datetime,
+    reason_source: str = "admin_canceled"
+) -> Optional[int]:
+    """
+    يُلغي الاشتراك المحدد عبر الـ subscription_id:
+    - يضبط is_active = FALSE
+    - يحدّث expiry_date و source و updated_at
+    - يرجع الـ id إذا نجح، أو None إن لم يكن هناك صف نشط
+    """
+    try:
+        updated_id = await connection.fetchval(
+            """
+            UPDATE subscriptions
+            SET
+                is_active    = FALSE,
+                expiry_date  = $1,
+                source       = CASE
+                                   WHEN source IS NULL THEN $2
+                                   ELSE source || '_canceled'
+                               END,
+                updated_at   = NOW()
+            WHERE id = $3
+              AND is_active = TRUE
+            RETURNING id;
+            """,
+            cancellation_time,
+            reason_source,
+            subscription_id
+        )
+        if updated_id:
+            logging.info(f"✅ cancel_subscription_db: subscription_id={updated_id} canceled.")
+        else:
+            logging.info(f"ℹ️ cancel_subscription_db: no active row for subscription_id={subscription_id}.")
+        return updated_id
+
+    except Exception as e:
+        logging.error(f"❌ cancel_subscription_db error for subscription_id={subscription_id}: {e}", exc_info=True)
+        return None
+
+
+async def delete_scheduled_tasks_for_subscription(
+        connection,
+        telegram_id: int,
+        channel_ids: list  # قائمة بـ IDs القنوات (الرئيسية والفرعية)
+):
+    """
+    Deletes 'remove_user' scheduled tasks for the given user and channel IDs.
+    """
+    if not channel_ids:
+        return True
+    try:
+        await connection.execute(
+            """
+            DELETE FROM scheduled_tasks
+            WHERE task_type = 'remove_user'
+              AND telegram_id = $1
+              AND channel_id = ANY($2::bigint[])
+            """,
+            telegram_id,
+            channel_ids
+        )
+        logging.info(f"🧹 Scheduled 'remove_user' tasks deleted for user {telegram_id} and channels {channel_ids}.")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Error deleting scheduled tasks for user {telegram_id}, channels {channel_ids}: {e}",
+                      exc_info=True)
+        return False
 
 
 async def update_task_status(connection, task_id: int, status: str):

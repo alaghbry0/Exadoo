@@ -4,16 +4,24 @@ import logging
 from quart import Blueprint, request, jsonify, abort, current_app, send_file
 from config import DATABASE_CONFIG, SECRET_KEY
 from auth import get_current_user
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import pytz
 from functools import wraps
 import jwt
 import asyncpg
 import asyncio
-from utils.db_utils import remove_users_from_channel
+from utils.notifications import create_notification
+from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user
 import io
 import pandas as pd
-
+from database.db_queries import (
+    add_user,
+    add_subscription,
+    add_scheduled_task,
+    cancel_subscription_db,
+    delete_scheduled_tasks_for_subscription
+)
+from database.db_queries import update_subscription as update_subscription_db
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
@@ -22,6 +30,37 @@ async def create_db_pool():
 
 # إنشاء Blueprint مع بادئة URL
 admin_routes = Blueprint("admin_routes", __name__, url_prefix="/api/admin")
+LOCAL_TZ = pytz.timezone(os.getenv("LOCAL_TZ", "Asia/Riyadh"))
+IS_DEVELOPMENT = os.getenv("FLASK_ENV", "production") == "development"
+
+
+# --- دالة مساعدة لحساب التواريخ (مستحسنة) ---
+async def _calculate_admin_subscription_dates(connection, telegram_id, main_channel_id, days_to_add, current_time_utc):
+    """Helper function to calculate start and expiry dates for admin actions."""
+    existing_main_channel_sub = await connection.fetchrow(
+        "SELECT id, start_date, expiry_date, is_active FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2",
+        telegram_id, main_channel_id
+    )
+
+    start_date_to_use = current_time_utc
+    base_expiry_to_extend = current_time_utc
+
+    if existing_main_channel_sub and \
+            existing_main_channel_sub['is_active'] and \
+            existing_main_channel_sub['expiry_date'] and \
+            existing_main_channel_sub['expiry_date'] >= current_time_utc:
+        start_date_to_use = existing_main_channel_sub['start_date']
+        base_expiry_to_extend = existing_main_channel_sub['expiry_date']
+    elif existing_main_channel_sub and existing_main_channel_sub['expiry_date'] and existing_main_channel_sub[
+        'expiry_date'] < current_time_utc:
+        # اشتراك سابق منتهي، نبدأ من الآن
+        pass  # القيم الافتراضية صحيحة
+
+    # إضافة دقائق للتطوير (اختياري، يمكنك إزالته إذا لم يكن مطلوباً لعمليات الإدارة)
+    duration_minutes_dev = 120 if IS_DEVELOPMENT else 0
+    new_expiry_date = base_expiry_to_extend + timedelta(days=days_to_add, minutes=duration_minutes_dev)
+
+    return start_date_to_use, new_expiry_date
 
 
 def role_required(required_role):
@@ -2039,94 +2078,350 @@ async def update_subscription(subscription_id):
 # =====================================
 # 4. API لإضافة اشتراك جديد
 # =====================================
-@admin_routes.route("/subscriptions", methods=["POST"])
+@admin_routes.route("/subscriptions", methods=["POST"])  # استخدام المسار الأصلي الذي لديك
 @role_required("admin")
-async def add_subscription():
+async def add_subscription_admin():  # تم تغيير اسم الدالة لتمييزها
     try:
         data = await request.get_json()
-        # استلام البيانات الأساسية من الـ Modal
-        telegram_id = data.get("telegram_id")
-        expiry_date = data.get("expiry_date")
-        subscription_type_id = data.get("subscription_type_id")
-        full_name = data.get("full_name")
-        username = data.get("username")
+        telegram_id_str = data.get("telegram_id")
+        days_to_add_str = data.get("days_to_add")
+        subscription_type_id_str = data.get("subscription_type_id")
 
-        # التحقق من وجود الحقول الأساسية
-        if not all([telegram_id, subscription_type_id, expiry_date]):
-            return jsonify({"error": "Missing required fields: telegram_id, subscription_type_id, expiry_date"}), 400
+        full_name = data.get("full_name")  # اسم المستخدم (اختياري، للتسجيل الأولي)
+        username = data.get("username")  # اسم مستخدم تيليجرام (اختياري، للتسجيل الأولي)
 
-        # تحويل telegram_id إلى رقم (int)
+        if not all([telegram_id_str, subscription_type_id_str, days_to_add_str]):
+            return jsonify({"error": "Missing required fields: telegram_id, subscription_type_id, days_to_add"}), 400
+
         try:
-            telegram_id = int(telegram_id)
+            telegram_id = int(telegram_id_str)
+            days_to_add = int(days_to_add_str)
+            subscription_type_id = int(subscription_type_id_str)
+            if days_to_add <= 0:
+                return jsonify({"error": "days_to_add must be a positive integer"}), 400
         except ValueError:
-            return jsonify({"error": "Invalid telegram_id format"}), 400
+            return jsonify({"error": "Invalid data type for telegram_id, subscription_type_id, or days_to_add"}), 400
 
-        from datetime import datetime
-        import pytz
-        local_tz = pytz.timezone("Asia/Riyadh")
-        # تحويل expiry_date إلى datetime timezone-aware باستخدام local_tz
-        dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(local_tz)
+        db_pool = getattr(current_app, "db_pool", None)
+        if not db_pool:
+            logging.critical("❌ Database connection is missing!")
+            return jsonify({"error": "Internal Server Error"}), 500
 
-        async with current_app.db_pool.acquire() as connection:
-            # استنتاج channel_id من subscription_type_id
-            channel_row = await connection.fetchrow(
-                "SELECT channel_id FROM subscription_types WHERE id = $1",
+        async with db_pool.acquire() as connection:
+            # 1. تأكد من وجود المستخدم أو قم بإنشائه/تحديثه
+            await add_user(connection, telegram_id, username=username, full_name=full_name)
+
+            user_info_for_greeting = await connection.fetchrow(
+                "SELECT username, full_name FROM users WHERE telegram_id = $1", telegram_id)
+            actual_full_name = full_name or (
+                user_info_for_greeting.get('full_name') if user_info_for_greeting else None)
+            actual_username = username or (user_info_for_greeting.get('username') if user_info_for_greeting else None)
+            greeting_name = actual_full_name or actual_username or str(telegram_id)
+
+            # 2. احصل على معلومات نوع الاشتراك (اسم النوع، القناة الرئيسية)
+            subscription_type_info = await connection.fetchrow(
+                "SELECT name, channel_id AS main_channel_id FROM subscription_types WHERE id = $1",
                 subscription_type_id
             )
-            if not channel_row:
+            if not subscription_type_info:
                 return jsonify({"error": "Invalid subscription_type_id"}), 400
-            channel_id = channel_row["channel_id"]
 
-            # التعامل مع user_id: البحث عن المستخدم باستخدام telegram_id
-            user_row = await connection.fetchrow(
-                "SELECT id FROM users WHERE telegram_id = $1",
-                telegram_id
+            main_channel_id = int(subscription_type_info["main_channel_id"])
+            subscription_type_name = subscription_type_info["name"]
+
+            if not main_channel_id:
+                logging.error(f"ADMIN: No main_channel_id for subscription_type_id: {subscription_type_id}")
+                return jsonify({"error": "Subscription type is not configured with a main channel."}), 400
+
+            # 3. حساب تواريخ الاشتراك
+            current_time_utc = datetime.now(timezone.utc)
+            calculated_start_date, calculated_new_expiry_date = await _calculate_admin_subscription_dates(
+                connection, telegram_id, main_channel_id, days_to_add, current_time_utc
             )
-            if user_row:
-                user_id = user_row["id"]
-            else:
-                # إنشاء سجل مستخدم جديد إذا لم يكن موجوداً
-                user_insert = await connection.fetchrow(
-                    "INSERT INTO users (telegram_id, username, full_name) VALUES ($1, $2, $3) RETURNING id",
-                    telegram_id, username, full_name
+
+            # 4. إنشاء رابط دعوة للقناة الرئيسية
+            main_invite_result = await generate_channel_invite_link(telegram_id, main_channel_id,
+                                                                    subscription_type_name)
+            if not main_invite_result["success"]:
+                logging.error(
+                    f"ADMIN: Failed to generate invite link for main channel {main_channel_id}: {main_invite_result.get('error')}")
+                return jsonify(
+                    {"error": f"Failed to generate main invite link: {main_invite_result.get('error')}"}), 500
+            main_invite_link = main_invite_result["invite_link"]
+
+            # 5. تحديد مصدر العملية
+            admin_action_source = "admin_manual"
+
+            # 6. إضافة أو تحديث الاشتراك في جدول 'subscriptions' للقناة الرئيسية
+            # `subscription_plan_id` و `payment_id` سيتم تمريرهما كـ None
+            existing_main_subscription = await connection.fetchrow(
+                "SELECT id FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2",
+                telegram_id, main_channel_id
+            )
+
+            action_type_for_history = ""
+            main_subscription_record_id = None
+
+            if existing_main_subscription:
+                success_update = await update_subscription_db(
+                    connection, telegram_id, main_channel_id, subscription_type_id,
+                    calculated_new_expiry_date, calculated_start_date, True,  # is_active
+                    None,  # subscription_plan_id
+                    None,  # payment_id
+                    main_invite_link,
+                    admin_action_source
                 )
-                user_id = user_insert["id"]
+                if not success_update:
+                    logging.critical(
+                        f"ADMIN: Failed to update subscription for {telegram_id} in channel {main_channel_id}")
+                    return jsonify({"error": "Failed to update main subscription record."}), 500
+                main_subscription_record_id = existing_main_subscription['id']
+                action_type_for_history = 'ADMIN_RENEWAL'
+            else:
+                newly_created_main_sub_id = await add_subscription(
+                    connection, telegram_id, main_channel_id, subscription_type_id,
+                    calculated_start_date, calculated_new_expiry_date, True,  # is_active
+                    None,  # subscription_plan_id
+                    None,  # payment_id
+                    main_invite_link,
+                    admin_action_source,
+                    returning_id=True
+                )
+                if not newly_created_main_sub_id:
+                    logging.critical(
+                        f"ADMIN: Failed to create subscription for {telegram_id} in channel {main_channel_id}")
+                    return jsonify({"error": "Failed to create main subscription record."}), 500
+                main_subscription_record_id = newly_created_main_sub_id
+                action_type_for_history = 'ADMIN_NEW'
 
-            # تعيين subscription_plan_id افتراضيًا إذا لم يُرسل
-            subscription_plan_id = data.get("subscription_plan_id") or 1
+            logging.info(
+                f"ADMIN: Main subscription {action_type_for_history} for user {telegram_id}, channel {main_channel_id}, expiry {calculated_new_expiry_date}")
 
-            # ضبط is_active بناءً على expiry_date
-            is_active = dt_expiry > datetime.now(local_tz)
-
-            # تعيين source افتراضيًا
-            source = data.get("source") or "manual"
-
-            # payment_id يبقى None إذا لم يُرسل
-            payment_id = data.get("payment_id")
-
-            query = """
-                INSERT INTO subscriptions 
-                (user_id, expiry_date, is_active, channel_id, subscription_type_id, telegram_id, subscription_plan_id, payment_id, source)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                RETURNING *;
-            """
-            row = await connection.fetchrow(
-                query,
-                user_id,
-                dt_expiry,
-                is_active,
-                channel_id,
-                subscription_type_id,
-                telegram_id,
-                subscription_plan_id,
-                payment_id,
-                source
+            # 7. معالجة القنوات الفرعية (كما في الكود الذي قدمته)
+            secondary_channel_links_to_send = []
+            all_channels_for_type = await connection.fetch(
+                "SELECT channel_id, channel_name, is_main FROM subscription_type_channels WHERE subscription_type_id = $1 ORDER BY is_main DESC, channel_name",
+                subscription_type_id
             )
-        return jsonify(dict(row)), 201
-    except Exception as e:
-        logging.error("Error adding subscription: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
 
+            for channel_data in all_channels_for_type:
+                current_channel_id_being_processed = int(channel_data["channel_id"])
+                current_channel_name = channel_data["channel_name"] or f"Channel {current_channel_id_being_processed}"
+                is_current_channel_main = channel_data["is_main"]
+
+                if not is_current_channel_main:
+                    invite_res = await generate_channel_invite_link(telegram_id, current_channel_id_being_processed,
+                                                                    current_channel_name)
+                    if invite_res["success"]:
+                        secondary_channel_links_to_send.append(
+                            f"▫️ قناة <a href='{invite_res['invite_link']}'>{current_channel_name}</a>"
+                        )
+                        # لا يوجد اشتراك منفصل للقنوات الفرعية في جدول subscriptions
+                        # فقط جدولة مهمة الإزالة
+                        await add_scheduled_task(
+                            connection, "remove_user", telegram_id,
+                            current_channel_id_being_processed, calculated_new_expiry_date,  # clean_up=True (الافتراضي)
+                        )
+                        logging.info(
+                            f"ADMIN: Scheduled 'remove_user' for SECONDARY channel {current_channel_name} (ID: {current_channel_id_being_processed}) at {calculated_new_expiry_date.astimezone(LOCAL_TZ)}")
+                    else:
+                        logging.warning(
+                            f"ADMIN: Failed to generate invite for secondary channel {current_channel_name} for user {telegram_id}. Skipping.")
+
+            # 8. تسجيل في `subscription_history`
+            # اسم الخطة سيكون عامًا لأننا لا نستخدم subscription_plan_id
+            admin_subscription_plan_name = "اشتراك إداري"  # أو "Admin Subscription"
+
+            extra_data_for_history = json.dumps({
+                "full_name": actual_full_name,
+                "username": actual_username,
+                "added_by_admin": True,
+                "days_added": days_to_add,
+                "source": admin_action_source,
+                "total_channels_in_bundle": len(all_channels_for_type),
+                "secondary_links_generated_count": len(secondary_channel_links_to_send)
+            })
+
+            history_query = """
+                INSERT INTO subscription_history (
+                    subscription_id, invite_link, action_type, subscription_type_name, subscription_plan_name,
+                    renewal_date, expiry_date, telegram_id, extra_data, payment_id, source
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id
+            """
+            history_record = await connection.fetchrow(
+                history_query, main_subscription_record_id, main_invite_link,
+                action_type_for_history, subscription_type_name, admin_subscription_plan_name,
+                calculated_start_date, calculated_new_expiry_date, telegram_id,
+                extra_data_for_history,
+                None,  # payment_id is None
+                admin_action_source
+            )
+            subscription_history_id = history_record["id"] if history_record else None
+            if subscription_history_id:
+                logging.info(f"ADMIN: Action logged in subscription_history ID: {subscription_history_id}")
+            else:
+                logging.error(f"ADMIN: Failed to log action in subscription_history for user {telegram_id}")
+
+            # 9. إنشاء وإرسال إشعار للمستخدم
+            final_expiry_date_local = calculated_new_expiry_date.astimezone(LOCAL_TZ)
+            notification_title_key = 'تجديد' if action_type_for_history == 'ADMIN_RENEWAL' else 'تفعيل'
+            notification_title = f"{notification_title_key} اشتراك (إدارة): {subscription_type_name}"
+
+            num_accessible_channels = 1 + len(secondary_channel_links_to_send)  # القناة الرئيسية + الفرعية
+
+            notification_message_text = (
+                f"🎉 مرحبًا {greeting_name},\n\n"
+                f"تم {notification_title_key.lower()} اشتراكك في \"{subscription_type_name}\" بواسطة الإدارة.\n"
+                f"صالح حتى: {final_expiry_date_local.strftime('%Y-%m-%d %H:%M %Z')}.\n"
+                f"🔗 للانضمام للقناة الرئيسية: {main_invite_link}\n"
+                f"يمكنك الآن الوصول إلى {num_accessible_channels} قناة."
+            )
+
+            extra_notification_data = {
+                "subscription_type": subscription_type_name,
+                "subscription_history_id": subscription_history_id,
+                "expiry_date_iso": calculated_new_expiry_date.isoformat(),
+                "start_date_iso": calculated_start_date.isoformat(),
+                "main_invite_link": main_invite_link,
+                "secondary_links_sent_count": len(secondary_channel_links_to_send),
+                "admin_initiated": True,
+                "source": admin_action_source
+            }
+
+            await create_notification(
+                connection=connection, notification_type="admin_subscription_update", title=notification_title,
+                message=notification_message_text, extra_data=extra_notification_data,
+                is_public=False, telegram_ids=[telegram_id]
+            )
+
+            # إرسال رسالة منفصلة بروابط القنوات الفرعية إذا وجدت
+            if secondary_channel_links_to_send:
+                secondary_links_message_text = (
+                        f"📬 بالإضافة إلى القناة الرئيسية، يمكنك الانضمام إلى القنوات الفرعية التالية لاشتراك \"{subscription_type_name}\":\n\n" +
+                        "\n".join(secondary_channel_links_to_send) +
+                        "\n\n💡 هذه الروابط خاصة بك وصالحة لفترة محدودة. يرجى الانضمام في أقرب وقت."
+                )
+                await send_message_to_user(telegram_id, secondary_links_message_text)
+
+            # 10. إرجاع استجابة ناجحة للأدمن
+            formatted_response_message_html = (
+                f"✅ تم {notification_title_key.lower()} اشتراك \"{subscription_type_name}\" بنجاح للمستخدم {telegram_id} (<code>{greeting_name}</code>).<br>"
+                f"ينتهي في: {final_expiry_date_local.strftime('%Y-%m-%d %H:%M:%S %Z')}.<br>"
+
+            )
+            if secondary_channel_links_to_send:
+                formatted_response_message_html += "<br>📬 تم إرسال روابط القنوات الفرعية إلى المستخدم."
+            else:
+                formatted_response_message_html += "<br>ℹ️ لا توجد قنوات فرعية مرتبطة بهذا النوع من الاشتراك."
+
+            response_data = {
+                "message": f"Subscription for user {telegram_id} in '{subscription_type_name}' has been {action_type_for_history.lower().replace('_admin', '').replace('_', ' ')}.",
+                "telegram_id": telegram_id,
+                "subscription_type_name": subscription_type_name,
+                "new_expiry_date_formatted": final_expiry_date_local.strftime('%Y-%m-%d %H:%M:%S %Z'),
+                "start_date_formatted": calculated_start_date.astimezone(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z'),
+                "main_invite_link": main_invite_link,
+                "action_taken": action_type_for_history,
+                "formatted_message_html": formatted_response_message_html,
+                "secondary_channels_processed": len(secondary_channel_links_to_send)
+            }
+
+            return jsonify(response_data), 200  # 200 OK لأن العملية قد تكون تحديثاً أو إنشاء
+
+    except Exception as e:
+        logging.error(f"ADMIN: Critical error in /subscriptions (admin) endpoint: {str(e)}", exc_info=True)
+        error_message = str(e) if IS_DEVELOPMENT else "Internal server error"
+        return jsonify({"error": error_message}), 500
+
+
+@admin_routes.route("/subscriptions/cancel", methods=["POST"])
+@role_required("admin")
+async def cancel_subscription_admin():
+    try:
+        data = await request.get_json(force=True)
+        telegram_id = int(data.get("telegram_id", 0))
+        subscription_type_id = int(data.get("subscription_type_id", 0))
+        if not telegram_id or not subscription_type_id:
+            return jsonify({"error": "telegram_id and subscription_type_id are required"}), 400
+
+        db_pool = current_app.db_pool
+        async with db_pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. اعثر على الاشتراك النشط الأقل انتهاءً
+                active = await conn.fetchrow(
+                    """
+                    SELECT id, channel_id, start_date, expiry_date, source
+                    FROM subscriptions
+                    WHERE telegram_id = $1
+                      AND subscription_type_id = $2
+                      AND is_active = TRUE
+                    ORDER BY expiry_date ASC NULLS LAST, id ASC
+                    LIMIT 1
+                    """,
+                    telegram_id, subscription_type_id
+                )
+                if not active:
+                    return jsonify({
+                        "message": f"No active subscription found for user {telegram_id} in type {subscription_type_id}"
+                    }), 404
+
+                sub_id = active["id"]
+                main_channel = int(active["channel_id"])
+                orig_start = active["start_date"]
+                orig_expiry = active["expiry_date"]
+                orig_source = active["source"] or ""
+
+                # 2. إزالة المستخدم من القنوات
+                channels = [main_channel]
+                rows = await conn.fetch(
+                    "SELECT channel_id FROM subscription_type_channels WHERE subscription_type_id = $1",
+                    subscription_type_id
+                )
+                channels += [int(r["channel_id"]) for r in rows if int(r["channel_id"]) != main_channel]
+                for ch in channels:
+                    await remove_users_from_channel(telegram_id, ch)
+
+                # 3. إلغاء الاشتراك في الـ DB باستخدام subscription_id فقط
+                cancel_time = datetime.now(timezone.utc)
+                reason = f"{orig_source}_admin_canceled" if orig_source else "admin_canceled"
+                upd_id = await cancel_subscription_db(conn, sub_id, cancel_time, reason)
+
+                if not upd_id:
+                    return jsonify({
+                        "error": "Failed to cancel subscription in DB; it may already be inactive."
+                    }), 500
+
+                # 4. حذف المهام المجدولة
+                await delete_scheduled_tasks_for_subscription(conn, telegram_id, channels)
+
+                # 5. تسجيل الـ history
+                await conn.execute(
+                    """
+                    INSERT INTO subscription_history (
+                        subscription_id, action_type, subscription_type_name,
+                        subscription_plan_name, renewal_date, expiry_date,
+                        telegram_id, extra_data
+                    ) VALUES ($1, 'ADMIN_CANCEL', 
+                              (SELECT name FROM subscription_types WHERE id = $2),
+                              'إلغاء إداري', $3, $4, $5, $6)
+                    """,
+                    sub_id, subscription_type_id, orig_start, cancel_time, telegram_id,
+                    json.dumps({
+                        "channels_removed": channels,
+                        "source": reason,
+                    })
+                )
+
+                return jsonify({
+                    "message": f"Subscription {sub_id} canceled successfully.",
+                    "subscription_id": sub_id,
+                    "telegram_id": telegram_id,
+                    "channels": channels
+                }), 200
+
+    except Exception as e:
+        logging.error(f"ADMIN CANCEL: unexpected error: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @admin_routes.route("/subscriptions/export", methods=["GET"])
 @role_required("admin")
