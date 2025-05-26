@@ -1,270 +1,375 @@
+# seed_data.py
+import asyncpg
+import asyncio
+import logging  # لاستخدام logging بدلاً من print للأخطاء
 import os
 from dotenv import load_dotenv # تأكد من تثبيت python-dotenv: pip install python-dotenv
-load_dotenv() # تحميل المتغيرات من .env أولاً
-
-import asyncio
-import asyncpg
-import aiohttp
-import json
-from decimal import Decimal
-import logging
-
-# --- إعدادات التسجيل ---
+load_dotenv()
+# إعدادات تسجيل بسيطة
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- إعدادات البرنامج ---
-try:
-    # إذا كنت تفضل DATABASE_URI من config.py ولديك هذا الملف
-    from config import DATABASE_URI
-    logging.info("Loaded DATABASE_URI from config.py")
-except ImportError:
-    logging.info("config.py not found or DATABASE_URI not in config.py. Trying DATABASE_URI_FALLBACK from environment.")
-    DATABASE_URI = os.getenv("DATABASE_URI_FALLBACK")
+# --- تفاصيل الاتصال بقاعدة البيانات ---
+# !!! قم بتعديل هذه القيم لتناسب بيئتك المحلية !!!
+DB_CONFIG = {
+    'user': os.getenv('DB_USER', 'neondb_owner'),
+    'password': os.getenv('DB_PASSWORD', 'npg_hqkR5UfFX'),
+    'database': os.getenv('DB_NAME', 'neondb'),
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': int(os.getenv('DB_PORT', 5432)),
+    'ssl': 'require'
+}
 
-# الآن قم بتحميل المتغيرات الأخرى من البيئة (التي قد تكون تم تعيينها عبر .env)
-SUBSCRIBE_API_URL = os.getenv("SUBSCRIBE_API_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+# --- بيانات الأدوار ---
+ROLES_DATA = [
+    ('owner', 'مالك النظام - صلاحيات كاملة'),
+    ('super_admin', 'مدير عام - صلاحيات واسعة'),
+    ('admin', 'مدير - صلاحيات محدودة'),
+    ('marketer', 'مسوق - صلاحيات التسويق'),
+    ('support', 'دعم فني - صلاحيات الدعم'),
+    ('viewer', 'مشاهد - صلاحيات القراءة فقط')
+]
 
-# طباعة للتحقق (للتصحيح)
-logging.debug(f"Loaded DATABASE_URI = {DATABASE_URI}")
-logging.debug(f"Loaded SUBSCRIBE_API_URL = {SUBSCRIBE_API_URL}")
-logging.debug(f"Loaded WEBHOOK_SECRET = {WEBHOOK_SECRET}")
+# --- بيانات الصلاحيات ---
+PERMISSIONS_DATA = [
+    # ============== إدارة مستخدمي لوحة التحكم (Panel Users) ==============
+    ('panel_users.create', 'إنشاء مستخدمين جدد للوحة التحكم', 'panel_users'),
+    ('panel_users.read', 'عرض قائمة مستخدمي لوحة التحكم', 'panel_users'),
+    ('panel_users.delete', 'حذف مستخدمي لوحة التحكم', 'panel_users'),
+    ('panel_users.manage_roles', 'إدارة أدوار مستخدمي لوحة التحكم', 'panel_users'),
+
+    # ============== إدارة مستخدمي البوت (Bot Users/Subscribers) ==============
+    ('bot_users.read', 'عرض قائمة مستخدمي البوت (المشتركين)', 'bot_users'),
+    ('bot_users.read_details', 'عرض تفاصيل مستخدم بوت معين (اشتراكات، مدفوعات)', 'bot_users'),
+    ('bot_users.export', 'تصدير بيانات مستخدمي البوت', 'bot_users'),
+
+    # ============== إدارة أنواع الاشتراكات (Subscription Types) ==============
+    ('subscription_types.create', 'إنشاء أنواع اشتراكات جديدة', 'subscription_types'),
+    ('subscription_types.read', 'عرض قائمة أنواع الاشتراكات', 'subscription_types'),
+    ('subscription_types.update', 'تعديل أنواع الاشتراكات', 'subscription_types'),
+    ('subscription_types.delete', 'حذف أنواع الاشتراكات', 'subscription_types'),
+
+    # ============== إدارة خطط الاشتراك (Subscription Plans) ==============
+    ('subscription_plans.create', 'إنشاء خطط اشتراك جديدة', 'subscription_plans'),
+    ('subscription_plans.read', 'عرض قائمة خطط الاشتراك', 'subscription_plans'),
+    ('subscription_plans.update', 'تعديل خطط الاشتراك', 'subscription_plans'),
+    ('subscription_plans.delete', 'حذف خطط الاشتراك', 'subscription_plans'),
+
+    # ============== إدارة اشتراكات المستخدمين (User Subscriptions) ==============
+    ('user_subscriptions.create_manual', 'إضافة اشتراك جديد يدويًا للمستخدمين', 'user_subscriptions'),
+    ('user_subscriptions.read', 'عرض قائمة اشتراكات المستخدمين', 'user_subscriptions'),
+    ('user_subscriptions.update', 'تعديل اشتراكات المستخدمين (تاريخ، خطة، مصدر)', 'user_subscriptions'),
+    ('user_subscriptions.cancel', 'إلغاء اشتراكات المستخدمين', 'user_subscriptions'),
+    ('user_subscriptions.read_sources', 'عرض مصادر الاشتراكات المتاحة', 'user_subscriptions'),
+
+    # ============== إدارة الاشتراكات المعلقة (Pending Subscriptions) ==============
+    ('pending_subscriptions.read', 'عرض قائمة الأعضاء غير المشتركين في القنوات', 'pending_subscriptions'),
+    ('pending_subscriptions.stats', 'عرض إحصائيات الأعضاء غير المشتركين', 'pending_subscriptions'),
+    ('pending_subscriptions.remove_single', 'إزالة عضو غير مشترك واحد من القنوات', 'pending_subscriptions'),
+    ('pending_subscriptions.remove_bulk', 'إزالة جماعية للأعضاء غير المشتركين من القنوات', 'pending_subscriptions'),
+
+    # ============== إدارة الاشتراكات القديمة (Legacy Subscriptions) ==============
+    ('legacy_subscriptions.read', 'عرض قائمة الاشتراكات القديمة', 'legacy_subscriptions'),
+    ('legacy_subscriptions.stats', 'عرض إحصائيات الاشتراكات القديمة', 'legacy_subscriptions'),
+
+    # ============== إدارة المدفوعات والتحويلات (Payments & Transactions) ==============
+    ('payments.read_all', 'عرض جميع سجلات المدفوعات', 'payments'),
+    ('payments.read_incoming_transactions', 'عرض التحويلات المالية الواردة للمحفظة', 'payments'),
+    ('payments.reports', 'عرض تقارير المدفوعات المالية', 'payments'),
+
+    # ============== إعدادات النظام والتكوين (System Configuration) ==============
+    ('system.manage_wallet', 'إدارة عنوان المحفظة و API Key', 'system_config'),
+    ('system.manage_reminder_settings', 'إدارة إعدادات رسائل التذكير', 'system_config'),
+    ('system.view_settings', 'عرض إعدادات النظام العامة (غير حساسة)', 'system_config'),
+    ('system.backup', 'إدارة النسخ الاحتياطية للنظام', 'system_config'),
+    ('system.view_logs', 'عرض سجلات النظام (logs)', 'system_config'),
+    ('system.view_audit_log', 'عرض سجل تدقيق العمليات', 'system_config'),
+
+    # ============== إدارة الأدوار والصلاحيات (RBAC Management) ==============
+    ('roles.create', 'إنشاء أدوار جديدة', 'rbac'),
+    ('roles.read', 'عرض الأدوار الموجودة', 'rbac'),
+    ('roles.update', 'تعديل الأدوار وصلاحياتها', 'rbac'),
+    ('roles.delete', 'حذف الأدوار', 'rbac'),
+    ('permissions.manage', 'إدارة الصلاحيات المتاحة في النظام (للمطورين)', 'rbac'),
+
+    # ============== لوحة التحكم الرئيسية والإحصائيات (Dashboard) ==============
+    ('dashboard.view_stats', 'عرض إحصائيات لوحة التحكم الرئيسية', 'dashboard'),
+    ('dashboard.view_revenue_chart', 'عرض الرسم البياني للإيرادات', 'dashboard'),
+    ('dashboard.view_subscriptions_chart', 'عرض الرسم البياني للاشتراكات', 'dashboard'),
+    ('dashboard.view_recent_activities', 'عرض أحدث الأنشطة', 'dashboard'),
+    ('dashboard.view_recent_payments', 'عرض أحدث المدفوعات', 'dashboard')
+]
+
+# --- تعيينات الصلاحيات للأدوار (اسم الدور: [قائمة بأسماء الصلاحيات]) ---
+ROLE_PERMISSION_MAPPINGS = {
+    'owner': ['ALL'],  # كلمة مفتاحية خاصة لجميع الصلاحيات
+    'super_admin': [
+        p[0] for p in PERMISSIONS_DATA if p[0] not in [
+            'permissions.manage',  # لا يدير الصلاحيات المتاحة
+            'roles.delete'  # قد لا يحذف الأدوار إلا إذا كان المالك
+        ]
+    ],
+    'admin': [
+        'bot_users.read', 'bot_users.read_details',
+        'subscription_types.read',
+        'subscription_plans.read',
+        'user_subscriptions.read', 'user_subscriptions.update', 'user_subscriptions.create_manual',
+        'user_subscriptions.cancel', 'user_subscriptions.read_sources',
+        'pending_subscriptions.read', 'pending_subscriptions.stats', 'pending_subscriptions.remove_single',
+        'pending_subscriptions.remove_bulk',
+        'legacy_subscriptions.read', 'legacy_subscriptions.stats',
+        'payments.read_all', 'payments.read_incoming_transactions',
+        'system.view_settings', 'system.view_audit_log',
+        'dashboard.view_stats', 'dashboard.view_revenue_chart', 'dashboard.view_subscriptions_chart',
+        'dashboard.view_recent_activities', 'dashboard.view_recent_payments'
+        # ملاحظة: تم تعديل صلاحيات dashboard.view_recent_payments لتكون ضمن صلاحيات admin
+    ],
+    'marketer': [
+        'bot_users.read', 'bot_users.export',
+        'subscription_types.read', 'subscription_plans.read',
+        'user_subscriptions.read', 'user_subscriptions.read_sources',
+        'legacy_subscriptions.read', 'legacy_subscriptions.stats',
+        'payments.reports',
+        'pending_subscriptions.stats',
+        'dashboard.view_stats', 'dashboard.view_revenue_chart', 'dashboard.view_subscriptions_chart'
+    ],
+    'support': [
+        'bot_users.read', 'bot_users.read_details',
+        'subscription_types.read', 'subscription_plans.read',
+        'user_subscriptions.read', 'user_subscriptions.update', 'user_subscriptions.create_manual',
+        'user_subscriptions.cancel', 'user_subscriptions.read_sources',
+        'pending_subscriptions.read', 'pending_subscriptions.remove_single',
+        'legacy_subscriptions.read',
+        'payments.read_all',
+        'system.view_audit_log'
+    ],
+    'viewer': [
+        'bot_users.read',
+        'subscription_types.read', 'subscription_plans.read',
+        'user_subscriptions.read', 'user_subscriptions.read_sources',
+        'legacy_subscriptions.read', 'legacy_subscriptions.stats',
+        'payments.reports',
+        'pending_subscriptions.stats',
+        'dashboard.view_stats', 'dashboard.view_revenue_chart', 'dashboard.view_subscriptions_chart',
+        'dashboard.view_recent_activities', 'dashboard.view_recent_payments',
+        'system.view_audit_log'
+    ]
+}
+
+# --- قائمة المستخدمين الذين يجب أن يكونوا owner ---
+OWNER_EMAILS = [
+    'Mmahdy502@gmail.com',
+    'mmahdy502@gmail.com',
+    'mohammedalaghbry3@gmail.com'
+    # يمكنك إضافة المزيد هنا إذا لزم الأمر
+]
 
 
-if not all([DATABASE_URI, SUBSCRIBE_API_URL, WEBHOOK_SECRET]):
-    missing_vars = []
-    if not DATABASE_URI: missing_vars.append("DATABASE_URI (from config.py or DATABASE_URI_FALLBACK env var)")
-    if not SUBSCRIBE_API_URL: missing_vars.append("SUBSCRIBE_API_URL env var")
-    if not WEBHOOK_SECRET: missing_vars.append("WEBHOOK_SECRET env var")
-    logging.critical(f"❌ متغيرات بيئة مطلوبة غير موجودة: {', '.join(missing_vars)}. يرجى تعيينها.")
-    exit(1)
-
-
-
-async def process_missed_overpayments():
-    conn = None
-    processed_count = 0
-    failed_count = 0
-    skipped_count = 0
-    # قائمة لتخزين تفاصيل النجاح والفشل
-    successful_renewals = []
-    failed_renewals = []
-
+async def seed_roles(conn):
+    logging.info("Seeding roles...")
     try:
-        conn = await asyncpg.connect(DATABASE_URI)
-        logging.info("✅ متصل بقاعدة البيانات.")
+        # استخدام ON CONFLICT لتجنب الأخطاء إذا كانت الأدوار موجودة بالفعل
+        await conn.executemany(
+            "INSERT INTO roles (name, description) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING",
+            ROLES_DATA
+        )
+        logging.info(f"{len(ROLES_DATA)} roles processed.")
+    except Exception as e:
+        logging.error(f"Error seeding roles: {e}", exc_info=True)
 
-        # --- الخطوة 1: تحديد الدفعات المتأثرة ---
-        # استخدام الاستعلام الذي قدمته والذي يعمل يدويًا
-        query_affected_payments = """
-        SELECT
-            p.id AS payment_db_id,
-            p.telegram_id,
-            p.username,
-            p.full_name,
-            p.subscription_plan_id,
-            sp.name AS plan_name,
-            sp.price AS plan_price,
-            p.amount_received,
-            p.amount AS original_expected_amount,
-            (p.amount_received - sp.price) AS overpayment_amount,
-            p.status,
-            p.tx_hash,
-            p.payment_token,
-            p.created_at,
-            p.processed_at,
-            p.error_message
-        FROM
-            payments p
-        JOIN
-            subscription_plans sp ON p.subscription_plan_id = sp.id
-        WHERE
-            p.status = 'completed'
-            AND p.tx_hash IS NOT NULL
-            AND p.amount_received IS NOT NULL
-            AND p.amount_received > sp.price
-        ORDER BY
-            p.created_at ASC; -- معالجة الأقدم أولاً لتكون أكثر عدلاً إذا كان هناك حدود
-        """
-        # ملاحظة: إذا كان الاستعلام اليدوي الذي يعمل لك يتضمن ORDER BY p.created_at DESC
-        # فقم بتغييره هنا أيضًا ليتطابق. ASC يعني الأقدم أولاً.
 
-        logging.info("🚀 تنفيذ استعلام جلب الدفعات المتأثرة...")
-        affected_payments = await conn.fetch(query_affected_payments)
-        logging.info(f"🔍 تم العثور على {len(affected_payments)} دفعة زائدة محتملة لمعالجتها بناءً على الاستعلام.")
+async def seed_permissions(conn):
+    logging.info("Seeding permissions...")
+    try:
+        # استخدام ON CONFLICT لتجنب الأخطاء إذا كانت الصلاحيات موجودة بالفعل
+        await conn.executemany(
+            "INSERT INTO permissions (name, description, category) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING",
+            PERMISSIONS_DATA
+        )
+        logging.info(f"{len(PERMISSIONS_DATA)} permissions processed.")
+    except Exception as e:
+        logging.error(f"Error seeding permissions: {e}", exc_info=True)
 
-        if not affected_payments:
-            logging.info("🏁 لا توجد دفعات لمعالجتها بناءً على المعايير الحالية.")
-            return
 
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bearer {WEBHOOK_SECRET}",
-                "Content-Type": "application/json"
-            }
+async def seed_role_permissions(conn):
+    logging.info("Seeding role_permissions...")
+    try:
+        for role_name, perm_names in ROLE_PERMISSION_MAPPINGS.items():
+            role_record = await conn.fetchrow("SELECT id FROM roles WHERE name = $1", role_name)
+            if not role_record:
+                logging.warning(f"Role '{role_name}' not found. Skipping its permissions.")
+                continue
 
-            for payment in affected_payments:
-                logging.info(
-                    f"\n🔄 بدء معالجة الدفعة: DB_ID={payment['payment_db_id']}, Username='{payment['username']}', tx_hash={payment['tx_hash']}")
+            role_id = role_record['id']
 
-                # التحقق من البيانات الأساسية قبل المتابعة
-                required_fields = ['tx_hash', 'telegram_id', 'subscription_plan_id', 'payment_token']
-                missing_fields = [field for field in required_fields if not payment[field]]
-
-                if missing_fields:
-                    logging.warning(
-                        f"⚠️ تخطي الدفعة (DB ID: {payment['payment_db_id']}) بسبب نقص البيانات: {', '.join(missing_fields)}.")
-                    skipped_count += 1
-                    failed_renewals.append({
-                        "payment_db_id": payment['payment_db_id'],
-                        "username": payment['username'],
-                        "tx_hash": payment['tx_hash'],
-                        "reason": f"Missing data: {', '.join(missing_fields)}"
-                    })
+            if perm_names == ['ALL']:  # حالة خاصة للمالك
+                # جلب جميع IDs الصلاحيات
+                all_permission_ids = await conn.fetch("SELECT id FROM permissions")
+                permissions_to_assign = [(role_id, p_id['id']) for p_id in all_permission_ids]
+            else:
+                # جلب IDs الصلاحيات المحددة
+                # بناء استعلام IN بشكل آمن
+                if not perm_names:  # إذا كانت قائمة الصلاحيات فارغة للدور
+                    logging.info(f"No permissions specified for role '{role_name}'. Skipping.")
                     continue
 
-                payload = {
-                    "telegram_id": int(payment['telegram_id']),
-                    "subscription_plan_id": int(payment['subscription_plan_id']),
-                    "payment_id": str(payment['tx_hash']),
-                    "payment_token": str(payment['payment_token']),
-                    "username": str(payment['username']) if payment['username'] else None,
-                    "full_name": str(payment['full_name']) if payment['full_name'] else None,
-                }
+                # تحويل أسماء الصلاحيات إلى IDs
+                # بناء قائمة من $1, $2, ...
+                placeholders = ', '.join([f'${i + 1}' for i in range(len(perm_names))])
+                query = f"SELECT id FROM permissions WHERE name IN ({placeholders})"
+                specific_permission_ids_records = await conn.fetch(query, *perm_names)
 
-                logging.info(f"📞 استدعاء API الاشتراك بالبيانات: {json.dumps(payload, indent=2)}")
+                permissions_to_assign = [(role_id, p_id['id']) for p_id in specific_permission_ids_records]
 
-                try:
-                    async with session.post(SUBSCRIBE_API_URL, json=payload, headers=headers, timeout=30) as response:
-                        response_status = response.status
-                        response_text = await response.text()
+            if permissions_to_assign:
+                await conn.executemany(
+                    "INSERT INTO role_permissions (role_id, permission_id) VALUES ($1, $2) ON CONFLICT (role_id, permission_id) DO NOTHING",
+                    permissions_to_assign
+                )
+                logging.info(f"Assigned {len(permissions_to_assign)} permissions to role '{role_name}'.")
+            else:
+                logging.info(
+                    f"No new permissions to assign to role '{role_name}' (either already exist or none specified/found).")
 
-                        if response_status == 200:
-                            logging.info(
-                                f"✅ نجح استدعاء API الاشتراك لـ tx_hash: {payment['tx_hash']}. الحالة: {response_status}. الاستجابة (أول 200 حرف): {response_text[:200]}...")
-                            processed_count += 1
-                            successful_renewals.append({
-                                "payment_db_id": payment['payment_db_id'],
-                                "username": payment['username'],
-                                "tx_hash": payment['tx_hash'],
-                                "api_response_status": response_status
-                            })
-
-                            # تحديث سجل الدفع في قاعدة البيانات
-                            # يمكنك تعديل error_message لتكون أكثر وضوحًا
-                            update_message = f"Manually processed via script on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - API OK."
-                            await conn.execute(
-                                "UPDATE payments SET processed_at = NOW(), error_message = $2 WHERE id = $1",
-                                payment['payment_db_id'], update_message
-                            )
-                            logging.info(
-                                f"   تم تحديث سجل الدفع (DB ID: {payment['payment_db_id']}) بالرسالة: {update_message}")
-
-                        else:
-                            logging.error(
-                                f"❌ فشل استدعاء API الاشتراك لـ tx_hash: {payment['tx_hash']}. الحالة: {response_status}, التفاصيل: {response_text}")
-                            failed_count += 1
-                            failed_renewals.append({
-                                "payment_db_id": payment['payment_db_id'],
-                                "username": payment['username'],
-                                "tx_hash": payment['tx_hash'],
-                                "reason": f"API call failed with status {response_status}",
-                                "api_response_status": response_status,
-                                "api_response_text": response_text
-                            })
-                            await conn.execute(
-                                "UPDATE payments SET error_message = $2 WHERE id = $1",
-                                payment['payment_db_id'],
-                                f"Manual script API call failed: {response_status} - {response_text[:500]}"
-                            )
-                            logging.warning(f"   تم تحديث error_message لسجل الدفع (DB ID: {payment['payment_db_id']})")
-
-                except aiohttp.ClientError as e:
-                    logging.exception(
-                        f"❌ خطأ في الاتصال (ClientError) بـ API الاشتراك لـ tx_hash: {payment['tx_hash']}. الخطأ: {str(e)}")
-                    failed_count += 1
-                    failed_renewals.append({
-                        "payment_db_id": payment['payment_db_id'],
-                        "username": payment['username'],
-                        "tx_hash": payment['tx_hash'],
-                        "reason": f"aiohttp.ClientError: {str(e)}",
-                    })
-                    await conn.execute(
-                        "UPDATE payments SET error_message = $2 WHERE id = $1",
-                        payment['payment_db_id'],
-                        f"Manual script API connection error: {str(e)[:500]}"
-                    )
-                except asyncio.TimeoutError:
-                    logging.exception(
-                        f"❌ انتهت مهلة الاتصال (TimeoutError) بـ API الاشتراك لـ tx_hash: {payment['tx_hash']}.")
-                    failed_count += 1
-                    failed_renewals.append({
-                        "payment_db_id": payment['payment_db_id'],
-                        "username": payment['username'],
-                        "tx_hash": payment['tx_hash'],
-                        "reason": "asyncio.TimeoutError",
-                    })
-                    await conn.execute(
-                        "UPDATE payments SET error_message = $2 WHERE id = $1",
-                        payment['payment_db_id'],
-                        "Manual script API timeout error"
-                    )
-                except Exception as e:
-                    logging.exception(
-                        f"❌ خطأ عام غير متوقع أثناء معالجة tx_hash: {payment['tx_hash']}. الخطأ: {str(e)}")  # .exception يطبع تتبع الخطأ
-                    failed_count += 1
-                    failed_renewals.append({
-                        "payment_db_id": payment['payment_db_id'],
-                        "username": payment['username'],
-                        "tx_hash": payment['tx_hash'],
-                        "reason": f"Unexpected error: {str(e)}",
-                        "error_type": type(e).__name__
-                    })
-                    await conn.execute(
-                        "UPDATE payments SET error_message = $2 WHERE id = $1",
-                        payment['payment_db_id'],
-                        f"Manual script unexpected error: {str(e)[:500]}"
-                    )
-
-                await asyncio.sleep(0.5)  # انتظار بسيط بين الطلبات لتجنب إغراق الـ API
-
-    except asyncpg.PostgresError as e:
-        logging.exception(f"❌ خطأ في قاعدة البيانات أثناء الاتصال أو الاستعلام الأولي: {e}")
     except Exception as e:
-        logging.exception(f"❌ خطأ عام في السكربت قبل بدء حلقة المعالجة: {e}")
+        logging.error(f"Error seeding role_permissions: {e}", exc_info=True)
+
+
+async def update_panel_users_roles(conn):
+    logging.info("Updating panel_users roles...")
+    try:
+        # 1. إضافة عمود role_id إذا لم يكن موجودًا (مع التحقق)
+        # هذا الجزء يفترض أنك قد تقوم بتشغيل السكربت على قاعدة بيانات لم يتم تعديلها بعد
+        # أو أنه آمن لإعادة التشغيل.
+
+        # التحقق من وجود عمود role_id
+        role_id_column_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'panel_users' 
+                AND column_name = 'role_id'
+            );
+        """)
+
+        if not role_id_column_exists:
+            logging.info("Column 'role_id' not found in 'panel_users'. Adding it.")
+            await conn.execute("ALTER TABLE panel_users ADD COLUMN role_id INTEGER")
+            await conn.execute("""
+                ALTER TABLE panel_users ADD CONSTRAINT fk_user_role 
+                FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE SET NULL
+            """)
+            logging.info("Column 'role_id' and foreign key constraint added.")
+        else:
+            logging.info("Column 'role_id' already exists in 'panel_users'.")
+
+        # 2. جلب IDs الأدوار 'owner' و 'admin'
+        owner_role_id_rec = await conn.fetchrow("SELECT id FROM roles WHERE name = 'owner'")
+        admin_role_id_rec = await conn.fetchrow("SELECT id FROM roles WHERE name = 'admin'")
+
+        if not owner_role_id_rec or not admin_role_id_rec:
+            logging.error("Critical: 'owner' or 'admin' role not found in 'roles' table. Cannot update panel_users.")
+            return
+
+        owner_role_id = owner_role_id_rec['id']
+        admin_role_id = admin_role_id_rec['id']
+
+        # 3. تحديث المستخدمين المحددين ليكونوا owner
+        # تحويل قائمة الإيميلات إلى حروف صغيرة للمقارنة غير الحساسة لحالة الأحرف
+        owner_emails_lower = [email.lower() for email in OWNER_EMAILS]
+
+        # بناء استعلام IN بشكل آمن
+        placeholders_owner_emails = ', '.join([f'${i + 1}' for i in range(len(owner_emails_lower))])
+
+        if owner_emails_lower:  # فقط إذا كانت هناك إيميلات محددة للمالك
+            update_owners_query = f"UPDATE panel_users SET role_id = {owner_role_id} WHERE lower(email) IN ({placeholders_owner_emails})"
+            status_owners = await conn.execute(update_owners_query, *owner_emails_lower)
+            logging.info(f"Updated specific users to 'owner' role. Status: {status_owners}")
+        else:
+            logging.info(
+                "No specific emails provided to be set as 'owner'. Skipping direct owner assignment by email list.")
+
+        # 4. تحديث جميع المستخدمين الآخرين (الذين ليسوا في قائمة OWNER_EMAILS) ليكونوا admin
+        # أو الذين كان دورهم النصي القديم 'admin'
+        # أو الذين ليس لديهم role_id بعد
+
+        # تحديث المستخدمين الذين كان دورهم النصي 'admin' ولم يتم تعيينهم كـ owner
+        # بناء استعلام NOT IN بشكل آمن
+        if owner_emails_lower:
+            update_admins_query_by_old_role = f"""
+                UPDATE panel_users
+                SET role_id = {admin_role_id}
+                WHERE lower(role) = 'admin' AND lower(email) NOT IN ({placeholders_owner_emails}) AND role_id IS NULL
+            """
+            status_admins_old_role = await conn.execute(update_admins_query_by_old_role, *owner_emails_lower)
+        else:  # إذا لم تكن هناك قائمة owner_emails، قم بتحديث جميع من كان دورهم admin
+            update_admins_query_by_old_role = f"""
+                UPDATE panel_users
+                SET role_id = {admin_role_id}
+                WHERE lower(role) = 'admin' AND role_id IS NULL
+            """
+            status_admins_old_role = await conn.execute(update_admins_query_by_old_role)
+        logging.info(f"Updated users with old role 'admin' to new 'admin' role_id. Status: {status_admins_old_role}")
+
+        # تحديث أي مستخدم متبقي ليس لديه role_id (وليس من قائمة الـ owners) إلى admin كإجراء احتياطي
+        if owner_emails_lower:
+            update_remaining_to_admin_query = f"""
+                UPDATE panel_users
+                SET role_id = {admin_role_id}
+                WHERE role_id IS NULL AND lower(email) NOT IN ({placeholders_owner_emails})
+            """
+            status_remaining_admins = await conn.execute(update_remaining_to_admin_query, *owner_emails_lower)
+        else:
+            update_remaining_to_admin_query = f"""
+                UPDATE panel_users
+                SET role_id = {admin_role_id}
+                WHERE role_id IS NULL
+            """
+            status_remaining_admins = await conn.execute(update_remaining_to_admin_query)
+
+        logging.info(f"Updated remaining users without role_id to 'admin'. Status: {status_remaining_admins}")
+
+        # 5. (اختياري) إزالة قيد panel_users_role_check القديم إذا كان لا يزال موجودًا
+        # وعمود role القديم بعد التأكد من نجاح الترحيل
+        try:
+            await conn.execute("ALTER TABLE panel_users DROP CONSTRAINT IF EXISTS panel_users_role_check")
+            logging.info("Dropped old 'panel_users_role_check' constraint if it existed.")
+            # يمكنك إضافة ALTER TABLE panel_users DROP COLUMN role; هنا إذا كنت واثقًا
+            # لكن من الأفضل القيام بذلك يدويًا بعد التحقق.
+        except Exception as e_alter:
+            logging.warning(f"Could not drop old constraint/column (might not exist or other issue): {e_alter}")
+
+
+    except Exception as e:
+        logging.error(f"Error updating panel_users roles: {e}", exc_info=True)
+
+
+async def main():
+    conn = None
+    try:
+        conn = await asyncpg.connect(**DB_CONFIG)
+        logging.info("Successfully connected to the database.")
+
+        # ترتيب التنفيذ مهم
+        await seed_roles(conn)
+        await seed_permissions(conn)
+        await seed_role_permissions(conn)
+
+        # تحديث المستخدمين الحاليين بعد إنشاء الأدوار
+        await update_panel_users_roles(conn)
+
+        logging.info("Seeding and user update process completed successfully!")
+
+    except asyncpg.exceptions.InvalidPasswordError:
+        logging.error("Database connection failed: Invalid password. Please check DB_CONFIG.")
+    except asyncpg.exceptions.CannotConnectNowError:
+        logging.error("Database connection failed: Cannot connect to the server. Is it running and accessible?")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during the main process: {e}", exc_info=True)
     finally:
         if conn:
             await conn.close()
-            logging.info("📪 تم إغلاق الاتصال بقاعدة البيانات.")
-
-        logging.info(f"\n--- ملخص المعالجة ---")
-        logging.info(
-            f"   إجمالي الدفعات التي تم جلبها: {len(affected_payments) if 'affected_payments' in locals() and affected_payments is not None else 'N/A'}")
-        logging.info(f"   تمت معالجة الاشتراكات بنجاح: {processed_count}")
-        logging.info(f"   فشلت معالجة الاشتراكات: {failed_count}")
-        logging.info(f"   تم تخطي الاشتراكات (بيانات ناقصة): {skipped_count}")
-
-        if successful_renewals:
-            logging.info("\n--- تفاصيل الاشتراكات التي تم تجديدها بنجاح ---")
-            for item in successful_renewals:
-                logging.info(
-                    f"  - DB ID: {item['payment_db_id']}, Username: '{item['username']}', tx_hash: {item['tx_hash']}, API Status: {item['api_response_status']}")
-
-        if failed_renewals:
-            logging.warning("\n--- تفاصيل الاشتراكات التي فشل تجديدها ---")
-            for item in failed_renewals:
-                logging.warning(
-                    f"  - DB ID: {item['payment_db_id']}, Username: '{item['username']}', tx_hash: {item['tx_hash']}, Reason: {item['reason']}")
-                if "api_response_status" in item:
-                    logging.warning(
-                        f"    API Status: {item['api_response_status']}, API Response: {item.get('api_response_text', '')[:300]}")
+            logging.info("Database connection closed.")
 
 
 if __name__ == "__main__":
-    from datetime import datetime  # لاستخدامها في رسالة التحديث
-
-    # تأكد من أنك تقوم بتشغيل هذا في بيئة تم فيها تحميل متغيرات البيئة بشكل صحيح
-    # إذا كنت تستخدم .env، قم بإلغاء تعليق الأسطر التالية:
-    # from dotenv import load_dotenv
-    # load_dotenv()
-    asyncio.run(process_missed_overpayments())
+    asyncio.run(main())

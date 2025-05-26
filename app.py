@@ -1,4 +1,4 @@
-#app.py
+# app.py
 
 import asyncpg
 import logging
@@ -8,14 +8,14 @@ import hypercorn.config
 import hypercorn.asyncio
 import aiohttp
 from pgvector.asyncpg import register_vector
-from quart import Quart
-from quart_cors import cors
+from quart import Quart, request
 from chatbot.ai_service import DeepSeekService
 from config import DATABASE_CONFIG
 from routes.subscriptions import subscriptions_bp
 from routes.users import user_bp
 from routes.shop import shop
 from routes.admin_routes import admin_routes
+from routes.permissions_routes import permissions_routes
 from routes.notifications_routes import notifications_bp
 from routes.subscriptions_routs import public_routes
 from routes.telegram_payments import payment_bp
@@ -38,6 +38,7 @@ for var in REQUIRED_ENV_VARS:
     if not os.environ.get(var):
         raise ValueError(f"❌ متغير البيئة {var} غير مضبوط.")
 
+
 # دالة تُنفّذ على كل اتصال جديد في pool
 async def _on_connect(conn):
     # تأكد من وجود امتداد vector
@@ -45,29 +46,57 @@ async def _on_connect(conn):
     # سجّل codec للـ vector type
     await register_vector(conn)
 
+
 # تهيئة التطبيق
 app = Quart(__name__)
 app.db_pool = None
 app.aiohttp_session = None
 app.bot = None
 app.bot_running = False
-logging.basicConfig(level=logging.INFO)
-# هنا نسجل خدمة الذكاء الاصطناعي
 
+# إعدادات الجلسة (إذا كنت تستخدمها)
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = False  # True إذا كنت تستخدم HTTPS
 
 app.chat_manager = ChatManager(app)
-app.kb           = knowledge_base
-app = cors(app, allow_origin="*")
+app.kb = knowledge_base
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+
+# ========== إعدادات CORS المخصصة ==========
+@app.after_request
+async def handle_cors(response):
+    origin = request.headers.get('Origin', '*')
+
+    # السماح لجميع المصادر مع التحكم في Credentials
+    response.headers['Access-Control-Allow-Origin'] = origin
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, X-Requested-With'
+    response.headers['Vary'] = 'Origin'
+    response.headers['Access-Control-Max-Age'] = '86400'  # 24 ساعة
+
+    return response
+
+
+# معالجة طلبات OPTIONS لكل المسارات
+@app.route("/<path:path>", methods=["OPTIONS"])
+@app.route("/", methods=["OPTIONS"])
+async def options_handler(path=None):
+    return "", 204
+
+
+# ========== نهاية إعدادات CORS ==========
+
 # تسجيل Blueprints
 app.register_blueprint(notifications_bp, url_prefix="/api")
 app.register_blueprint(public_routes)
 app.register_blueprint(admin_routes)
+app.register_blueprint(permissions_routes)
 app.register_blueprint(auth_routes)
 app.register_blueprint(payment_status_bp)
 app.register_blueprint(subscriptions_bp)
@@ -78,6 +107,7 @@ app.register_blueprint(admin_chatbot_bp)
 app.register_blueprint(telegram_bot_bp)
 app.register_blueprint(chatbot_bp, url_prefix="/bot")
 app.register_blueprint(ws_bp)
+
 
 # إضافة رؤوس أمان
 @app.after_request
@@ -93,6 +123,7 @@ async def add_security_headers(response):
     }
     response.headers.update(headers)
     return response
+
 
 # تهيئة التطبيق والاتصالات
 async def initialize_app():
@@ -144,6 +175,7 @@ async def initialize_app():
         await close_resources()
         raise
 
+
 # إغلاق الموارد
 @app.after_serving
 async def close_resources():
@@ -162,6 +194,7 @@ async def close_resources():
     except Exception as e:
         logging.error(f"❌ Error during cleanup: {e}")
 
+
 # تشغيل التهيئة قبل البدء في استقبال الطلبات
 @app.before_serving
 async def setup():
@@ -177,10 +210,12 @@ async def setup():
         logging.critical(f"Initialization failed: {e}")
         raise
 
+
 # نقطة فحص صحية
 @app.route("/")
 async def home():
     return "🚀 Exadoo API is running!"
+
 
 # نقطة الدخول الرئيسية
 if __name__ == "__main__":

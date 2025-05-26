@@ -21,39 +21,50 @@ public_routes = Blueprint("public_routes", __name__, url_prefix="/api/public")
 async def get_public_subscription_types():
     try:
         async with current_app.db_pool.acquire() as connection:
+            # --- تعديل الاستعلام ليشمل terms_and_conditions ---
             query = """
-                SELECT id, 
-                    name, 
-                    channel_id, 
-                    description, 
-                    image_url, 
-                    features, 
-                    usp, 
-                    is_active,
-                    is_recommended,
-                    created_at
-                FROM subscription_types
-                WHERE is_active = true
-                ORDER BY created_at DESC
+                SELECT 
+                    st.id, 
+                    st.name, 
+                    st.channel_id, 
+                    st.description, 
+                    st.image_url, 
+                    st.features, 
+                    st.usp, 
+                    st.is_active,
+                    st.is_recommended,
+                    st.terms_and_conditions, -- <-- إضافة جديدة
+                    st.created_at
+                FROM subscription_types st -- استخدام st كاسم مستعار للجدول
+                WHERE st.is_active = true
+                ORDER BY st.created_at DESC
             """
             results = await connection.fetch(query)
 
         types = []
         for row in results:
             row_dict = dict(row)
-            # التأكد من تحويل الحقل features إلى مصفوفة JSON
-            row_dict["features"] = json.loads(row_dict["features"]) if row_dict["features"] else []
+            # التأكد من تحويل الحقول JSONB إلى مصفوفات
+            # asyncpg عادة ما يقوم بهذا تلقائيًا لـ jsonb إلى list/dict
+            if isinstance(row_dict.get("features"), str): # احتياطًا
+                row_dict["features"] = json.loads(row_dict["features"]) if row_dict["features"] else []
+            elif row_dict.get("features") is None:
+                row_dict["features"] = []
+            
+            if isinstance(row_dict.get("terms_and_conditions"), str): # <-- إضافة جديدة, احتياطًا
+                row_dict["terms_and_conditions"] = json.loads(row_dict["terms_and_conditions"]) if row_dict["terms_and_conditions"] else []
+            elif row_dict.get("terms_and_conditions") is None: # <-- إضافة جديدة
+                row_dict["terms_and_conditions"] = []
+            
             types.append(row_dict)
 
-        # تضمين رؤوس للتخزين المؤقت لتحسين الأداء
         return jsonify(types), 200, {
-            "Cache-Control": "public, max-age=300",
+            "Cache-Control": "public, max-age=300", # يمكنك تعديل مدة التخزين المؤقت
             "Content-Type": "application/json; charset=utf-8"
         }
     except Exception as e:
         logging.error("Error fetching public subscription types: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
 
 # نقطة API لجلب قائمة بخطط الاشتراك العامة
 @public_routes.route("/subscription-plans", methods=["GET"])
