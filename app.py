@@ -67,29 +67,34 @@ logging.basicConfig(
 )
 
 
-# ========== إعدادات CORS المخصصة ==========
+# ========== معالجة CORS ديناميكية ==========
+@app.before_request
+async def handle_preflight():
+    if request.method == 'OPTIONS':
+        # رد على طلب preflight برؤوس CORS المطلوبة
+        origin = request.headers.get('Origin', '*')
+        req_method = request.headers.get('Access-Control-Request-Method', '')
+        req_headers = request.headers.get('Access-Control-Request-Headers', '')
+        response = make_response('', 204)
+        response.headers.update({
+            'Access-Control-Allow-Origin': origin,
+            'Access-Control-Allow-Methods': req_method or 'GET,POST,PUT,DELETE,OPTIONS',
+            'Access-Control-Allow-Headers': req_headers or '*',
+            'Access-Control-Allow-Credentials': 'true',
+            'Access-Control-Max-Age': '86400',  # 24 ساعة
+            'Vary': 'Origin'
+        })
+        return response
+
 @app.after_request
-async def handle_cors(response):
+async def add_cors_headers(response):
+    # إضافة رؤوس CORS للردود العادية
     origin = request.headers.get('Origin', '*')
-
-    # السماح لجميع المصادر مع التحكم في Credentials
-    response.headers['Access-Control-Allow-Origin'] = origin
-    response.headers['Access-Control-Allow-Credentials'] = 'true'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = (
-        'Authorization, Content-Type, X-Requested-With, X-Telegram-Id'
-    )
-    response.headers['Vary'] = 'Origin'
-    response.headers['Access-Control-Max-Age'] = '86400'  # 24 ساعة
-
+    response.headers.setdefault('Access-Control-Allow-Origin', origin)
+    response.headers.setdefault('Access-Control-Allow-Credentials', 'true')
+    response.headers.setdefault('Vary', 'Origin')
     return response
-
-
-# معالجة طلبات OPTIONS لكل المسارات
-@app.route("/<path:path>", methods=["OPTIONS"])
-@app.route("/", methods=["OPTIONS"])
-async def options_handler(path=None):
-    return "", 204
+# ========== نهاية CORS ==========
 
 
 # ========== نهاية إعدادات CORS ==========

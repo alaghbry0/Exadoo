@@ -3,7 +3,7 @@ from functools import wraps
 from quart import request, jsonify, current_app
 import jwt
 from config import SECRET_KEY
-from uuid import uuid
+import uuid
 
 from utils.audit_logger import audit_logger, AuditCategory, AuditSeverity
 from auth import get_current_user
