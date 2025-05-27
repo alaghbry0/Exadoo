@@ -1,4 +1,4 @@
-# app.py
+#app.py
 
 import asyncpg
 import logging
@@ -8,7 +8,8 @@ import hypercorn.config
 import hypercorn.asyncio
 import aiohttp
 from pgvector.asyncpg import register_vector
-from quart import Quart, request
+from quart import Quart
+from quart_cors import cors
 from chatbot.ai_service import DeepSeekService
 from config import DATABASE_CONFIG
 from routes.subscriptions import subscriptions_bp
@@ -38,7 +39,6 @@ for var in REQUIRED_ENV_VARS:
     if not os.environ.get(var):
         raise ValueError(f"❌ متغير البيئة {var} غير مضبوط.")
 
-
 # دالة تُنفّذ على كل اتصال جديد في pool
 async def _on_connect(conn):
     # تأكد من وجود امتداد vector
@@ -46,58 +46,24 @@ async def _on_connect(conn):
     # سجّل codec للـ vector type
     await register_vector(conn)
 
-
 # تهيئة التطبيق
 app = Quart(__name__)
 app.db_pool = None
 app.aiohttp_session = None
 app.bot = None
 app.bot_running = False
+logging.basicConfig(level=logging.INFO)
+# هنا نسجل خدمة الذكاء الاصطناعي
 
-# إعدادات الجلسة (إذا كنت تستخدمها)
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = False  # True إذا كنت تستخدم HTTPS
 
 app.chat_manager = ChatManager(app)
-app.kb = knowledge_base
+app.kb           = knowledge_base
+app = cors(app, allow_origin="*")
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-
-
-# ========== معالجة CORS ديناميكية ==========
-@app.before_request
-async def handle_preflight():
-    if request.method == 'OPTIONS':
-        # رد على طلب preflight برؤوس CORS المطلوبة
-        origin = request.headers.get('Origin', '*')
-        req_method = request.headers.get('Access-Control-Request-Method', '')
-        req_headers = request.headers.get('Access-Control-Request-Headers', '')
-        response = make_response('', 204)
-        response.headers.update({
-            'Access-Control-Allow-Origin': origin,
-            'Access-Control-Allow-Methods': req_method or 'GET,POST,PUT,DELETE,OPTIONS',
-            'Access-Control-Allow-Headers': req_headers or '*',
-            'Access-Control-Allow-Credentials': 'true',
-            'Access-Control-Max-Age': '86400',  # 24 ساعة
-            'Vary': 'Origin'
-        })
-        return response
-
-@app.after_request
-async def add_cors_headers(response):
-    # إضافة رؤوس CORS للردود العادية
-    origin = request.headers.get('Origin', '*')
-    response.headers.setdefault('Access-Control-Allow-Origin', origin)
-    response.headers.setdefault('Access-Control-Allow-Credentials', 'true')
-    response.headers.setdefault('Vary', 'Origin')
-    return response
-# ========== نهاية CORS ==========
-
-
-# ========== نهاية إعدادات CORS ==========
 
 # تسجيل Blueprints
 app.register_blueprint(notifications_bp, url_prefix="/api")
@@ -115,7 +81,6 @@ app.register_blueprint(telegram_bot_bp)
 app.register_blueprint(chatbot_bp, url_prefix="/bot")
 app.register_blueprint(ws_bp)
 
-
 # إضافة رؤوس أمان
 @app.after_request
 async def add_security_headers(response):
@@ -125,12 +90,11 @@ async def add_security_headers(response):
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline' https://accounts.google.com; "
             "frame-src 'self' https://accounts.google.com; "
-            "connect-src 'self' https://accounts.google.com https://api.github.com https://api.nepcha.com http://localhost:5000 https://exadooo-plum.vercel.app https://exaado-panel.vercel.app"
+            "connect-src 'self' https://accounts.google.com https://api.github.com https://api.nepcha.com http://localhost:5000; https://exaado-panel.vercel.app"
         )
     }
     response.headers.update(headers)
     return response
-
 
 # تهيئة التطبيق والاتصالات
 async def initialize_app():
@@ -182,7 +146,6 @@ async def initialize_app():
         await close_resources()
         raise
 
-
 # إغلاق الموارد
 @app.after_serving
 async def close_resources():
@@ -201,7 +164,6 @@ async def close_resources():
     except Exception as e:
         logging.error(f"❌ Error during cleanup: {e}")
 
-
 # تشغيل التهيئة قبل البدء في استقبال الطلبات
 @app.before_serving
 async def setup():
@@ -217,12 +179,10 @@ async def setup():
         logging.critical(f"Initialization failed: {e}")
         raise
 
-
 # نقطة فحص صحية
 @app.route("/")
 async def home():
     return "🚀 Exadoo API is running!"
-
 
 # نقطة الدخول الرئيسية
 if __name__ == "__main__":
