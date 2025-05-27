@@ -310,53 +310,196 @@ async def get_my_permissions():
 @permissions_routes.route("/audit-logs", methods=["GET"])
 @permission_required("system.view_audit_log")
 async def get_audit_logs():
-    """جلب سجل العمليات"""
+    """جلب سجل العمليات مع فلترة متقدمة"""
     page = int(request.args.get("page", 1))
     limit = int(request.args.get("limit", 25))
     offset = (page - 1) * limit
-
+    
+    # فلاتر البحث
+    user_email = request.args.get("user_email")
+    action = request.args.get("action")
+    category = request.args.get("category")
+    severity = request.args.get("severity")
+    resource = request.args.get("resource")
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+    session_id = request.args.get("session_id")
+    
+    # بناء الاستعلام
+    where_conditions = []
+    params = []
+    param_count = 0
+    
+    if user_email:
+        param_count += 1
+        where_conditions.append(f"al.user_email ILIKE ${param_count}")
+        params.append(f"%{user_email}%")
+    
+    if action:
+        param_count += 1
+        where_conditions.append(f"al.action ILIKE ${param_count}")
+        params.append(f"%{action}%")
+    
+    if category:
+        param_count += 1
+        where_conditions.append(f"al.category = ${param_count}")
+        params.append(category)
+    
+    if severity:
+        param_count += 1
+        where_conditions.append(f"al.severity = ${param_count}")
+        params.append(severity)
+    
+    if resource:
+        param_count += 1
+        where_conditions.append(f"al.resource = ${param_count}")
+        params.append(resource)
+    
+    if date_from:
+        param_count += 1
+        where_conditions.append(f"al.created_at >= ${param_count}")
+        params.append(date_from)
+    
+    if date_to:
+        param_count += 1
+        where_conditions.append(f"al.created_at <= ${param_count}")
+        params.append(date_to)
+    
+    if session_id:
+        param_count += 1
+        where_conditions.append(f"al.session_id = ${param_count}")
+        params.append(session_id)
+    
+    where_clause = "WHERE " + " AND ".join(where_conditions) if where_conditions else ""
+    
     async with current_app.db_pool.acquire() as connection:
-        logs_from_db = await connection.fetch("""
+        # استعلام السجلات
+        query = f"""
             SELECT 
-                al.id, 
-                al.user_email, 
-                COALESCE(pu.display_name, al.user_email) as user_display_identifier, -- استخدم display_name، وإذا لم يوجد، استخدم email
-                al.action, 
-                al.resource, 
-                al.resource_id, 
-                al.details, 
-                al.ip_address, 
-                al.user_agent, 
-                al.created_at 
+                al.id, al.user_email, 
+                COALESCE(pu.display_name, al.user_email) as user_display_identifier,
+                al.action, al.resource, al.resource_id, al.details,
+                al.old_values, al.new_values, al.ip_address, al.user_agent,
+                al.session_id, al.severity, al.category, al.created_at
             FROM audit_logs al
-            LEFT JOIN panel_users pu ON al.user_email = pu.email -- الربط باستخدام البريد الإلكتروني
+            LEFT JOIN panel_users pu ON al.user_email = pu.email
+            {where_clause}
             ORDER BY al.created_at DESC 
-            LIMIT $1 OFFSET $2
-        """, limit, offset)
-
-        total_count = await connection.fetchval("SELECT COUNT(*) FROM audit_logs")
-
+            LIMIT ${param_count + 1} OFFSET ${param_count + 2}
+        """
+        params.extend([limit, offset])
+        
+        logs = await connection.fetch(query, *params)
+        
+        # استعلام العدد الإجمالي
+        count_query = f"SELECT COUNT(*) FROM audit_logs al {where_clause}"
+        total_count = await connection.fetchval(count_query, *params[:-2])
+        
         result_logs = []
-        for db_log_row in logs_from_db:
-            result_logs.append({
-                "id": db_log_row["id"],
-                "user_email": db_log_row["user_email"], # يمكنك إبقاؤه إذا كنت لا تزال تحتاجه
-                "user_display_identifier": db_log_row["user_display_identifier"], # هذا هو الاسم المعروض أو البريد الإلكتروني
-                "action": db_log_row["action"],
-                "resource": db_log_row["resource"],
-                "resource_id": db_log_row["resource_id"],
-                "details": db_log_row["details"],
-                "ip_address": str(db_log_row["ip_address"]) if db_log_row["ip_address"] else None,
-                "user_agent": db_log_row["user_agent"],
-                "created_at": db_log_row["created_at"].isoformat() if db_log_row["created_at"] else None
-            })
-
+        for log in logs:
+            log_dict = dict(log)
+            # تحويل JSONB إلى dict
+            for json_field in ['details', 'old_values', 'new_values']:
+                if log_dict[json_field]:
+                    try:
+                        log_dict[json_field] = json.loads(log_dict[json_field]) if isinstance(log_dict[json_field], str) else log_dict[json_field]
+                    except:
+                        pass
+            
+            if log_dict["created_at"]:
+                log_dict["created_at"] = log_dict["created_at"].isoformat()
+            
+            result_logs.append(log_dict)
+        
         return jsonify({
             "logs": result_logs,
             "pagination": {
                 "page": page,
                 "limit": limit,
                 "total": total_count,
-                "pages": (total_count + limit - 1) // limit if limit > 0 else 0
+                "pages": (total_count + limit - 1) // limit
+            },
+            "filters": {
+                "user_email": user_email,
+                "action": action,
+                "category": category,
+                "severity": severity,
+                "resource": resource,
+                "date_from": date_from,
+                "date_to": date_to,
+                "session_id": session_id
             }
         }), 200
+
+@permissions_routes.route("/audit-logs/summary", methods=["GET"])
+@permission_required("system.view_audit_log")
+async def get_audit_summary():
+    """إحصائيات سجل العمليات"""
+    async with current_app.db_pool.acquire() as connection:
+        # إحصائيات عامة
+        stats = await connection.fetchrow("""
+            SELECT 
+                COUNT(*) as total_logs,
+                COUNT(DISTINCT user_email) as unique_users,
+                COUNT(DISTINCT session_id) as unique_sessions,
+                MIN(created_at) as earliest_log,
+                MAX(created_at) as latest_log
+            FROM audit_logs
+        """)
+        
+        # أهم الأنشطة
+        top_actions = await connection.fetch("""
+            SELECT action, COUNT(*) as count
+            FROM audit_logs
+            GROUP BY action
+            ORDER BY count DESC
+            LIMIT 10
+        """)
+        
+        # أكثر المستخدمين نشاطاً
+        top_users = await connection.fetch("""
+            SELECT 
+                al.user_email,
+                COALESCE(pu.display_name, al.user_email) as display_name,
+                COUNT(*) as activity_count
+            FROM audit_logs al
+            LEFT JOIN panel_users pu ON al.user_email = pu.email
+            GROUP BY al.user_email, pu.display_name
+            ORDER BY activity_count DESC
+            LIMIT 10
+        """)
+        
+        # إحصائيات حسب التصنيف
+        category_stats = await connection.fetch("""
+            SELECT 
+                COALESCE(category, 'uncategorized') as category,
+                COUNT(*) as count
+            FROM audit_logs
+            GROUP BY category
+            ORDER BY count DESC
+        """)
+        
+        # إحصائيات حسب الخطورة
+        severity_stats = await connection.fetch("""
+            SELECT severity, COUNT(*) as count
+            FROM audit_logs
+            GROUP BY severity
+            ORDER BY 
+                CASE severity
+                    WHEN 'CRITICAL' THEN 1
+                    WHEN 'ERROR' THEN 2
+                    WHEN 'WARNING' THEN 3
+                    WHEN 'INFO' THEN 4
+                    ELSE 5
+                END
+        """)
+        
+        return jsonify({
+            "summary": dict(stats),
+            "top_actions": [dict(row) for row in top_actions],
+            "top_users": [dict(row) for row in top_users],
+            "category_distribution": [dict(row) for row in category_stats],
+            "severity_distribution": [dict(row) for row in severity_stats]
+        }), 200
+    
+

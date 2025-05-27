@@ -118,7 +118,7 @@ async def add_security_headers(response):
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline' https://accounts.google.com; "
             "frame-src 'self' https://accounts.google.com; "
-            "connect-src 'self' https://accounts.google.com https://api.github.com https://api.nepcha.com http://localhost:5000; https://exaado-panel.vercel.app"
+            "connect-src 'self' https://accounts.google.com https://api.github.com https://api.nepcha.com http://localhost:5000 https://exadooo-plum.vercel.app https://exaado-panel.vercel.app"
         )
     }
     response.headers.update(headers)

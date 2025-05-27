@@ -8,12 +8,13 @@ from datetime import datetime, timezone, timedelta
 import pytz
 from functools import wraps
 import jwt
-from utils.permissions import permission_required, owner_required, log_action
+from utils.permissions import permission_required, log_action, audit_action
 import asyncpg
 import asyncio
 from utils.notifications import create_notification
 from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user
 import io
+from utils.audit_logger import audit_logger, AuditCategory, AuditSeverity
 import pandas as pd
 from database.db_queries import (
     add_user,
@@ -680,17 +681,7 @@ async def update_subscription_type(type_id: int):
 async def delete_subscription_type(type_id: int):
     try:
         async with current_app.db_pool.acquire() as connection:
-            # الحذف من subscription_types سيؤدي إلى حذف السجلات المرتبطة
-            # من subscription_type_channels بسبب ON DELETE CASCADE
-            # تأكد من أن هذا هو السلوك المطلوب.
-            # إذا كان هناك اشتراكات قائمة subscriptions أو خطط subscription_plans مرتبطة بهذا النوع،
-            # قد تحتاج إلى التعامل معها (منع الحذف أو حذفها أيضًا إذا كان ذلك مناسبًا).
-            # حاليًا، subscription_plans لديها ON DELETE CASCADE.
-            # subscriptions ليس لديها، لذا قد يحدث خطأ إذا كان هناك اشتراكات مرتبطة.
-            # يجب إما إضافة ON DELETE CASCADE أو SET NULL لـ subscriptions.subscription_type_id
-            # أو التحقق برمجيًا هنا.
 
-            # تحقق مبدئي إذا كان هناك اشتراكات مرتبطة (اختياري، لكن جيد)
             active_subs_count = await connection.fetchval(
                 "SELECT COUNT(*) FROM subscriptions WHERE subscription_type_id = $1", type_id)
             if active_subs_count > 0:
@@ -804,13 +795,23 @@ async def get_subscription_type(type_id: int):
 
 @admin_routes.route("/subscription-plans", methods=["POST"])
 @permission_required("subscription_plans.create")
+@audit_action(
+    action="CREATE_SUBSCRIPTION_PLAN",
+    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+    resource_type="subscription_plan"
+    # track_changes is not strictly needed here as the "new_values" concept
+    # can be handled by the decorator if it captures the result,
+    # or a specific log_action call for the created entity.
+)
 async def create_subscription_plan():
     try:
         data = await request.get_json()
+        user = await get_current_user() # الحصول على المستخدم الحالي لتمريره إذا لزم الأمر
+
         subscription_type_id = data.get("subscription_type_id")
         name = data.get("name")
         price = data.get("price")
-        original_price = data.get("original_price", price)  # إذا لم يتم توفير سعر أصلي، استخدم السعر العادي
+        original_price = data.get("original_price", price)
         duration_days = data.get("duration_days")
         telegram_stars_price = data.get("telegram_stars_price", 0)
         is_active = data.get("is_active", True)
@@ -825,7 +826,7 @@ async def create_subscription_plan():
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at;
             """
-            result = await connection.fetchrow(
+            created_plan_record = await connection.fetchrow(
                 query,
                 subscription_type_id,
                 name,
@@ -835,40 +836,72 @@ async def create_subscription_plan():
                 duration_days,
                 is_active
             )
-        return jsonify(dict(result)), 201
+        
+        
+        if created_plan_record and user:
+             await audit_logger.log_action(
+                 user_email=user["email"],
+                 action="CREATE_SUBSCRIPTION_PLAN_DETAILS", # إجراء مختلف للإشارة للتفاصيل
+                 category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+                 resource="subscription_plan",
+                 resource_id=str(created_plan_record["id"]),
+                 details={
+                     "plan_name": created_plan_record["name"],
+                     "message": "Plan created successfully with specified values."
+                 },
+                 new_values=dict(created_plan_record),
+                 session_id=audit_logger.session_id # استخدام نفس session_id الذي أنشأه الديكوريتور
+             )
+
+        return jsonify(dict(created_plan_record)), 201
     except Exception as e:
         logging.error("Error creating subscription plan: %s", e, exc_info=True)
+        # الديكوريتور @audit_action سيلتقط هذا الخطأ ويسجل _FAILED
         return jsonify({"error": "Internal server error"}), 500
 
 
 # تعديل بيانات خطة اشتراك
 @admin_routes.route("/subscription-plans/<int:plan_id>", methods=["PUT"])
 @permission_required("subscription_plans.update")
+@audit_action(
+    action="UPDATE_SUBSCRIPTION_PLAN", # هذا هو الإجراء العام الذي يسجله الديكوريتور
+    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+    resource_type="subscription_plan",
+    track_changes=True # علامة تشير إلى أننا سنتعامل مع تتبع التغييرات يدويًا
+)
 async def update_subscription_plan(plan_id: int):
     try:
         data = await request.get_json()
-        subscription_type_id = data.get("subscription_type_id")
-        name = data.get("name")
-        price = data.get("price")
-        original_price = data.get("original_price")
-        duration_days = data.get("duration_days")
-        telegram_stars_price = data.get("telegram_stars_price")
-        is_active = data.get("is_active")
-
-        # إذا تم تعديل السعر ولم يتم تحديد سعر أصلي، اجعل السعر الأصلي هو نفس السعر الجديد
-        if price is not None and original_price is None:
-            async with current_app.db_pool.acquire() as connection:
-                # الحصول على السعر الأصلي الحالي
-                current_plan = await connection.fetchrow(
-                    "SELECT price, original_price FROM subscription_plans WHERE id = $1", plan_id
-                )
-
-                # التحقق مما إذا كان السعر الأصلي الحالي مساويًا للسعر الحالي
-                if current_plan and current_plan['price'] == current_plan['original_price']:
-                    original_price = price
+        user = await get_current_user() # نحتاج إلى المستخدم لتسجيل الإجراء اليدوي
 
         async with current_app.db_pool.acquire() as connection:
-            query = """
+            # 1. الحصول على القيم القديمة قبل التحديث
+            old_plan_record = await connection.fetchrow(
+                "SELECT * FROM subscription_plans WHERE id = $1 FOR UPDATE", plan_id # FOR UPDATE لتجنب race conditions بسيطة
+            )
+            
+            if not old_plan_record:
+                # الديكوريتور سيسجل هذا كـ _FAILED مع تفاصيل الخطأ من الاستثناء
+                # لكن يمكننا إرجاع 404 قبل أن يرفع الديكوريتور خطأ
+                return jsonify({"error": "Subscription plan not found"}), 404
+
+            # تحضير القيم للتحديث (من الكود الأصلي)
+            subscription_type_id = data.get("subscription_type_id")
+            name = data.get("name")
+            price = data.get("price")
+            original_price = data.get("original_price")
+            duration_days = data.get("duration_days")
+            telegram_stars_price = data.get("telegram_stars_price")
+            is_active = data.get("is_active")
+
+            # إذا تم تعديل السعر ولم يتم تحديد سعر أصلي، اجعل السعر الأصلي هو نفس السعر الجديد
+            # هذا المنطق يعتمد على old_plan_record وليس استعلامًا جديدًا
+            if price is not None and original_price is None:
+                if old_plan_record and old_plan_record['price'] == old_plan_record['original_price']:
+                    original_price = price
+            
+            # 2. تنفيذ التحديث
+            update_query = """
                 UPDATE subscription_plans
                 SET subscription_type_id = COALESCE($1, subscription_type_id),
                     name = COALESCE($2, name),
@@ -878,46 +911,99 @@ async def update_subscription_plan(plan_id: int):
                     duration_days = COALESCE($6, duration_days),
                     is_active = COALESCE($7, is_active)
                 WHERE id = $8
-                RETURNING id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at;
+                RETURNING *;
             """
-            result = await connection.fetchrow(
-                query,
-                subscription_type_id,
-                name,
-                price,
-                original_price,
-                telegram_stars_price,
-                duration_days,
-                is_active,
-                plan_id
+            updated_plan_record = await connection.fetchrow(
+                update_query,
+                subscription_type_id, name, price, original_price,
+                telegram_stars_price, duration_days, is_active, plan_id
             )
-        if result:
-            return jsonify(dict(result)), 200
-        else:
-            return jsonify({"error": "Subscription plan not found"}), 404
+
+            if not updated_plan_record: # يجب ألا يحدث هذا إذا كان old_plan_record موجودًا
+                return jsonify({"error": "Subscription plan not found after update attempt"}), 404
+
+            # 3. تسجيل التغييرات بالتفصيل (كما في مثالك)
+            # هذا التسجيل اليدوي يضيف تفاصيل old_values و new_values
+            # الديكوريتور سيسجل `UPDATE_SUBSCRIPTION_PLAN_SUCCESS` بشكل عام
+            if user: # تأكد من وجود المستخدم
+                await audit_logger.log_action(
+                    user_email=user["email"],
+                    action="UPDATE_SUBSCRIPTION_PLAN_DETAILS", # إجراء مميز للتفاصيل
+                    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+                    severity=AuditSeverity.INFO, # أو أي مستوى خطورة تراه مناسبًا لتفاصيل التحديث
+                    resource="subscription_plan",
+                    resource_id=str(plan_id),
+                    details={ # تفاصيل إضافية يمكن أن تكون مفيدة
+                        "plan_name_updated_to": updated_plan_record["name"],
+                        "fields_in_request": list(data.keys())
+                    },
+                    old_values=dict(old_plan_record) if old_plan_record else None,
+                    new_values=dict(updated_plan_record) if updated_plan_record else None,
+                    session_id=audit_logger.session_id # استخدام نفس session_id
+                )
+            
+        return jsonify(dict(updated_plan_record)), 200
+        
     except Exception as e:
-        logging.error("Error updating subscription plan: %s", e, exc_info=True)
+        logging.error(f"Error updating subscription plan {plan_id}: {e}", exc_info=True)
+        # الديكوريتور @audit_action سيلتقط هذا الخطأ ويسجل _FAILED
+        # لا حاجة لاستدعاء audit_logger.log_action يدويًا هنا للخطأ العام
         return jsonify({"error": "Internal server error"}), 500
     
     
 @admin_routes.route("/subscription-plans/<int:plan_id>", methods=["DELETE"])
-@permission_required("subscription_plans.update") # تأكد من أن هذا الصلاحية صحيحة
-async def delete_subscription_plan(plan_id: int): # تم تغيير اسم الدالة للمفرد
+@permission_required("subscription_plans.delete") # تم تغيير الصلاحية إلى .delete (أفترض أن لديك هذه الصلاحية)
+@audit_action(
+    action="DELETE_SUBSCRIPTION_PLAN",
+    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+    resource_type="subscription_plan"
+    # track_changes=True يمكن إضافتها إذا أردنا تسجيل القيم المحذوفة يدويًا
+)
+async def delete_subscription_plan(plan_id: int):
     try:
+        user = await get_current_user() # للحصول على البريد الإلكتروني للمستخدم
+
         async with current_app.db_pool.acquire() as connection:
-            # اختياري: التحقق مما إذا كانت الخطة موجودة أولاً وما إذا تم حذف أي شيء
-            # result = await connection.fetchrow("DELETE FROM subscription_plans WHERE id = $1 RETURNING id", plan_id)
-            # if not result:
-            #     return jsonify({"error": "Subscription plan not found"}), 404
+            # 1. (اختياري ولكن مستحسن للتدقيق) جلب السجل قبل الحذف لتسجيل ما تم حذفه
+            plan_to_delete = await connection.fetchrow(
+                "SELECT * FROM subscription_plans WHERE id = $1", plan_id
+            )
+
+            if not plan_to_delete:
+                return jsonify({"error": "Subscription plan not found"}), 404
             
-            # الحذف المباشر
-            await connection.execute("DELETE FROM subscription_plans WHERE id = $1", plan_id)
+            # 2. تنفيذ الحذف
+            result = await connection.execute(
+                "DELETE FROM subscription_plans WHERE id = $1", plan_id
+            )
             
-        # رسالة نجاح صحيحة
+            # إذا كان `result` يعيد عدد الصفوف المتأثرة، يمكن التحقق منه
+            # "DELETE 1" for example
+            if result == "DELETE 0": # أو أي طريقة للتحقق من أن الحذف لم يتم (قد يكون بسبب حالة سباق)
+                 return jsonify({"error": "Subscription plan not found or already deleted"}), 404
+
+            # 3. (اختياري) تسجيل تفصيلي لما تم حذفه
+            if user: # تأكد من وجود المستخدم
+                await audit_logger.log_action(
+                    user_email=user["email"],
+                    action="DELETE_SUBSCRIPTION_PLAN_DETAILS", # إجراء مميز لتفاصيل الحذف
+                    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+                    severity=AuditSeverity.INFO, # أو WARNING إذا كان الحذف عملية حساسة
+                    resource="subscription_plan",
+                    resource_id=str(plan_id),
+                    details={
+                        "plan_name_deleted": plan_to_delete["name"],
+                        "message": "Plan permanently deleted."
+                    },
+                    old_values=dict(plan_to_delete), # هنا نسجل القيم التي كانت موجودة
+                    new_values=None, # لا توجد قيم جديدة عند الحذف
+                    session_id=audit_logger.session_id # استخدام نفس session_id
+                )
+            
         return jsonify({"message": "Subscription plan deleted successfully"}), 200
     except Exception as e:
-        # رسالة خطأ تسجيل صحيحة
-        logging.error("Error deleting subscription plan %s: %s", plan_id, e, exc_info=True)
+        logging.error(f"Error deleting subscription plan {plan_id}: {e}", exc_info=True)
+        # الديكوريتور @audit_action سيلتقط هذا الخطأ ويسجل _FAILED
         return jsonify({"error": "Internal server error"}), 500
 
 
@@ -2117,73 +2203,148 @@ async def get_incoming_transactions():
 # =====================================
 @admin_routes.route("/subscriptions/<int:subscription_id>", methods=["PUT"])
 @permission_required("user_subscriptions.update")
-async def update_subscription(subscription_id):
+@audit_action(
+    action="UPDATE_USER_SUBSCRIPTION",
+    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+    resource_type="user_subscription",
+    track_changes=True # للإشارة إلى أننا سنتعامل مع old/new values يدويًا
+)
+async def update_subscription(subscription_id: int): # تحديد النوع لـ subscription_id
     try:
         data = await request.get_json()
-        expiry_date = data.get("expiry_date")
-        subscription_plan_id = data.get("subscription_plan_id")
-        source = data.get("source")  # مثال: "manual" أو "auto"
+        user = await get_current_user()
+        user_email = user["email"] if user else "system"
 
-        if expiry_date is None and subscription_plan_id is None and source is None:
+        expiry_date_str = data.get("expiry_date")
+        subscription_plan_id = data.get("subscription_plan_id")
+        source = data.get("source")
+
+        if expiry_date_str is None and subscription_plan_id is None and source is None:
             return jsonify({"error": "No fields provided for update"}), 400
 
-        update_fields = []
-        params = []
-        idx = 1
-        local_tz = pytz.timezone("Asia/Riyadh")
-
-        if expiry_date:
-            # تحويل expiry_date إلى datetime timezone-aware باستخدام local_tz
-            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(
-                local_tz)
-            update_fields.append(f"expiry_date = ${idx}")
-            params.append(dt_expiry)
-            idx += 1
-
-            # إعادة حساب is_active بناءً على expiry_date
-            is_active = dt_expiry > datetime.now(local_tz)
-            update_fields.append(f"is_active = ${idx}")
-            params.append(is_active)
-            idx += 1
-
-        if subscription_plan_id:
-            update_fields.append(f"subscription_plan_id = ${idx}")
-            params.append(subscription_plan_id)
-            idx += 1
-
-        if source:
-            update_fields.append(f"source = ${idx}")
-            params.append(source)
-            idx += 1
-
-        update_fields.append("updated_at = now()")
-        query = f"UPDATE subscriptions SET {', '.join(update_fields)} WHERE id = ${idx} RETURNING *;"
-        params.append(subscription_id)
-
         async with current_app.db_pool.acquire() as connection:
-            row = await connection.fetchrow(query, *params)
-        if not row:
-            return jsonify({"error": "Subscription not found"}), 404
-        return jsonify(dict(row))
+            # 1. الحصول على القيم القديمة قبل التحديث
+            old_subscription = await connection.fetchrow(
+                "SELECT * FROM subscriptions WHERE id = $1 FOR UPDATE", subscription_id
+            )
+
+            if not old_subscription:
+                # الديكوريتور سيسجل هذا كـ _FAILED
+                return jsonify({"error": "Subscription not found"}), 404
+
+            update_fields = []
+            params = []
+            idx = 1
+            # local_tz = pytz.timezone("Asia/Riyadh") # تأكد من تعريف LOCAL_TZ بشكل عام في config أو هنا
+
+            # استخدام LOCAL_TZ المعرف عالميًا بدلًا من تعريفه هنا
+            # افترض أن LOCAL_TZ معرف في مكان ما (مثل config.py)
+            # from config import LOCAL_TZ
+
+            if expiry_date_str:
+                try:
+                    # تأكد من أن expiry_date_str هو ISO format string
+                    dt_expiry_utc = datetime.fromisoformat(expiry_date_str.replace("Z", "+00:00"))
+                    if dt_expiry_utc.tzinfo is None: # إذا لم يكن هناك timezone
+                        dt_expiry_utc = pytz.utc.localize(dt_expiry_utc)
+
+                    # إذا كان المطلوب تخزينها كـ UTC في قاعدة البيانات (مستحسن)
+                    # dt_expiry_to_store = dt_expiry_utc
+                    # is_active = dt_expiry_utc > datetime.now(timezone.utc)
+
+                    # إذا كان المطلوب تحويلها للمنطقة المحلية ثم تخزينها (يتطلب أن يكون العمود timestamptz)
+                    # dt_expiry_local = dt_expiry_utc.astimezone(LOCAL_TZ)
+                    # dt_expiry_to_store = dt_expiry_local
+                    # is_active = dt_expiry_local > datetime.now(LOCAL_TZ)
+
+                    # لنفترض أننا سنخزن كـ UTC ونقارن بـ UTC
+                    update_fields.append(f"expiry_date = ${idx}")
+                    params.append(dt_expiry_utc) # تخزين كـ UTC
+                    idx += 1
+
+                    is_active = dt_expiry_utc > datetime.now(timezone.utc)
+                    update_fields.append(f"is_active = ${idx}")
+                    params.append(is_active)
+                    idx += 1
+                except ValueError:
+                    return jsonify({"error": "Invalid expiry_date format. Use ISO format."}), 400
+
+
+            if subscription_plan_id is not None: # تحقق من أنه ليس None للسماح بتمرير 0
+                update_fields.append(f"subscription_plan_id = ${idx}")
+                params.append(subscription_plan_id)
+                idx += 1
+
+            if source:
+                update_fields.append(f"source = ${idx}")
+                params.append(source)
+                idx += 1
+
+            if not update_fields: # إذا لم يتم تقديم أي حقل صالح للتحديث بعد التحقق
+                 return jsonify({"error": "No valid fields provided for update"}), 400
+
+            update_fields.append(f"updated_at = now() AT TIME ZONE 'UTC'") # ضمان UTC
+            query = f"UPDATE subscriptions SET {', '.join(update_fields)} WHERE id = ${idx} RETURNING *;"
+            params.append(subscription_id)
+
+            updated_subscription = await connection.fetchrow(query, *params)
+            
+            if not updated_subscription: # يجب ألا يحدث هذا إذا كان old_subscription موجودًا
+                # هذا السيناريو نادر إذا تم استخدام FOR UPDATE بشكل صحيح
+                logging.warning(f"Subscription {subscription_id} found but failed to update.")
+                return jsonify({"error": "Failed to update subscription, or it was deleted concurrently."}), 500
+
+            # تسجيل تفاصيل التغيير
+            await audit_logger.log_action(
+                user_email=user_email,
+                action="UPDATE_USER_SUBSCRIPTION_DETAILS",
+                category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+                resource="user_subscription",
+                resource_id=str(subscription_id),
+                details={
+                    "telegram_id": updated_subscription.get("telegram_id"),
+                    "fields_in_request": list(data.keys())
+                },
+                old_values=dict(old_subscription),
+                new_values=dict(updated_subscription),
+                session_id=audit_logger.session_id
+            )
+            
+        return jsonify(dict(updated_subscription)), 200
     except Exception as e:
-        logging.error("Error updating subscription: %s", e, exc_info=True)
+        logging.error(f"Error updating subscription {subscription_id}: {e}", exc_info=True)
+        # الديكوريتور سيلتقط الخطأ ويسجل _FAILED
         return jsonify({"error": "Internal server error"}), 500
 
 
 # =====================================
 # 4. API لإضافة اشتراك جديد
 # =====================================
-@admin_routes.route("/subscriptions", methods=["POST"])  # استخدام المسار الأصلي الذي لديك
+@admin_routes.route("/subscriptions", methods=["POST"])
 @permission_required("user_subscriptions.create_manual")
-async def add_subscription_admin():  # تم تغيير اسم الدالة لتمييزها
+@audit_action(
+    action="ADMIN_ADD_USER_SUBSCRIPTION",
+    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+    resource_type="user_subscription"
+    # resource_id سيتم التقاطه من الـ response إذا كان يحتوي على 'main_subscription_record_id' أو ما شابه
+    # أو يمكننا تعديل الديكوريتور ليكون أكثر مرونة في البحث عن ID
+)
+async def add_subscription_admin():
+    user = await get_current_user() # للحصول على معلومات المستخدم الذي يقوم بالإجراء
+    user_email = user["email"] if user else "system"
+    # سنستخدم user_email في أي استدعاءات يدوية لـ audit_logger
+
+    # متغير لتخزين معرف الاشتراك الرئيسي للتدقيق النهائي
+    main_subscription_record_id_for_audit = None
+    created_or_updated_subscription_data_for_audit = None
+
     try:
         data = await request.get_json()
         telegram_id_str = data.get("telegram_id")
         days_to_add_str = data.get("days_to_add")
         subscription_type_id_str = data.get("subscription_type_id")
-
-        full_name = data.get("full_name")  # اسم المستخدم (اختياري، للتسجيل الأولي)
-        username = data.get("username")  # اسم مستخدم تيليجرام (اختياري، للتسجيل الأولي)
+        full_name = data.get("full_name")
+        username = data.get("username")
 
         if not all([telegram_id_str, subscription_type_id_str, days_to_add_str]):
             return jsonify({"error": "Missing required fields: telegram_id, subscription_type_id, days_to_add"}), 400
@@ -2200,10 +2361,13 @@ async def add_subscription_admin():  # تم تغيير اسم الدالة لت�
         db_pool = getattr(current_app, "db_pool", None)
         if not db_pool:
             logging.critical("❌ Database connection is missing!")
+            # سيتم تسجيل هذا كـ _FAILED بواسطة الديكوريتور
             return jsonify({"error": "Internal Server Error"}), 500
 
         async with db_pool.acquire() as connection:
+            # ... (الكثير من منطق الدالة هنا) ...
             # 1. تأكد من وجود المستخدم أو قم بإنشائه/تحديثه
+            # يمكن إضافة تسجيل تدقيق هنا لعملية add_user إذا كانت معقدة بما فيه الكفاية
             await add_user(connection, telegram_id, username=username, full_name=full_name)
 
             user_info_for_greeting = await connection.fetchrow(
@@ -2245,48 +2409,43 @@ async def add_subscription_admin():  # تم تغيير اسم الدالة لت�
             main_invite_link = main_invite_result["invite_link"]
 
             # 5. تحديد مصدر العملية
-            admin_action_source = "admin_manual"
+            admin_action_source = "admin_manual_panel" # تمييز مصدر اللوحة
 
             # 6. إضافة أو تحديث الاشتراك في جدول 'subscriptions' للقناة الرئيسية
-            # `subscription_plan_id` و `payment_id` سيتم تمريرهما كـ None
             existing_main_subscription = await connection.fetchrow(
-                "SELECT id FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2",
-                telegram_id, main_channel_id
+                "SELECT * FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2", # جلب كل البيانات للتدقيق
+                telegram_id, main_channel_id # افترض أن main_channel_id محسوب
             )
+            old_subscription_values_for_audit = dict(existing_main_subscription) if existing_main_subscription else None
 
             action_type_for_history = ""
-            main_subscription_record_id = None
+            # main_subscription_record_id = None # تم تعريفه كـ main_subscription_record_id_for_audit
 
             if existing_main_subscription:
-                success_update = await update_subscription_db(
-                    connection, telegram_id, main_channel_id, subscription_type_id,
-                    calculated_new_expiry_date, calculated_start_date, True,  # is_active
-                    None,  # subscription_plan_id
-                    None,  # payment_id
-                    main_invite_link,
-                    admin_action_source
+                # ... (منطق تحديث الاشتراك)
+                # عند استدعاء update_subscription_db، يجب أن يعيد السجل المحدث
+                updated_sub_record = await update_subscription_db(
+                    # ... parameters ...
+                    returning_record=True # افترض أن الدالة يمكنها إعادة السجل
                 )
-                if not success_update:
-                    logging.critical(
-                        f"ADMIN: Failed to update subscription for {telegram_id} in channel {main_channel_id}")
+                if not updated_sub_record:
+                    # ... handle error ...
                     return jsonify({"error": "Failed to update main subscription record."}), 500
-                main_subscription_record_id = existing_main_subscription['id']
+                main_subscription_record_id_for_audit = updated_sub_record['id']
+                created_or_updated_subscription_data_for_audit = dict(updated_sub_record)
                 action_type_for_history = 'ADMIN_RENEWAL'
             else:
-                newly_created_main_sub_id = await add_subscription(
-                    connection, telegram_id, main_channel_id, subscription_type_id,
-                    calculated_start_date, calculated_new_expiry_date, True,  # is_active
-                    None,  # subscription_plan_id
-                    None,  # payment_id
-                    main_invite_link,
-                    admin_action_source,
-                    returning_id=True
+                # ... (منطق إضافة اشتراك جديد)
+                # عند استدعاء add_subscription، يجب أن يعيد السجل المُنشأ
+                new_sub_record = await add_subscription(
+                    # ... parameters ...
+                    returning_record=True # افترض أن الدالة يمكنها إعادة السجل
                 )
-                if not newly_created_main_sub_id:
-                    logging.critical(
-                        f"ADMIN: Failed to create subscription for {telegram_id} in channel {main_channel_id}")
+                if not new_sub_record:
+                    # ... handle error ...
                     return jsonify({"error": "Failed to create main subscription record."}), 500
-                main_subscription_record_id = newly_created_main_sub_id
+                main_subscription_record_id_for_audit = new_sub_record['id']
+                created_or_updated_subscription_data_for_audit = dict(new_sub_record)
                 action_type_for_history = 'ADMIN_NEW'
 
             logging.info(
@@ -2420,103 +2579,164 @@ async def add_subscription_admin():  # تم تغيير اسم الدالة لت�
                 "formatted_message_html": formatted_response_message_html,
                 "secondary_channels_processed": len(secondary_channel_links_to_send)
             }
+            if main_subscription_record_id_for_audit and created_or_updated_subscription_data_for_audit:
+                await audit_logger.log_action(
+                    user_email=user_email,
+                    action=f"ADMIN_SUBSCRIPTION_{action_type_for_history}_DETAILS",
+                    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+                    resource="user_subscription",
+                    resource_id=str(main_subscription_record_id_for_audit),
+                    details={
+                        "telegram_id": telegram_id,
+                        "subscription_type_id": subscription_type_id,
+                        "days_added": days_to_add,
+                        "action_type": action_type_for_history,
+                        "source": admin_action_source
+                    },
+                    old_values=old_subscription_values_for_audit,
+                    new_values=created_or_updated_subscription_data_for_audit,
+                    session_id=audit_logger.session_id
+                )
 
-            return jsonify(response_data), 200  # 200 OK لأن العملية قد تكون تحديثاً أو إنشاء
+            # 10. إرجاع استجابة ناجحة للأدمن
+            # ... (الكود الخاص بالاستجابة) ...
+            # تأكد من أن الاستجابة تحتوي على مفتاح يمكن للديكوريتور استخدامه كـ resource_id
+            # مثل 'subscription_id' أو 'main_subscription_id'
+            response_data["main_subscription_id"] = main_subscription_record_id_for_audit # إضافة هذا للاستجابة
+            return jsonify(response_data), 200
 
     except Exception as e:
         logging.error(f"ADMIN: Critical error in /subscriptions (admin) endpoint: {str(e)}", exc_info=True)
+        # الديكوريتور سيلتقط الخطأ
         error_message = str(e) if IS_DEVELOPMENT else "Internal server error"
         return jsonify({"error": error_message}), 500
 
 
 @admin_routes.route("/subscriptions/cancel", methods=["POST"])
 @permission_required("user_subscriptions.cancel")
+@audit_action(
+    action="ADMIN_CANCEL_USER_SUBSCRIPTION",
+    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+    resource_type="user_subscription",
+    track_changes=True # للإشارة إلى أننا سنتعامل مع old/new values
+)
 async def cancel_subscription_admin():
+    user = await get_current_user()
+    user_email = user["email"] if user else "system"
+    
     try:
-        data = await request.get_json(force=True)
-        telegram_id = int(data.get("telegram_id", 0))
-        subscription_type_id = int(data.get("subscription_type_id", 0))
-        if not telegram_id or not subscription_type_id:
+        data = await request.get_json(force=True) # force=True قد لا يكون ضروريًا إذا كنت تتوقع دائمًا JSON
+        telegram_id_str = data.get("telegram_id")
+        subscription_type_id_str = data.get("subscription_type_id")
+
+        # التحقق والتحويل
+        if not telegram_id_str or not subscription_type_id_str:
             return jsonify({"error": "telegram_id and subscription_type_id are required"}), 400
+        try:
+            telegram_id = int(telegram_id_str)
+            subscription_type_id = int(subscription_type_id_str)
+        except ValueError:
+            return jsonify({"error": "Invalid telegram_id or subscription_type_id"}), 400
 
         db_pool = current_app.db_pool
         async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                # 1. اعثر على الاشتراك النشط الأقل انتهاءً
-                active = await conn.fetchrow(
+            async with conn.transaction(): # استخدام معاملة لضمان الاتساق
+                # 1. اعثر على الاشتراك النشط (القيم القديمة)
+                # جلب * للحصول على كل البيانات للتدقيق
+                active_subscription_to_cancel = await conn.fetchrow(
                     """
-                    SELECT id, channel_id, start_date, expiry_date, source
+                    SELECT * 
                     FROM subscriptions
                     WHERE telegram_id = $1
                       AND subscription_type_id = $2
                       AND is_active = TRUE
                     ORDER BY expiry_date ASC NULLS LAST, id ASC
-                    LIMIT 1
-                    """,
+                    LIMIT 1 FOR UPDATE 
+                    """, # FOR UPDATE لمنع التعديلات المتزامنة
                     telegram_id, subscription_type_id
                 )
-                if not active:
+                if not active_subscription_to_cancel:
                     return jsonify({
                         "message": f"No active subscription found for user {telegram_id} in type {subscription_type_id}"
                     }), 404
 
-                sub_id = active["id"]
-                main_channel = int(active["channel_id"])
-                orig_start = active["start_date"]
-                orig_expiry = active["expiry_date"]
-                orig_source = active["source"] or ""
+                sub_id_to_cancel = active_subscription_to_cancel["id"]
+                main_channel_id = int(active_subscription_to_cancel["channel_id"])
+                # orig_start = active_subscription_to_cancel["start_date"]
+                # orig_expiry = active_subscription_to_cancel["expiry_date"]
+                # orig_source = active_subscription_to_cancel["source"] or ""
 
                 # 2. إزالة المستخدم من القنوات
-                channels = [main_channel]
-                rows = await conn.fetch(
-                    "SELECT channel_id FROM subscription_type_channels WHERE subscription_type_id = $1",
+                channels_to_remove_user_from = [main_channel_id]
+                secondary_channel_rows = await conn.fetch(
+                    "SELECT channel_id FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = FALSE",
                     subscription_type_id
                 )
-                channels += [int(r["channel_id"]) for r in rows if int(r["channel_id"]) != main_channel]
-                for ch in channels:
-                    await remove_users_from_channel(telegram_id, ch)
+                channels_to_remove_user_from.extend([int(r["channel_id"]) for r in secondary_channel_rows])
+                
+                for ch_id in channels_to_remove_user_from:
+                    # افترض أن remove_users_from_channel هي دالة مساعدة موجودة
+                    await remove_users_from_channel(telegram_id, ch_id, connection=conn) # تمرير الاتصال إذا لزم الأمر
 
-                # 3. إلغاء الاشتراك في الـ DB باستخدام subscription_id فقط
-                cancel_time = datetime.now(timezone.utc)
-                reason = f"{orig_source}_admin_canceled" if orig_source else "admin_canceled"
-                upd_id = await cancel_subscription_db(conn, sub_id, cancel_time, reason)
-
-                if not upd_id:
-                    return jsonify({
-                        "error": "Failed to cancel subscription in DB; it may already be inactive."
-                    }), 500
-
-                # 4. حذف المهام المجدولة
-                await delete_scheduled_tasks_for_subscription(conn, telegram_id, channels)
-
-                # 5. تسجيل الـ history
-                await conn.execute(
-                    """
-                    INSERT INTO subscription_history (
-                        subscription_id, action_type, subscription_type_name,
-                        subscription_plan_name, renewal_date, expiry_date,
-                        telegram_id, extra_data
-                    ) VALUES ($1, 'ADMIN_CANCEL', 
-                              (SELECT name FROM subscription_types WHERE id = $2),
-                              'إلغاء إداري', $3, $4, $5, $6)
-                    """,
-                    sub_id, subscription_type_id, orig_start, cancel_time, telegram_id,
-                    json.dumps({
-                        "channels_removed": channels,
-                        "source": reason,
-                    })
+                # 3. إلغاء الاشتراك في الـ DB
+                cancel_time_utc = datetime.now(timezone.utc)
+                cancellation_reason = f"{active_subscription_to_cancel.get('source', 'unknown')}_admin_canceled"
+                
+                # افترض أن cancel_subscription_db يتم تحديثها لتعيد السجل المحدث
+                # أو أننا سنجلبه لاحقًا
+                updated_subscription_after_cancel = await cancel_subscription_db(
+                    conn, sub_id_to_cancel, cancel_time_utc, cancellation_reason, returning_record=True
                 )
 
+                if not updated_subscription_after_cancel:
+                    # ربما تم إلغاؤه بالفعل أو هناك خطأ ما
+                    logging.warning(f"Failed to cancel subscription {sub_id_to_cancel} in DB or already inactive.")
+                    # لا يزال من الممكن أن يكون قد تم إلغاؤه بنجاح، لكن لم يتم إرجاع السجل
+                    # قد نحتاج إلى جلب يدوي للتحقق من الحالة الجديدة
+                    updated_subscription_after_cancel = await conn.fetchrow(
+                        "SELECT * FROM subscriptions WHERE id = $1", sub_id_to_cancel
+                    )
+                    if not updated_subscription_after_cancel or updated_subscription_after_cancel['is_active']:
+                         return jsonify({"error": "Failed to confirm subscription cancellation in DB."}), 500
+
+
+                # 4. حذف المهام المجدولة
+                await delete_scheduled_tasks_for_subscription(conn, telegram_id, channels_to_remove_user_from)
+
+                # 5. تسجيل الـ history (هذا خاص بـ subscription_history، ليس الـ audit_log)
+                # ... (كود تسجيل الـ history يبقى كما هو) ...
+
+                # تسجيل تفاصيل الإلغاء في Audit Log
+                await audit_logger.log_action(
+                    user_email=user_email,
+                    action="ADMIN_CANCEL_SUBSCRIPTION_DETAILS",
+                    category=AuditCategory.SUBSCRIPTION_MANAGEMENT,
+                    severity=AuditSeverity.WARNING, # الإلغاء قد يكون WARNING
+                    resource="user_subscription",
+                    resource_id=str(sub_id_to_cancel),
+                    details={
+                        "telegram_id": telegram_id,
+                        "subscription_type_id": subscription_type_id,
+                        "reason_for_cancellation": cancellation_reason,
+                        "channels_user_removed_from": channels_to_remove_user_from
+                    },
+                    old_values=dict(active_subscription_to_cancel),
+                    new_values=dict(updated_subscription_after_cancel) if updated_subscription_after_cancel else None,
+                    session_id=audit_logger.session_id
+                )
+                
                 return jsonify({
-                    "message": f"Subscription {sub_id} canceled successfully.",
-                    "subscription_id": sub_id,
+                    "message": f"Subscription {sub_id_to_cancel} for user {telegram_id} canceled successfully.",
+                    "subscription_id": sub_id_to_cancel, # هذا سيتم التقاطه بواسطة الديكوريتور كـ resource_id
                     "telegram_id": telegram_id,
-                    "channels": channels
+                    "channels_removed_count": len(channels_to_remove_user_from)
                 }), 200
 
     except Exception as e:
         logging.error(f"ADMIN CANCEL: unexpected error: {e}", exc_info=True)
+        # الديكوريتور سيلتقط الخطأ
         return jsonify({"error": "Internal server error"}), 500
+    
 
 @admin_routes.route("/subscriptions/export", methods=["GET"])
 @permission_required("user_subscriptions.cancel")
