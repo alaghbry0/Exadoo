@@ -6,7 +6,7 @@ import json
 import os
 from decimal import Decimal, ROUND_DOWN, getcontext
 import aiohttp
-from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_payment_token, record_incoming_transaction
+from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_payment_token, record_incoming_transaction, add_user
 from pytoniq import LiteBalancer, begin_cell, Address
 from pytoniq.liteclient.client import LiteServerError
 from typing import Optional  # لإضافة تلميحات النوع
@@ -532,6 +532,24 @@ async def confirm_payment():
         amount = 0.0
         async with current_app.db_pool.acquire() as conn:
             try:
+                user_op_successful = await add_user(
+                    connection=conn,
+                    telegram_id=telegram_id,
+                    username=telegram_username,
+                    full_name=full_name
+
+                )
+                if user_op_successful:
+                    logging.info(f"👤 المستخدم {telegram_id} تم إضافته/تحديثه بنجاح في جدول users.")
+                else:
+                    # دالة add_user أعادت False, مما يعني خطأ داخلي تم تسجيله هناك
+                    logging.warning(f"⚠️ فشلت عملية إضافة/تحديث المستخدم {telegram_id} (يرجى مراجعة سجلات add_user).")
+            except Exception as e_user_update:
+                logging.error(f"❌ خطأ حرج أثناء محاولة إضافة/تحديث المستخدم {telegram_id}: {str(e_user_update)}",
+                              exc_info=True)
+
+
+            try:
                 query = "SELECT price FROM subscription_plans WHERE id = $1"
                 record_price = await conn.fetchrow(query, subscription_plan_id) # تم تغيير اسم المتغير لتجنب التضارب مع record_payment
                 if record_price and record_price.get("price") is not None:
@@ -582,26 +600,6 @@ async def confirm_payment():
             if result is None:
                 logging.error("❌ فشل تسجيل الدفعة بعد محاولات متعددة بسبب تضارب payment_token (لم يتم الوصول للنتيجة).")
                 return jsonify({"error": "Failed to record payment after retries"}), 500
-
-            try:
-                await conn.execute('''
-                    INSERT INTO telegram_payments (
-                        payment_token,
-                        telegram_id,
-                        status,
-                        created_at
-                    ) VALUES (
-                        $1, $2, 'pending', CURRENT_TIMESTAMP
-                    )
-                    RETURNING payment_token
-                ''', payment_token, telegram_id)
-                logging.info(f"✅ تم تسجيل البيانات في جدول telegram_payments: {payment_token}")
-            except UniqueViolationError as uve:
-                # هذا السيناريو يجب أن يكون نادرًا جدًا إذا كان payment_token في telegram_payments
-                # هو نفسه الذي في الجدول الأول وعليه قيد التفرد أيضًا.
-                logging.warning(f"⚠️ تكرار في telegram_payments لرمز الدفع {payment_token}: {uve}")
-            except Exception as e:
-                logging.error(f"❌ خطأ أثناء تسجيل البيانات في جدول telegram_payments: {str(e)}")
 
         logging.info(f"✅ تم تسجيل الدفعة المعلقة بنجاح في قاعدة البيانات. payment_token={payment_token}")
         formatted_amount = f"{amount:.2f}"
