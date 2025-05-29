@@ -36,8 +36,6 @@ async def generate_channel_invite_link(telegram_id: int, channel_id: int, channe
             expire_date=expire_date
         )
         invite_link_str = invite_link_obj.invite_link
-        logging.info(
-            f"✅ تم إنشاء رابط دعوة للمستخدم {telegram_id} لقناة {channel_name} ({channel_id}): {invite_link_str}")
 
         return {
             "success": True,
