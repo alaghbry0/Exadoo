@@ -509,6 +509,121 @@ async def handle_join_request(join_request: ChatJoinRequest):
             logging.error(f"❌ فشل رفض طلب الانضمام بعد حدوث خطأ عام: {decline_error_general}")
 
 
+# 🔹 وظيفة إدارة المستخدم (إضافة أو تحديث)
+async def manage_user(connection, telegram_id, username=None, full_name=None):
+    """
+    إضافة مستخدم جديد أو تحديث بيانات مستخدم موجود
+    """
+    try:
+        # البحث عن المستخدم الحالي
+        async with current_app.db_pool.acquire() as connection:
+            # البحث عن المستخدم الحالي
+            existing_user = await connection.fetchrow(
+                "SELECT id, username, full_name FROM users WHERE telegram_id = $1",
+                telegram_id
+            )
+
+        if existing_user:
+            # تحديث البيانات إذا كانت مختلفة
+            update_needed = False
+            current_username = existing_user['username']
+            current_full_name = existing_user['full_name']
+
+            if username and username != current_username:
+                update_needed = True
+            if full_name and full_name != current_full_name:
+                update_needed = True
+
+            if update_needed:
+                await connection.execute("""
+                    UPDATE users 
+                    SET username = COALESCE($2, username),
+                        full_name = COALESCE($3, full_name)
+                    WHERE telegram_id = $1
+                """, telegram_id, username, full_name)
+                logging.info(f"✅ تم تحديث بيانات المستخدم {telegram_id}")
+
+            return existing_user['id']
+        else:
+            # إضافة مستخدم جديد
+            user_id = await connection.fetchval("""
+                INSERT INTO users (telegram_id, username, full_name)
+                VALUES ($1, $2, $3)
+                RETURNING id
+            """, telegram_id, username, full_name)
+            logging.info(f"✅ تم إضافة مستخدم جديد {telegram_id} بـ ID: {user_id}")
+            return user_id
+
+    except Exception as e:
+        logging.error(f"❌ خطأ في إدارة المستخدم {telegram_id}: {e}")
+        return None
+
+
+# 🔹 وظيفة تسجيل الدفعة الناجحة
+async def record_successful_payment(
+        user_db_id: int,
+        telegram_id: int,
+        plan_id: int,
+        payment_id: str, # يستخدم كـ tx_hash
+        payment_token: str,
+        amount: float,
+        username: Optional[str] = None,
+        full_name: Optional[str] = None
+):
+    """
+    تسجيل الدفعة الناجحة في جدول payments.
+    يتم تعيين created_at و processed_at إلى الوقت الحالي (UTC+3) عند التسجيل.
+    """
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            # التوقيت الحالي المحسوب في قاعدة البيانات (UTC+3)
+            db_timestamp_expression = "(NOW() AT TIME ZONE 'UTC' + INTERVAL '3 hours')::timestamp"
+
+            payment_record_id = await connection.fetchval(f"""
+                INSERT INTO payments (
+                    user_id,
+                    telegram_id,
+                    subscription_plan_id,
+                    amount,
+                    status,
+                    currency,
+                    payment_token,
+                    tx_hash,
+                    username,
+                    full_name,
+                    payment_method,
+                    processed_at,  -- سيتم تعيينه بواسطة SQL
+                    created_at     -- سيتم تعيينه بواسطة SQL
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8,
+                    COALESCE($9, NULL),  -- username
+                    COALESCE($10, NULL), -- full_name
+                    $11,                 -- payment_method
+                    {db_timestamp_expression}, -- processed_at
+                    {db_timestamp_expression}  -- created_at
+                )
+                RETURNING id
+            """,
+                user_db_id,             # $1
+                telegram_id,            # $2
+                plan_id,                # $3
+                amount,                 # $4
+                'completed',            # $5 status
+                'Stars',       # $6 currency
+                payment_token,          # $7 payment_token
+                payment_id,             # $8 tx_hash (using payment_id from Telegram)
+                username,               # $9 username
+                full_name,              # $10 full_name
+                'Telegram stars'        # $11 payment_method
+            )
+
+            logging.info(f"✅ تم تسجيل الدفعة الناجحة برقم {payment_record_id}")
+            return payment_record_id
+
+    except Exception as e:
+        logging.error(f"❌ خطأ في تسجيل الدفعة: {e}")
+        return None
+
 # 🔹 وظيفة معالجة الدفع الناجح مع آلية إعادة المحاولة
 async def process_successful_payment_with_retry(
         telegram_id,
