@@ -1978,8 +1978,7 @@ async def get_incoming_transactions():
         page_size = int(request.args.get("page_size", 20))
         offset = (page - 1) * page_size
 
-        # استخراج الفلاتر من الطلب
-        processed_filter_str = request.args.get("processed")  # سيكون "true", "false", أو "all"
+        processed_filter_str = request.args.get("processed")
         start_date_filter = request.args.get("start_date")
         end_date_filter = request.args.get("end_date")
         search_term = request.args.get("search", "").strip()
@@ -1990,131 +1989,132 @@ async def get_incoming_transactions():
                 it.processed, it.received_at, it.memo, it.txhash_base64
             FROM incoming_transactions it
         """
-
         count_base_query_select = """
             SELECT COUNT(it.txhash) as total
             FROM incoming_transactions it
         """
 
-        where_clauses = ["1=1"]
-        where_params = []
+        # --- بناء جملة WHERE والمعاملات للاستعلام الرئيسي ---
+        main_where_clauses = []
+        main_where_params = []
+        param_idx_main = 1  # لبدء ترقيم المعاملات من $1
 
-        # 1. فلتر الحالة (Processed)
+        # 1. فلتر الحالة (Processed) للاستعلام الرئيسي
         if processed_filter_str and processed_filter_str.lower() != "all":
             try:
-                # تحويل "true" أو "false" إلى قيمة boolean
                 processed_val = processed_filter_str.lower() == "true"
-                where_clauses.append(f"it.processed = ${len(where_params) + 1}")
-                where_params.append(processed_val)
+                main_where_clauses.append(f"it.processed = ${param_idx_main}")
+                main_where_params.append(processed_val)
+                param_idx_main += 1
             except ValueError:
                 logging.warning(f"Invalid processed filter value: {processed_filter_str}")
-        # إذا لم يتم تحديد فلتر (أو كان 'all')، لا نضيف شيئاً لـ where_clauses بخصوص processed
 
-        # 2. فلاتر التاريخ (Date filters on received_at)
+        # 2. فلاتر التاريخ للاستعلام الرئيسي
         if start_date_filter and start_date_filter.strip():
-            where_clauses.append(f"it.received_at >= ${len(where_params) + 1}::TIMESTAMP")
-            where_params.append(start_date_filter)
-
+            main_where_clauses.append(f"it.received_at >= ${param_idx_main}::TIMESTAMP")
+            main_where_params.append(start_date_filter)
+            param_idx_main += 1
         if end_date_filter and end_date_filter.strip():
-            where_clauses.append(f"it.received_at <= ${len(where_params) + 1}::TIMESTAMP")
-            where_params.append(end_date_filter)
+            main_where_clauses.append(f"it.received_at <= ${param_idx_main}::TIMESTAMP")
+            main_where_params.append(end_date_filter)
+            param_idx_main += 1
 
-        # 3. فلتر البحث (Search term)
+        # 3. فلتر البحث للاستعلام الرئيسي
         if search_term:
             search_pattern = f"%{search_term}%"
-            search_conditions = []
-            current_param_index = len(where_params)
+            search_conditions_main = []
+            search_fields = ["it.txhash", "it.sender_address", "it.memo", "it.payment_token"]
+            for field in search_fields:
+                search_conditions_main.append(f"{field} ILIKE ${param_idx_main}")
+                main_where_params.append(search_pattern)
+                param_idx_main += 1
+            if search_conditions_main:
+                main_where_clauses.append(f"({' OR '.join(search_conditions_main)})")
 
-            search_conditions.append(f"it.txhash ILIKE ${current_param_index + 1}")
-            where_params.append(search_pattern)
-            current_param_index += 1
-
-            search_conditions.append(f"it.sender_address ILIKE ${current_param_index + 1}")
-            where_params.append(search_pattern)
-            current_param_index += 1
-
-            search_conditions.append(f"it.memo ILIKE ${current_param_index + 1}")
-            where_params.append(search_pattern)
-            current_param_index += 1
-
-            search_conditions.append(f"it.payment_token ILIKE ${current_param_index + 1}")
-            where_params.append(search_pattern)
-            # current_param_index += 1 # لا حاجة لزيادته هنا
-
-            where_clauses.append(f"({' OR '.join(search_conditions)})")
-
-        # --- بناء جملة WHERE النهائية ---
-        where_sql = " AND ".join(where_clauses) if len(where_clauses) > 1 else where_clauses[0]
+        main_where_sql = " AND ".join(main_where_clauses) if main_where_clauses else "1=1"
 
         # --- استعلام البيانات الرئيسي ---
-        query_final_params = list(where_params)
+        query_final_params = list(main_where_params)  # نسخة من المعاملات
         query = f"""
             {base_query_select}
-            WHERE {where_sql}
+            WHERE {main_where_sql}
             ORDER BY it.received_at DESC 
-            LIMIT ${len(query_final_params) + 1} OFFSET ${len(query_final_params) + 2}
+            LIMIT ${param_idx_main} OFFSET ${param_idx_main + 1}
         """
-        query_final_params.append(page_size)
-        query_final_params.append(offset)
+        query_final_params.extend([page_size, offset])
 
-        # --- استعلام العد ---
+        # --- استعلام العد الكلي (المفلتر) ---
         count_query = f"""
             {count_base_query_select}
-            WHERE {where_sql}
+            WHERE {main_where_sql}
+        """
+
+        # --- بناء جملة WHERE والمعاملات لعد المعاملات المعالجة (processed_count) ---
+        # هذا العد يجب أن يطبق جميع الفلاتر الأخرى (التاريخ، البحث) ثم يضيف شرط processed = true
+
+        processed_count_clauses = []
+        processed_count_params = []
+        param_idx_processed_count = 1
+
+        # أ. فلاتر التاريخ لعد المعاملات المعالجة
+        if start_date_filter and start_date_filter.strip():
+            processed_count_clauses.append(f"it.received_at >= ${param_idx_processed_count}::TIMESTAMP")
+            processed_count_params.append(start_date_filter)
+            param_idx_processed_count += 1
+        if end_date_filter and end_date_filter.strip():
+            processed_count_clauses.append(f"it.received_at <= ${param_idx_processed_count}::TIMESTAMP")
+            processed_count_params.append(end_date_filter)
+            param_idx_processed_count += 1
+
+        # ب. فلتر البحث لعد المعاملات المعالجة
+        if search_term:
+            search_pattern = f"%{search_term}%"
+            search_conditions_processed_count = []
+            search_fields_for_processed_count = ["it.txhash", "it.sender_address", "it.memo", "it.payment_token"]
+            for field in search_fields_for_processed_count:
+                search_conditions_processed_count.append(f"{field} ILIKE ${param_idx_processed_count}")
+                processed_count_params.append(search_pattern)
+                param_idx_processed_count += 1
+            if search_conditions_processed_count:
+                processed_count_clauses.append(f"({' OR '.join(search_conditions_processed_count)})")
+
+        # ج. إضافة شرط أن المعاملة معالجة (processed = True) بشكل إلزامي لهذا العد
+        processed_count_clauses.append(f"it.processed = ${param_idx_processed_count}")
+        processed_count_params.append(True)
+        # param_idx_processed_count += 1 # ليس ضروريًا بعد الآن
+
+        processed_count_where_sql = " AND ".join(processed_count_clauses) if processed_count_clauses else "1=1"
+        # بما أننا نضيف دائماً it.processed = $N، فلن تكون القائمة فارغة، لذا يمكننا إزالة "else '1=1'" إذا أردنا
+        # ولكن للسلامة، يمكن تركها. الأصح هو `WHERE {processed_count_where_sql}` فقط لأنها لن تكون فارغة.
+
+        processed_count_query_sql = f"""
+            SELECT COUNT(it.txhash) as processed_count
+            FROM incoming_transactions it
+            WHERE {processed_count_where_sql}
         """
 
         rows_data = []
         total_records = 0
-        processed_transactions_count = 0  # لحساب عدد المعاملات المعالجة
+        processed_transactions_count = 0
 
         async with current_app.db_pool.acquire() as connection:
-            # تنفيذ استعلام البيانات
             rows_result = await connection.fetch(query, *query_final_params)
             rows_data = [dict(row) for row in rows_result]
 
-            # تنفيذ استعلام العدد الكلي (المفلتر)
-            count_result_row = await connection.fetchrow(count_query, *where_params)
+            count_result_row = await connection.fetchrow(count_query, *main_where_params)
             if count_result_row and "total" in count_result_row:
                 total_records = count_result_row["total"]
 
-            # إحصائية عدد المعاملات المعالجة (يمكن أن تكون مفلترة أو غير مفلترة)
-            # لجعلها مفلترة، أضف where_sql و where_params. حاليًا هي غير مفلترة.
-            # لجعلها تتبع نفس الفلاتر (باستثناء فلتر processed نفسه إذا أردت إجمالي المعالج بغض النظر عن الفلتر الحالي):
-            processed_count_where_clauses = list(where_clauses)  # ابدأ بنسخة من الفلاتر الرئيسية
-            processed_count_where_params = list(where_params)
-
-            # تأكد من أن فلتر `processed` موجود ويشير إلى `true`
-            # إذا كان الفلتر الرئيسي لـ `processed` هو 'all' أو 'false'، فسنحتاج لتجاوزه هنا
-            # أو بناء where_clauses جديدة خصيصًا لهذا العد
-
-            # أبسط طريقة هي عد المعاملات المعالجة التي تطابق الفلاتر *الأخرى*
-            specific_processed_where_clauses = [wc for wc in where_clauses if "it.processed" not in wc]
-            specific_processed_where_params = [wp for i, wp in enumerate(where_params) if
-                                               "it.processed" not in where_clauses[
-                                                   i + 1]]  # (i+1) لأن where_clauses[0] هو '1=1'
-
-            specific_processed_where_clauses.append(f"it.processed = ${len(specific_processed_where_params) + 1}")
-            specific_processed_where_params.append(True)
-
-            processed_count_where_sql = " AND ".join(specific_processed_where_clauses) if len(
-                specific_processed_where_clauses) > 1 else specific_processed_where_clauses[0]
-
-            processed_count_query_sql = f"""
-                SELECT COUNT(it.txhash) as processed_count
-                FROM incoming_transactions it
-                WHERE {processed_count_where_sql}
-            """
-            processed_count_result_row = await connection.fetchrow(processed_count_query_sql,
-                                                                   *specific_processed_where_params)
+            processed_count_result_row = await connection.fetchrow(processed_count_query_sql, *processed_count_params)
             if processed_count_result_row and "processed_count" in processed_count_result_row:
                 processed_transactions_count = processed_count_result_row["processed_count"]
 
         response = {
             "data": rows_data,
-            "total": total_records,  # تم التغيير من totalCount إلى total
+            "total": total_records,
             "page": page,
-            "page_size": page_size,  # تم التغيير من pageSize إلى page_size
-            "processed_count": processed_transactions_count,  # إحصائية جديدة
+            "page_size": page_size,
+            "processed_count": processed_transactions_count,
         }
         return jsonify(response)
 
