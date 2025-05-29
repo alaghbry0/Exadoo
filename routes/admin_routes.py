@@ -369,10 +369,10 @@ async def get_user_details(telegram_id):
 
             # حساب إجمالي المدفوعات
             payments_query = """
-                SELECT COALESCE(SUM(amount), 0) as total_payments,
+                SELECT COALESCE(SUM(amount_received), 0) as total_payments,
                        COUNT(*) as payment_count
                 FROM payments
-                WHERE telegram_id = $1 AND status = 'completed'
+                WHERE telegram_id = $1 AND status = 'completed' AND currency = 'USDT'
             """
             payment_data = await conn.fetchrow(payments_query, telegram_id)
 
@@ -392,6 +392,7 @@ async def get_user_details(telegram_id):
                 SELECT id, amount, created_at, status, payment_method, payment_token, currency
                 FROM payments
                 WHERE telegram_id = $1
+                AND status = 'completed'
                 ORDER BY created_at DESC
                 LIMIT 5
             """
@@ -3020,7 +3021,7 @@ async def get_dashboard_stats():
                     (SELECT COUNT(*) FROM payments WHERE status = 'completed') as completed_payments,
 
                     -- إجمالي الإيرادات من المدفوعات المكتملة بعملة USDT فقط
-                    (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE status = 'completed' AND currency = 'USDT') as total_revenue,
+                    (SELECT COALESCE(SUM(amount_received), 0) FROM payments WHERE status = 'completed' AND currency = 'USDT') as total_revenue,
 
                     -- إجمالي عدد المستخدمين من جدول users
                     (SELECT COUNT(*) FROM users) as total_users,
@@ -3082,9 +3083,10 @@ async def get_revenue_chart():
                 query = """
                     SELECT 
                         DATE(created_at) as date,
-                        COALESCE(SUM(amount), 0) as revenue
+                        COALESCE(SUM(amount_received), 0) as revenue
                     FROM payments 
                     WHERE status = 'completed' 
+                    AND currency = 'USDT'
                     AND created_at >= CURRENT_DATE - INTERVAL '7 days'
                     GROUP BY DATE(created_at)
                     ORDER BY date
@@ -3093,9 +3095,10 @@ async def get_revenue_chart():
                 query = """
                     SELECT 
                         DATE(created_at) as date,
-                        COALESCE(SUM(amount), 0) as revenue
+                        COALESCE(SUM(amount_received), 0) as revenue
                     FROM payments 
                     WHERE status = 'completed' 
+                    AND currency = 'USDT'
                     AND created_at >= CURRENT_DATE - INTERVAL '30 days'
                     GROUP BY DATE(created_at)
                     ORDER BY date
@@ -3104,9 +3107,10 @@ async def get_revenue_chart():
                 query = """
                     SELECT 
                         DATE_TRUNC('month', created_at) as date,
-                        COALESCE(SUM(amount), 0) as revenue
+                        COALESCE(SUM(amount_received), 0) as revenue
                     FROM payments 
                     WHERE status = 'completed' 
+                    AND currency = 'USDT'
                     AND created_at >= CURRENT_DATE - INTERVAL '6 months'
                     GROUP BY DATE_TRUNC('month', created_at)
                     ORDER BY date
