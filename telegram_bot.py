@@ -655,7 +655,6 @@ async def process_successful_payment_with_retry(
                     # 2. تسجيل الدفعة الناجحة
                     #    نمرر 'connection' المكتسبة لهذه الدالة
                     payment_record_id = await record_successful_payment(
-                        connection,
                         user_db_id,
                         telegram_id,
                         plan_id,

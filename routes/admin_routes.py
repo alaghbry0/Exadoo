@@ -3019,8 +3019,8 @@ async def get_dashboard_stats():
                     -- إجمالي المدفوعات المكتملة
                     (SELECT COUNT(*) FROM payments WHERE status = 'completed') as completed_payments,
 
-                    -- إجمالي الإيرادات من المدفوعات المكتملة
-                    (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE status = 'completed') as total_revenue,
+                    -- إجمالي الإيرادات من المدفوعات المكتملة بعملة USDT فقط
+                    (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE status = 'completed' AND currency = 'USDT') as total_revenue,
 
                     -- إجمالي عدد المستخدمين من جدول users
                     (SELECT COUNT(*) FROM users) as total_users,
@@ -3063,10 +3063,6 @@ async def get_dashboard_stats():
                 # إذا كان current_new_users هو 0 و previous_period_count هو 0، فالنسبة 0
 
             stats['user_growth_percentage'] = round(growth_percentage, 1)
-
-            # إزالة الحقول القديمة إذا لم تعد مستخدمة (كانت من subscription_history)
-            # stats.pop('new_users_this_month', None)
-            # stats.pop('growth_percentage', None) # اسميناه الآن user_growth_percentage
 
             return jsonify(stats)
 
