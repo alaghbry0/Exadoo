@@ -12,7 +12,7 @@ from utils.permissions import permission_required, owner_required, log_action
 import asyncpg
 import asyncio
 from utils.notifications import create_notification
-from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user
+from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user, generate_shared_invite_link_for_channel
 import io
 import pandas as pd
 from database.db_queries import (
@@ -736,7 +736,7 @@ async def update_subscription_type(type_id: int):
                 logging.info(
                     f"Processing {len(newly_added_secondary_channels_for_actions)} new secondary channels for type '{updated_type['name']}' (ID: {type_id})")
 
-                # جلب المشتركين النشطين مع تاريخ انتهاء اشتراكهم
+                # جلب المشتركين النشطين (كما هو)
                 active_subscribers_for_actions = await connection.fetch(
                     """
                     SELECT s.telegram_id, s.expiry_date, u.full_name, u.username 
@@ -746,110 +746,117 @@ async def update_subscription_type(type_id: int):
                       AND s.is_active = TRUE
                       AND s.expiry_date > NOW()
                     GROUP BY s.telegram_id, s.expiry_date, u.full_name, u.username; 
-                    """,  # أضفنا s.expiry_date إلى GROUP BY للتأكد من صحة الاستعلام
+                    """,
                     type_id
                 )
+
+                # <<< الخطوة الجديدة: إنشاء روابط الدعوة المشتركة للقنوات الجديدة >>>
+                shared_invite_links_map = {}  # {channel_id: "invite_link_str"}
+                if send_invites_for_new_channels and newly_added_secondary_channels_for_actions:
+                    logging.info(
+                        f"Generating shared invite links for {len(newly_added_secondary_channels_for_actions)} new channels.")
+                    for new_channel_data in newly_added_secondary_channels_for_actions:
+                        new_channel_id = new_channel_data['channel_id']
+                        new_channel_name = new_channel_data['channel_name']
+
+                        if new_channel_id == effective_main_channel_id_after_update:  # تجنب الرئيسية
+                            continue
+
+                        # اسم وصفي للرابط يمكن رؤيته في إعدادات القناة
+                        link_name_prefix = f"دعوة لـ {updated_type['name']}"
+
+                        invite_result = await generate_shared_invite_link_for_channel(
+                            channel_id=new_channel_id,
+                            channel_name=new_channel_name,
+                            link_name_prefix=link_name_prefix
+                        )
+                        if invite_result and invite_result.get("success"):
+                            shared_invite_links_map[new_channel_id] = invite_result.get("invite_link")
+                        else:
+                            logging.error(
+                                f"Failed to generate shared invite link for channel '{new_channel_name}' ({new_channel_id}). Error: {invite_result.get('error')}")
+                            # يمكنك هنا أن تقرر ما إذا كنت تريد إيقاف العملية أو المتابعة بدون هذا الرابط
 
                 if active_subscribers_for_actions:
                     logging.info(
                         f"Found {len(active_subscribers_for_actions)} active subscribers for type {type_id} for post-update actions.")
-                    for subscriber in active_subscribers_for_actions:
-                        subscriber_telegram_id = subscriber['telegram_id']
-                        subscriber_expiry_date = subscriber['expiry_date']  # هذا هو تاريخ انتهاء الاشتراك
 
-                        # 1. جدولة مهام 'remove_user' للقنوات الفرعية الجديدة
+                    for subscriber_idx, subscriber in enumerate(active_subscribers_for_actions):
+                        subscriber_telegram_id = subscriber['telegram_id']
+                        subscriber_expiry_date = subscriber['expiry_date']
+
+                        # 1. جدولة مهام 'remove_user' (كما هو)
                         for new_channel_data in newly_added_secondary_channels_for_actions:
                             new_channel_id = new_channel_data['channel_id']
-                            new_channel_name = new_channel_data['channel_name']
-
-                            # تأكد من أن هذه القناة ليست القناة الرئيسية (على الرغم من أنها يجب أن تكون مصفاة بالفعل)
                             if new_channel_id == effective_main_channel_id_after_update:
-                                logging.warning(
-                                    f"Skipping remove_user task scheduling for main channel {new_channel_id} which was mistakenly in new_secondary_channels list for user {subscriber_telegram_id}.")
                                 continue
-
                             await add_scheduled_task(
                                 connection=connection,
                                 task_type='remove_user',
                                 telegram_id=subscriber_telegram_id,
                                 channel_id=new_channel_id,
-                                execute_at=subscriber_expiry_date,  # استخدام تاريخ انتهاء اشتراك المستخدم
-                                clean_up=True  # عادةً ما يكون جيدًا لتجنب المهام المكررة
+                                execute_at=subscriber_expiry_date,
+                                clean_up=True
                             )
-                            # تم نقل اللوج داخل add_scheduled_task
-                            # logging.info(f"✅ Scheduled 'remove_user' for user {subscriber_telegram_id} from new channel '{new_channel_name}' ({new_channel_id}) at {subscriber_expiry_date}")
 
-                        # 2. إرسال روابط الدعوة إذا كان الخيار مفعلًا
-                        if send_invites_for_new_channels:
+                        # 2. إرسال روابط الدعوة إذا كان الخيار مفعلًا وكانت هناك روابط تم إنشاؤها
+                        if send_invites_for_new_channels and shared_invite_links_map:
                             full_name = subscriber.get('full_name')
                             username = subscriber.get('username')
                             user_identifier = full_name or (f"@{username}" if username else str(subscriber_telegram_id))
-                            channel_links_to_send_in_message = []
 
+                            channel_links_to_send_in_message = []
                             for new_channel_data in newly_added_secondary_channels_for_actions:
                                 new_channel_id = new_channel_data['channel_id']
                                 new_channel_name = new_channel_data['channel_name']
 
-                                # (تجنب إرسال دعوة للقناة الرئيسية إذا ظهرت هنا بالخطأ)
                                 if new_channel_id == effective_main_channel_id_after_update:
                                     continue
 
-                                logging.info(
-                                    f"Generating invite for user {subscriber_telegram_id} to new channel '{new_channel_name}' ({new_channel_id})")
-                                invite_result = {"success": False, "error": "Function not implemented in this example"}
-                                try:
-                                    invite_result = await generate_channel_invite_link(
-                                        telegram_id=subscriber_telegram_id,
-                                        channel_id=new_channel_id,
-                                        channel_name=new_channel_name
-                                    )
-                                except Exception as e_invite:
-                                    logging.error(
-                                        f"Exception in generate_channel_invite_link for {new_channel_id}: {e_invite}")
-                                    invite_result = {"success": False, "error": str(e_invite)}
-
-                                if invite_result and invite_result.get("success"):
-                                    invite_link_str = invite_result.get("invite_link")
+                                # استخدم الرابط المشترك الذي تم إنشاؤه مسبقًا
+                                invite_link_str = shared_invite_links_map.get(new_channel_id)
+                                if invite_link_str:
                                     channel_links_to_send_in_message.append(
                                         f"▫️ قناة <a href='{invite_link_str}'>{new_channel_name}</a>"
                                     )
-                                else:
-                                    error_msg = invite_result.get('error', 'Unknown error generating invite link')
-                                    logging.error(
-                                        f"Failed to generate invite for user {subscriber_telegram_id} to channel '{new_channel_name}': {error_msg}")
+                                # لا داعي للـ else هنا، فقد تم تسجيل الخطأ عند محاولة إنشاء الرابط المشترك
 
                             if channel_links_to_send_in_message:
                                 message_text = (
                                         f"📬 مرحبًا {user_identifier},\n\n"
                                         f"تمت إضافة قنوات جديدة إلى اشتراكك في \"<b>{updated_type['name']}</b>\":\n\n" +
                                         "\n".join(channel_links_to_send_in_message) +
-                                        "\n\n💡 هذه الروابط خاصة بك وصالحة لفترة محدودة. يرجى الانضمام في أقرب وقت."
+                                        "\n\n💡 هذه الروابط صالحة للاستخدام للانضمام. يرجى الانضمام في أقرب وقت."
                                 )
-                                sent_successfully = False
                                 try:
+                                    # أضف تأخير بسيط بين إرسال الرسائل للمستخدمين إذا كان عددهم كبيراً جداً
+                                    # لتجنب مشاكل flood مع send_message أيضاً (أقل شيوعاً ولكن ممكنة)
+                                    if subscriber_idx > 0 and subscriber_idx % 20 == 0:  # كل 20 رسالة
+                                        logging.info(
+                                            f"Pausing for 1 second before sending more messages (sent {subscriber_idx})")
+                                        await asyncio.sleep(1)
+
                                     sent_successfully = await send_message_to_user(subscriber_telegram_id, message_text)
+                                    if sent_successfully:
+                                        logging.info(
+                                            f"Sent aggregated invite links message to user {subscriber_telegram_id} for type {type_id}")
+                                    else:
+                                        logging.warning(
+                                            f"Failed to send aggregated invite links message to user {subscriber_telegram_id} for type {type_id}")
                                 except Exception as e_send:
                                     logging.error(
                                         f"Exception in send_message_to_user for {subscriber_telegram_id}: {e_send}")
-
-                                if sent_successfully:
-                                    logging.info(
-                                        f"Sent aggregated invite links message to user {subscriber_telegram_id} for type {type_id}")
-                                else:
-                                    logging.warning(
-                                        f"Failed to send aggregated invite links message to user {subscriber_telegram_id} for type {type_id}")
-                            else:  # no channel_links_to_send_in_message
+                            else:
                                 logging.info(
-                                    f"No new channel links were successfully generated for user {subscriber_telegram_id} for type {type_id}, so no message sent.")
-                else:  # no active_subscribers_for_actions
+                                    f"No new channel links were available/generated to send to user {subscriber_telegram_id} for type {type_id}.")
+                else:
                     logging.info(f"No active subscribers found for type {type_id} to schedule tasks or send invites.")
 
-            # تسجيل إذا تم تحديد إرسال الدعوات ولكن لم تكن هناك قنوات جديدة بالفعل
             elif send_invites_for_new_channels and not newly_added_secondary_channels_for_actions:
                 logging.info(
                     f"Send invites was checked, but no genuinely new secondary channels were added for type {type_id}, so no tasks scheduled or invites sent.")
 
-        return jsonify(updated_type), 200  # updated_type يحتوي الآن على linked_channels
+            return jsonify(updated_type), 200  # updated_type يحتوي الآن على linked_channels
 
     except ValueError as ve:
         logging.error(f"ValueError in update_subscription_type for type_id {type_id}: {ve}", exc_info=True)

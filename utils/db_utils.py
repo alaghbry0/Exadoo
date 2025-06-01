@@ -66,6 +66,8 @@ async def send_message_to_user(telegram_id: int, message_text: str):
         return False
 
 
+
+
 async def remove_user_from_channel(connection, telegram_id: int, channel_id: int):
     """
     إزالة المستخدم من القناة وإرسال إشعار له.
@@ -257,6 +259,66 @@ async def remove_users_from_channel(telegram_id: int, channel_id: int) -> bool:
             exc_info=True
         )
         return False
+
+
+
+# دالة جديدة لإنشاء رابط مشترك للقناة مع معالجة Flood Wait
+async def generate_shared_invite_link_for_channel(
+    channel_id: int,
+    channel_name: str,
+    link_name_prefix: str = "الاشتراك في" # لتسمية الرابط في تيليجرام
+):
+    """
+    توليد رابط دعوة مشترك لقناة محددة، مع معالجة خطأ Flood Wait.
+    """
+    max_retries = 3
+    current_retry = 0
+    base_wait_time = 5 # ثواني للبدء بها إذا لم يحدد تيليجرام
+
+    while current_retry < max_retries:
+        try:
+
+
+            expire_date = int(time.time()) + (30 * 24 * 60 * 60)  # شهر واحد
+            invite_link_obj = await telegram_bot.create_chat_invite_link(
+                chat_id=channel_id,
+                creates_join_request=True, # مهم!
+                name=f"{link_name_prefix} {channel_name}", # اسم وصفي للرابط
+                expire_date=expire_date
+
+            )
+            invite_link_str = invite_link_obj.invite_link
+
+            logging.info(f"🔗 تم إنشاء رابط دعوة مشترك لقناة '{channel_name}' ({channel_id}): {invite_link_str}")
+            return {
+                "success": True,
+                "invite_link": invite_link_str if invite_link_str else "",
+                "message": f"تم إنشاء رابط دعوة مشترك للانضمام إلى قناة {channel_name}."
+            }
+        except TelegramAPIError as e:
+            # تحقق من رسالة الخطأ لتحديد ما إذا كان خطأ Flood Wait
+            error_message = str(e).lower()
+            if "too many requests" in error_message or "flood control" in error_message:
+                wait_seconds_match = re.search(r"retry after (\d+)", error_message)
+                wait_seconds = int(wait_seconds_match.group(1)) if wait_seconds_match else base_wait_time * (2 ** current_retry)
+
+                logging.warning(
+                    f"⚠️ Flood control exceeded for channel {channel_id} on create_chat_invite_link. "
+                    f"Retrying in {wait_seconds} seconds... (Attempt {current_retry + 1}/{max_retries})"
+                )
+                await asyncio.sleep(wait_seconds + 1) # +1 لضمان تجاوز الوقت المطلوب
+                current_retry += 1
+            else:
+                # أخطاء API أخرى
+                logging.error(f"❌ خطأ API أثناء إنشاء رابط دعوة مشترك لقناة {channel_id}: {e}")
+                return {"success": False, "invite_link": None, "error": str(e)}
+        except Exception as e:
+            logging.error(f"❌ خطأ غير متوقع أثناء إنشاء رابط دعوة مشترك للقناة {channel_id}: {e}")
+            return {"success": False, "invite_link": None, "error": str(e)}
+
+    logging.error(f"🚫 فشل إنشاء رابط دعوة مشترك لقناة {channel_id} بعد {max_retries} محاولات.")
+    return {"success": False, "invite_link": None, "error": f"Failed after {max_retries} retries due to flood control."}
+
 # ----------------- 🔹 إغلاق جلسة بوت تيليجرام ----------------- #
 
 async def close_telegram_bot_session():
