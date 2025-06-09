@@ -16,13 +16,57 @@ async def create_db_pool():
 public_routes = Blueprint("public_routes", __name__, url_prefix="/api/public")
 
 
+# --- إضافة جديدة: نقطة API لجلب مجموعات الاشتراكات العامة ---
+@public_routes.route("/subscription-groups", methods=["GET"])
+async def get_public_subscription_groups():
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                SELECT 
+                    id, 
+                    name, 
+                    description, 
+                    image_url, 
+                    color, 
+                    icon, 
+                    is_active,
+                    sort_order,
+                    created_at,
+                    updated_at
+                FROM subscription_groups
+                WHERE is_active = true
+                ORDER BY sort_order ASC, name ASC
+            """
+            results = await connection.fetch(query)
+
+        groups = [dict(row) for row in results]
+        return jsonify(groups), 200, {
+            "Cache-Control": "public, max-age=300",
+            "Content-Type": "application/json; charset=utf-8"
+        }
+    except Exception as e:
+        logging.error("Error fetching public subscription groups: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
 # نقطة API لجلب قائمة بأنواع الاشتراكات العامة
 @public_routes.route("/subscription-types", methods=["GET"])
 async def get_public_subscription_types():
     try:
+        # --- إضافة جديدة: استقبال group_id كمعامل اختياري ---
+        group_id_filter = request.args.get("group_id", type=int)
+
         async with current_app.db_pool.acquire() as connection:
-            # --- تعديل الاستعلام ليشمل terms_and_conditions ---
-            query = """
+            params = []
+            where_clauses = ["st.is_active = true"]
+
+            if group_id_filter is not None:
+                params.append(group_id_filter)
+                where_clauses.append(f"st.group_id = ${len(params)}")
+
+            where_sql = " AND ".join(where_clauses)
+
+            query = f"""
                 SELECT 
                     st.id, 
                     st.name, 
@@ -33,40 +77,43 @@ async def get_public_subscription_types():
                     st.usp, 
                     st.is_active,
                     st.is_recommended,
-                    st.terms_and_conditions, -- <-- إضافة جديدة
+                    st.terms_and_conditions,
+                    st.group_id,        -- <-- إضافة group_id هنا
+                    st.sort_order,      -- <-- إضافة sort_order هنا
                     st.created_at
-                FROM subscription_types st -- استخدام st كاسم مستعار للجدول
-                WHERE st.is_active = true
-                ORDER BY st.created_at DESC
-            """
-            results = await connection.fetch(query)
+                FROM subscription_types st
+                WHERE {where_sql}
+                ORDER BY st.sort_order ASC, st.created_at DESC 
+            """  # تم تعديل الترتيب ليشمل sort_order أولاً
+
+            results = await connection.fetch(query, *params)
 
         types = []
         for row in results:
             row_dict = dict(row)
-            # التأكد من تحويل الحقول JSONB إلى مصفوفات
-            # asyncpg عادة ما يقوم بهذا تلقائيًا لـ jsonb إلى list/dict
-            if isinstance(row_dict.get("features"), str): # احتياطًا
+            if isinstance(row_dict.get("features"), str):
                 row_dict["features"] = json.loads(row_dict["features"]) if row_dict["features"] else []
             elif row_dict.get("features") is None:
                 row_dict["features"] = []
-            
-            if isinstance(row_dict.get("terms_and_conditions"), str): # <-- إضافة جديدة, احتياطًا
-                row_dict["terms_and_conditions"] = json.loads(row_dict["terms_and_conditions"]) if row_dict["terms_and_conditions"] else []
-            elif row_dict.get("terms_and_conditions") is None: # <-- إضافة جديدة
+
+            if isinstance(row_dict.get("terms_and_conditions"), str):
+                row_dict["terms_and_conditions"] = json.loads(row_dict["terms_and_conditions"]) if row_dict[
+                    "terms_and_conditions"] else []
+            elif row_dict.get("terms_and_conditions") is None:
                 row_dict["terms_and_conditions"] = []
-            
+
             types.append(row_dict)
 
         return jsonify(types), 200, {
-            "Cache-Control": "public, max-age=300", # يمكنك تعديل مدة التخزين المؤقت
+            "Cache-Control": "public, max-age=300",
             "Content-Type": "application/json; charset=utf-8"
         }
     except Exception as e:
         logging.error("Error fetching public subscription types: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
-# نقطة API لجلب قائمة بخطط الاشتراك العامة
+
+# نقطة API لجلب قائمة بخطط الاشتراك العامة (تبقى كما هي)
 @public_routes.route("/subscription-plans", methods=["GET"])
 async def get_public_subscription_plans():
     try:
@@ -77,7 +124,7 @@ async def get_public_subscription_plans():
                     SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
                     FROM subscription_plans
                     WHERE subscription_type_id = $1 AND is_active = true
-                    ORDER BY created_at DESC
+                    ORDER BY price ASC, created_at DESC -- ترتيب الخطط حسب السعر مهم
                 """
                 results = await connection.fetch(query, int(subscription_type_id))
             else:
@@ -85,7 +132,7 @@ async def get_public_subscription_plans():
                     SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
                     FROM subscription_plans
                     WHERE is_active = true
-                    ORDER BY created_at DESC
+                    ORDER BY price ASC, created_at DESC -- ترتيب الخطط حسب السعر مهم
                 """
                 results = await connection.fetch(query)
 

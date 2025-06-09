@@ -13,7 +13,7 @@ DATABASE_CONFIG = {
     'database': os.getenv('DB_NAME', 'neondb'),
     'host': os.getenv('DB_HOST', 'localhost'),
     'port': int(os.getenv('DB_PORT', 5432)),
-    'ssl': 'require'
+    'ssl': os.getenv('DB_SSLMODE', 'disable')
 }
 
 DATABASE_URI = f"postgresql://{DATABASE_CONFIG['user']}:{DATABASE_CONFIG['password']}@{DATABASE_CONFIG['host']}:{DATABASE_CONFIG['port']}/{DATABASE_CONFIG['database']}"

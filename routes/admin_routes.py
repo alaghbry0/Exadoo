@@ -1,4 +1,5 @@
 import os
+from dotenv import load_dotenv
 import json
 import logging
 from quart import Blueprint, request, jsonify, abort, current_app, send_file
@@ -8,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 import pytz
 from functools import wraps
 import jwt
+from imagekitio import ImageKit
 from utils.permissions import permission_required, owner_required, log_action
 import asyncpg
 import asyncio
@@ -29,6 +31,7 @@ from database.db_queries import update_subscription as update_subscription_db
 async def create_db_pool():
     return await asyncpg.create_pool(**DATABASE_CONFIG)
 
+load_dotenv()
 
 # إنشاء Blueprint مع بادئة URL
 admin_routes = Blueprint("admin_routes", __name__, url_prefix="/api/admin")
@@ -413,8 +416,47 @@ async def get_user_details(telegram_id):
 # نقاط API لإدارة أنواع الاشتراكات (subscription_types)
 #######################################
 
+# --- دالة مساعدة لتهيئة عميل ImageKit ---
+_imagekit_client = None
 
-# --- إنشاء نوع اشتراك جديد ---
+def get_imagekit_client():
+    global _imagekit_client
+    if _imagekit_client is None:
+        required_keys = ['IMAGEKIT_PUBLIC_KEY', 'IMAGEKIT_PRIVATE_KEY', 'IMAGEKIT_URL_ENDPOINT']
+        if not all(os.getenv(key) for key in required_keys):
+            logging.error("ImageKit environment variables are missing or empty.")
+            raise ValueError("ImageKit configuration is not complete.")
+
+        # التهيئة تبقى كما هي باستخدام os.getenv
+        _imagekit_client = ImageKit(
+            public_key=os.getenv('IMAGEKIT_PUBLIC_KEY'),
+            private_key=os.getenv('IMAGEKIT_PRIVATE_KEY'),
+            url_endpoint=os.getenv('IMAGEKIT_URL_ENDPOINT')
+        )
+    return _imagekit_client
+# ------------------------------------
+
+# --- نقطة نهاية جديدة لتوليد توقيع الرفع لـ ImageKit ---
+@admin_routes.route("/imagekit-signature", methods=["GET"])
+@permission_required("subscription_types.update") # أو "subscription_types.create" أو صلاحية عامة للرفع
+async def get_imagekit_upload_signature():
+    try:
+        imagekit = get_imagekit_client()
+        # يمكن تخصيص المعلمات مثل token و expire إذا لزم الأمر
+        # expire هو الوقت بالثواني الذي سيكون فيه التوقيع صالحًا (افتراضي 30 دقيقة)
+        # token هو معرّف فريد للطلب (uuid)
+        auth_params = imagekit.get_authentication_parameters()
+        return jsonify(auth_params), 200
+    except ValueError as ve: # إذا لم تكن الإعدادات موجودة
+        logging.error(f"ImageKit configuration error: {ve}", exc_info=True)
+        return jsonify({"error": f"ImageKit configuration error: {str(ve)}"}), 500
+    except Exception as e:
+        logging.error(f"Error generating ImageKit signature: {e}", exc_info=True)
+        return jsonify({"error": "Failed to generate upload signature"}), 500
+# ----------------------------------------------------
+
+
+# --- تحديث API إنشاء نوع اشتراك لدعم المجموعات ---
 @admin_routes.route("/subscription-types", methods=["POST"])
 @permission_required("subscription_types.create")
 async def create_subscription_type():
@@ -422,14 +464,18 @@ async def create_subscription_type():
         data = await request.get_json()
         name = data.get("name")
         main_channel_id_str = data.get("main_channel_id")
+        group_id = data.get("group_id")  # إضافة جديدة
+        sort_order = data.get("sort_order", 0)  # إضافة جديدة
         description = data.get("description", "")
-        image_url = data.get("image_url", "")
         features = data.get("features", [])
-        terms_and_conditions = data.get("terms_and_conditions", [])  # <-- إضافة جديدة
+        terms_and_conditions = data.get("terms_and_conditions", [])
         usp = data.get("usp", "")
         is_active = data.get("is_active", True)
+        is_recommended = data.get("is_recommended", False)  # إضافة جديدة
         secondary_channels_data = data.get("secondary_channels", [])
         main_channel_name_from_data = data.get("main_channel_name", f"Main Channel for {name}")
+        image_url_from_client = data.get("image_url")
+        image_file_id_from_client = data.get("image_file_id")
 
         if not name or main_channel_id_str is None:
             return jsonify({"error": "Missing required fields: name and main_channel_id"}), 400
@@ -439,7 +485,20 @@ async def create_subscription_type():
         except ValueError:
             return jsonify({"error": "main_channel_id must be an integer"}), 400
 
-        # ... (التحقق من صحة secondary_channels_data كما هو موجود) ...
+        # التحقق من صحة group_id إذا تم تمريره
+        if group_id is not None:
+            try:
+                group_id = int(group_id)
+                async with current_app.db_pool.acquire() as connection:
+                    group_exists = await connection.fetchval(
+                        "SELECT id FROM subscription_groups WHERE id = $1", group_id
+                    )
+                    if not group_exists:
+                        return jsonify({"error": "Invalid group_id: group does not exist"}), 400
+            except ValueError:
+                return jsonify({"error": "group_id must be an integer"}), 400
+
+        # ... (باقي التحققات كما هي) ...
         valid_secondary_channels = []
         if not isinstance(secondary_channels_data, list):
             return jsonify({"error": "secondary_channels must be a list"}), 400
@@ -460,28 +519,35 @@ async def create_subscription_type():
 
         if not isinstance(features, list):
             return jsonify({"error": "features must be a list of strings"}), 400
-        if not isinstance(terms_and_conditions, list):  # <-- تحقق جديد
+        if not isinstance(terms_and_conditions, list):
             return jsonify({"error": "terms_and_conditions must be a list of strings"}), 400
 
         async with current_app.db_pool.acquire() as connection:
             async with connection.transaction():
                 query_type = """
                     INSERT INTO subscription_types
-                    (name, channel_id, description, image_url, features, usp, is_active, terms_and_conditions)
-                    VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb)
-                    RETURNING id, name, channel_id AS main_channel_id, description, image_url, 
-                              features, usp, is_active, created_at, terms_and_conditions;
+                    (name, channel_id, group_id, sort_order, description, 
+                     image_url, image_file_id, -- <--- إضافة image_file_id هنا
+                     features, usp, is_active, is_recommended, terms_and_conditions)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb) -- <--- تعديل عدد المعلمات
+                    RETURNING id, name, channel_id AS main_channel_id, group_id, sort_order,
+                              description, image_url, image_file_id, -- <--- إضافة image_file_id هنا
+                              features, usp, is_active, is_recommended,
+                              created_at, terms_and_conditions;
                 """
                 created_type = await connection.fetchrow(
-                    query_type, name, main_channel_id, description, image_url,
-                    json.dumps(features), usp, is_active, json.dumps(terms_and_conditions)  # <-- إضافة جديدة
+                    query_type, name, main_channel_id, group_id, sort_order,
+                    description,
+                    image_url_from_client, image_file_id_from_client, # <--- استخدام القيم الجديدة
+                    json.dumps(features), usp,
+                    is_active, is_recommended, json.dumps(terms_and_conditions)
                 )
                 if not created_type:
                     raise Exception("Failed to create subscription type record.")
 
                 new_type_id = created_type["id"]
 
-                # ... (إدراج القنوات الرئيسية والفرعية كما هو موجود) ...
+                # ... (باقي الكود لإدراج القنوات كما هو) ...
                 await connection.execute(
                     """
                     INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
@@ -504,6 +570,14 @@ async def create_subscription_type():
                             new_type_id, sec_channel["channel_id"], sec_channel.get("channel_name")
                         )
 
+                # جلب بيانات المجموعة إذا كانت موجودة
+                group_data = None
+                if created_type["group_id"]:
+                    group_data = await connection.fetchrow(
+                        "SELECT id, name, color, icon FROM subscription_groups WHERE id = $1",
+                        created_type["group_id"]
+                    )
+
                 linked_channels_query = "SELECT channel_id, channel_name, is_main FROM subscription_type_channels WHERE subscription_type_id = $1"
                 linked_channels_rows = await connection.fetch(linked_channels_query, new_type_id)
 
@@ -511,16 +585,17 @@ async def create_subscription_type():
                 # التأكد من أن features و terms_and_conditions هي قائمة في الاستجابة
                 if isinstance(response_data.get("features"), str):
                     response_data["features"] = json.loads(response_data["features"])
-                if isinstance(response_data.get("terms_and_conditions"), str):  # <-- إضافة جديدة
+                if isinstance(response_data.get("terms_and_conditions"), str):
                     response_data["terms_and_conditions"] = json.loads(response_data["terms_and_conditions"])
 
                 response_data["linked_channels"] = [dict(row) for row in linked_channels_rows]
+                response_data["group"] = dict(group_data) if group_data else None
 
         return jsonify(response_data), 201
 
     except Exception as e:
         logging.error("Error creating subscription type: %s", e, exc_info=True)
-        return jsonify({"error": f"Internal server error: {str(e)}"}),
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 
 # --- تعديل بيانات نوع اشتراك موجود ---
@@ -532,17 +607,53 @@ async def update_subscription_type(type_id: int):
         if not data:
             return jsonify({"error": "Request body must be JSON"}), 400
 
+        # --- جلب الحقول من data (مع تعديلات الصورة) ---
         name = data.get("name")
         new_main_channel_id_input = data.get("main_channel_id")
         main_channel_name_input = data.get("main_channel_name")
         secondary_channels_data = data.get("secondary_channels")
         send_invites_for_new_channels = data.get("send_invites_for_new_channels", False)
         description = data.get("description")
-        image_url = data.get("image_url")
         features = data.get("features")
         usp = data.get("usp")
         is_active = data.get("is_active")
         terms_and_conditions = data.get("terms_and_conditions")
+        group_id_input = data.get("group_id")
+        sort_order_input = data.get("sort_order")
+        is_recommended_input = data.get("is_recommended")
+
+        # --- [تعديل جديد] استقبال حقول الصورة من الواجهة ---
+        image_url_from_client = data.get("image_url")
+        image_file_id_from_client = data.get("image_file_id")
+        delete_image_flag = data.get("delete_image", False)
+        # --------------------------------------------------------
+
+        # التحقق من صحة group_id إذا تم تمريره (يسمح بـ null)
+        processed_group_id = None
+        group_id_provided = "group_id" in data
+
+        if group_id_provided:
+            if group_id_input is not None:
+                try:
+                    processed_group_id = int(group_id_input)
+                except ValueError:
+                    return jsonify({"error": "group_id must be an integer or null"}), 400
+            else:
+                processed_group_id = None
+
+        # (بقية التحققات للحقول الأخرى كما هي)
+        processed_sort_order = None
+        if sort_order_input is not None:
+            try:
+                processed_sort_order = int(sort_order_input)
+            except ValueError:
+                return jsonify({"error": "sort_order must be an integer"}), 400
+
+        processed_is_recommended = None
+        if is_recommended_input is not None:
+            if not isinstance(is_recommended_input, bool):
+                return jsonify({"error": "is_recommended must be a boolean"}), 400
+            processed_is_recommended = is_recommended_input
 
         new_main_channel_id = None
         if new_main_channel_id_input is not None:
@@ -553,310 +664,273 @@ async def update_subscription_type(type_id: int):
                 new_main_channel_id = int(temp_main_id_str)
             except ValueError:
                 return jsonify({
-                                   "error": f"main_channel_id '{new_main_channel_id_input}' must be a valid integer if provided"}), 400
+                    "error": f"main_channel_id '{new_main_channel_id_input}' must be a valid integer if provided"}), 400
 
         valid_new_secondary_channels = []
         if secondary_channels_data is not None:
             if not isinstance(secondary_channels_data, list):
                 return jsonify({"error": "secondary_channels must be a list if provided"}), 400
-
             for i, ch_data in enumerate(secondary_channels_data):
                 if not isinstance(ch_data, dict) or "channel_id" not in ch_data:
                     return jsonify(
                         {"error": f"Each secondary channel (index {i}) must be an object with 'channel_id'"}), 400
                 ch_id_value = ch_data.get("channel_id")
-                if ch_id_value is None:
-                    logging.warning(
-                        f"Secondary channel data at index {i} is missing 'channel_id' or it's null: {ch_data}")
-                    continue
+                if ch_id_value is None: continue
                 ch_id_as_str = str(ch_id_value).strip()
-                if not ch_id_as_str:
-                    logging.warning(
-                        f"Secondary channel data at index {i} has an empty 'channel_id' after stripping: {ch_data}")
-                    continue
+                if not ch_id_as_str: continue
                 try:
                     ch_id = int(ch_id_as_str)
                     ch_name_value = ch_data.get("channel_name", f"Secondary Channel {ch_id}")
                     ch_name_processed = str(ch_name_value).strip() or f"Secondary Channel {ch_id}"
-                    valid_new_secondary_channels.append({
-                        "channel_id": ch_id,
-                        "channel_name": ch_name_processed
-                    })
+                    valid_new_secondary_channels.append({"channel_id": ch_id, "channel_name": ch_name_processed})
                 except ValueError:
                     return jsonify(
-                        {
-                            "error": f"Invalid channel_id format '{ch_id_value}' in secondary_channels (index {i}). Must be a numeric string or number."}), 400
+                        {"error": f"Invalid channel_id format '{ch_id_value}' in secondary_channels (index {i})."}), 400
 
-        updated_type = None  # سيتم تعيينه داخل الـ transaction
-        newly_added_secondary_channels_for_actions = []  # سيتم تعيينه داخل الـ transaction
-        effective_main_channel_id_after_update = None  # سيتم تعيينه داخل الـ transaction
+        newly_added_secondary_channels_for_actions = []
+        effective_main_channel_id_after_update = None
+
+        # --- [تعديل جديد] متغير لتخزين ID الملف القديم لحذفه من ImageKit ---
+        old_image_file_id_to_delete_from_imagekit = None
+        # ----------------------------------------------------------------------
 
         async with current_app.db_pool.acquire() as connection:
             async with connection.transaction():
-                current_main_channel_id_db = new_main_channel_id
-                if current_main_channel_id_db is None:
-                    current_main_channel_id_db = await connection.fetchval(
-                        "SELECT channel_id FROM subscription_types WHERE id = $1", type_id)
-                    if current_main_channel_id_db is None:
-                        return jsonify({"error": "Subscription type not found"}), 404
+                # جلب النوع الحالي للتحقق من وجوده وللحصول على القيم الحالية
+                current_type = await connection.fetchrow("SELECT * FROM subscription_types WHERE id = $1", type_id)
+                if not current_type:
+                    return jsonify({"error": "Subscription type not found"}), 404
 
+                # التحقق من وجود المجموعة إذا تم توفير group_id جديد
+                if group_id_provided and processed_group_id is not None:
+                    group_exists = await connection.fetchval(
+                        "SELECT id FROM subscription_groups WHERE id = $1", processed_group_id
+                    )
+                    if not group_exists:
+                        return jsonify({"error": "Invalid group_id: group does not exist"}), 400
+
+                effective_main_channel_id_after_update = new_main_channel_id if new_main_channel_id is not None else \
+                current_type['channel_id']
                 for sec_ch in valid_new_secondary_channels:
-                    if sec_ch["channel_id"] == current_main_channel_id_db:
+                    if sec_ch["channel_id"] == effective_main_channel_id_after_update:
                         return jsonify({
-                            "error": f"Secondary channel ID {sec_ch['channel_id']} conflicts with the effective main channel ID {current_main_channel_id_db}."}), 400
+                            "error": f"Secondary channel ID {sec_ch['channel_id']} conflicts with the effective main channel ID {effective_main_channel_id_after_update}."}), 400
 
-                current_secondary_channels_rows = await connection.fetch(
-                    "SELECT channel_id FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = FALSE",
-                    type_id
-                )
-                current_secondary_channel_ids = {row['channel_id'] for row in current_secondary_channels_rows}
+                # بناء جملة التحديث ديناميكيًا
+                update_fields = {}
+                if name is not None: update_fields["name"] = name
+                if new_main_channel_id is not None: update_fields["channel_id"] = new_main_channel_id
+                if group_id_provided: update_fields["group_id"] = processed_group_id
+                if processed_sort_order is not None: update_fields["sort_order"] = processed_sort_order
+                if description is not None: update_fields["description"] = description
+                if features is not None: update_fields["features"] = json.dumps(features)
+                if usp is not None: update_fields["usp"] = usp
+                if is_active is not None: update_fields["is_active"] = is_active
+                if processed_is_recommended is not None: update_fields["is_recommended"] = processed_is_recommended
+                if terms_and_conditions is not None: update_fields["terms_and_conditions"] = json.dumps(
+                    terms_and_conditions)
 
-                query_type_update = """
-                    UPDATE subscription_types
-                    SET name = COALESCE($1, name),
-                        channel_id = COALESCE($2, channel_id), 
-                        description = COALESCE($3, description),
-                        image_url = COALESCE($4, image_url),
-                        features = COALESCE($5::jsonb, features),
-                        usp = COALESCE($6, usp),
-                        is_active = COALESCE($7, is_active),
-                        terms_and_conditions = COALESCE($8::jsonb, terms_and_conditions)
-                    WHERE id = $9
-                    RETURNING id, name, channel_id AS main_channel_id, description, image_url, 
-                              features, usp, is_active, created_at, terms_and_conditions,
-                              (SELECT channel_name FROM subscription_type_channels stc WHERE stc.subscription_type_id = $9 AND stc.channel_id = subscription_types.channel_id AND stc.is_main = TRUE LIMIT 1) as current_main_channel_name;
-                """
-                features_json = json.dumps(features) if features is not None else None
-                terms_json = json.dumps(terms_and_conditions) if terms_and_conditions is not None else None
+                # --- [تعديل جديد] منطق تحديث الصورة ---
+                current_image_file_id_db = current_type.get('image_file_id')
 
-                updated_type_row = await connection.fetchrow(  # تم تغيير اسم المتغير لتجنب الالتباس
-                    query_type_update, name, new_main_channel_id, description,
-                    image_url, features_json, usp, is_active,
-                    terms_json, type_id
-                )
+                if delete_image_flag:
+                    # إذا طلب العميل حذف الصورة
+                    if current_image_file_id_db:
+                        old_image_file_id_to_delete_from_imagekit = current_image_file_id_db
+                    update_fields["image_url"] = None
+                    update_fields["image_file_id"] = None
+                elif image_url_from_client is not None or image_file_id_from_client is not None:
+                    # إذا تم إرسال صورة جديدة
+                    if current_image_file_id_db and current_image_file_id_db != image_file_id_from_client:
+                        old_image_file_id_to_delete_from_imagekit = current_image_file_id_db
+                    update_fields["image_url"] = image_url_from_client
+                    update_fields["image_file_id"] = image_file_id_from_client
+                # إذا لم يتم إرسال أي شيء بخصوص الصورة، لا يتم تحديث حقولها في قاعدة البيانات
+                # ------------------------------------------
 
-                if not updated_type_row:
-                    check_exists = await connection.fetchval("SELECT id FROM subscription_types WHERE id = $1", type_id)
-                    if not check_exists:
-                        return jsonify({"error": "Subscription type not found"}), 404
-                    logging.warning(
-                        f"Subscription type {type_id} found but not updated. This might indicate no actual changes were made or an issue with COALESCE.")
-                    updated_type_row = await connection.fetchrow(
-                        """SELECT id, name, channel_id AS main_channel_id, description, image_url, 
-                                  features, usp, is_active, created_at, terms_and_conditions,
-                                  (SELECT channel_name FROM subscription_type_channels stc WHERE stc.subscription_type_id = $1 AND stc.channel_id = subscription_types.channel_id AND stc.is_main = TRUE LIMIT 1) as current_main_channel_name
-                           FROM subscription_types WHERE id = $1""", type_id
-                    )
-                    if not updated_type_row:
-                        return jsonify({"error": "Subscription type not found after attempting update."}), 404
-
-                updated_type = dict(updated_type_row)  # تحويل إلى dict لاستخدامه لاحقًا
-                effective_main_channel_id_after_update = updated_type["main_channel_id"]
-
-                main_channel_name_to_use = ""
-                if main_channel_name_input is not None:
-                    main_channel_name_to_use = str(main_channel_name_input).strip()
-
-                if not main_channel_name_to_use:
-                    existing_main_ch_name_from_db = updated_type.get("current_main_channel_name")
-                    if existing_main_ch_name_from_db and str(existing_main_ch_name_from_db).strip():
-                        main_channel_name_to_use = str(existing_main_ch_name_from_db).strip()
-                    else:
-                        main_channel_name_to_use = f"Main Channel for {updated_type['name']}"
-
-                if effective_main_channel_id_after_update is not None:
-                    await connection.execute(
-                        "UPDATE subscription_type_channels SET is_main = FALSE WHERE subscription_type_id = $1 AND channel_id != $2",
-                        type_id, effective_main_channel_id_after_update
-                    )
+                if not update_fields and secondary_channels_data is None and main_channel_name_input is None:
+                    updated_type_row = current_type
                 else:
-                    await connection.execute(
-                        "UPDATE subscription_type_channels SET is_main = FALSE WHERE subscription_type_id = $1",
-                        type_id
-                    )
+                    set_clauses = []
+                    params = []
+                    i = 1
+                    for key, value in update_fields.items():
+                        set_clauses.append(f"{key} = ${i}")
+                        params.append(value)
+                        i += 1
 
-                if effective_main_channel_id_after_update is not None:
-                    await connection.execute(
+                    params.append(type_id)
+
+                    if set_clauses:
+                        query_type_update = f"""
+                            UPDATE subscription_types
+                            SET {', '.join(set_clauses)}
+                            WHERE id = ${i}
+                            RETURNING *; 
                         """
-                        INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
-                        VALUES ($1, $2, $3, TRUE)
-                        ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET
-                        channel_name = EXCLUDED.channel_name, is_main = TRUE;
-                        """,
-                        type_id, effective_main_channel_id_after_update, main_channel_name_to_use
-                    )
+                        updated_type_row = await connection.fetchrow(query_type_update, *params)
+                        if not updated_type_row:
+                            return jsonify({"error": "Failed to update subscription type, or type not found."}), 404
+                    else:
+                        updated_type_row = current_type
 
-                # newly_added_secondary_channels_for_actions تم تعريفه في النطاق الخارجي
+                updated_type_dict = dict(updated_type_row)
+                effective_main_channel_id_after_update = updated_type_dict["channel_id"]
+
+                # --- إدارة القنوات (main and secondary) ---
+                # (الكود الخاص بإدارة القنوات يبقى كما هو)
+                current_main_channel_name_db = await connection.fetchval(
+                    """SELECT channel_name FROM subscription_type_channels 
+                       WHERE subscription_type_id = $1 AND channel_id = $2 AND is_main = TRUE""",
+                    type_id, effective_main_channel_id_after_update
+                )
+                main_channel_name_to_use = main_channel_name_input.strip() if main_channel_name_input is not None else None
+                if not main_channel_name_to_use:
+                    if current_main_channel_name_db and current_main_channel_name_db.strip():
+                        main_channel_name_to_use = current_main_channel_name_db.strip()
+                    else:
+                        main_channel_name_to_use = f"Main Channel for {updated_type_dict['name']}"
+
+                await connection.execute(
+                    "UPDATE subscription_type_channels SET is_main = FALSE WHERE subscription_type_id = $1", type_id
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
+                    VALUES ($1, $2, $3, TRUE)
+                    ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET
+                    channel_name = EXCLUDED.channel_name, is_main = TRUE;
+                    """, type_id, effective_main_channel_id_after_update, main_channel_name_to_use
+                )
+
                 if secondary_channels_data is not None:
+                    current_secondary_channel_ids_db = {
+                        row['channel_id'] for row in await connection.fetch(
+                            "SELECT channel_id FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = FALSE",
+                            type_id
+                        )
+                    }
                     ids_in_new_secondary_list = {ch['channel_id'] for ch in valid_new_secondary_channels}
-                    delete_query = "DELETE FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = FALSE"
-                    params = [type_id]
-                    if ids_in_new_secondary_list:
-                        delete_query += " AND channel_id NOT IN (SELECT unnest($2::bigint[]))"
-                        params.append(list(ids_in_new_secondary_list))
-                    await connection.execute(delete_query, *params)
-
+                    channels_to_delete = current_secondary_channel_ids_db - ids_in_new_secondary_list
+                    if channels_to_delete:
+                        await connection.execute(
+                            "DELETE FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = FALSE AND channel_id = ANY($2::bigint[])",
+                            type_id, list(channels_to_delete)
+                        )
                     for sec_channel_data in valid_new_secondary_channels:
                         ch_id = sec_channel_data["channel_id"]
                         ch_name = sec_channel_data["channel_name"]
-                        if ch_id == effective_main_channel_id_after_update:
-                            logging.warning(
-                                f"Attempted to add main channel {ch_id} as secondary. Skipping for subscription_type {type_id}.")
-                            continue
+                        if ch_id == effective_main_channel_id_after_update: continue
                         await connection.execute(
                             """
                             INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
                             VALUES ($1, $2, $3, FALSE)
                             ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET
-                            channel_name = EXCLUDED.channel_name, is_main = FALSE; 
-                            """,
-                            type_id, ch_id, ch_name
+                            channel_name = EXCLUDED.channel_name, is_main = FALSE;
+                            """, type_id, ch_id, ch_name
                         )
-                        if ch_id not in current_secondary_channel_ids:
-                            # هذه هي القنوات الفرعية الجديدة حقًا
+                        if ch_id not in current_secondary_channel_ids_db:
                             newly_added_secondary_channels_for_actions.append(sec_channel_data)
+                # --- نهاية إدارة القنوات ---
 
                 linked_channels_rows = await connection.fetch(
                     "SELECT channel_id, channel_name, is_main FROM subscription_type_channels WHERE subscription_type_id = $1 ORDER BY is_main DESC, channel_name",
                     type_id
                 )
+                updated_type_dict["linked_channels"] = [dict(row) for row in linked_channels_rows]
 
-                # تحديث updated_type بالبيانات الفعلية قبل إرسالها كاستجابة
-                if isinstance(updated_type.get("features"), str):
-                    updated_type["features"] = json.loads(updated_type["features"])
-                if isinstance(updated_type.get("terms_and_conditions"), str):
-                    updated_type["terms_and_conditions"] = json.loads(updated_type["terms_and_conditions"])
-                updated_type["linked_channels"] = [dict(row) for row in linked_channels_rows]
+                updated_type_dict["group"] = None
+                if updated_type_dict.get("group_id"):
+                    group_info = await connection.fetchrow(
+                        "SELECT id, name, color, icon FROM subscription_groups WHERE id = $1",
+                        updated_type_dict["group_id"]
+                    )
+                    if group_info:
+                        updated_type_dict["group"] = dict(group_info)
+
+                if isinstance(updated_type_dict.get("features"), str):
+                    updated_type_dict["features"] = json.loads(updated_type_dict["features"])
+                if isinstance(updated_type_dict.get("terms_and_conditions"), str):
+                    updated_type_dict["terms_and_conditions"] = json.loads(updated_type_dict["terms_and_conditions"])
+
             # --- نهاية Transaction ---
 
-            # --------------------------------------------------------------------------------
-            # --- جدولة المهام وإرسال الدعوات للقنوات الفرعية الجديدة ---
-            # --------------------------------------------------------------------------------
-            if newly_added_secondary_channels_for_actions:
-                logging.info(
-                    f"Processing {len(newly_added_secondary_channels_for_actions)} new secondary channels for type '{updated_type['name']}' (ID: {type_id})")
+            # --- [تعديل جديد] حذف الصورة القديمة من ImageKit بعد نجاح الـ transaction ---
+            if old_image_file_id_to_delete_from_imagekit:
+                try:
+                    imagekit = get_imagekit_client()  # تأكد من أن هذه الدالة موجودة
+                    imagekit.delete_file(file_id=old_image_file_id_to_delete_from_imagekit)
+                    logging.info(f"Old ImageKit file deleted successfully: {old_image_file_id_to_delete_from_imagekit}")
+                except Exception as e_delete:
+                    # نسجل الخطأ ولكن لا نوقف العملية لأن تحديث قاعدة البيانات قد نجح
+                    logging.error(
+                        f"Failed to delete old ImageKit file {old_image_file_id_to_delete_from_imagekit}: {e_delete}",
+                        exc_info=True
+                    )
+            # ---------------------------------------------------------------------------------
 
-                # جلب المشتركين النشطين (كما هو)
+            # --- منطق إرسال الدعوات للقنوات الجديدة (يبقى كما هو) ---
+            if newly_added_secondary_channels_for_actions and send_invites_for_new_channels:
                 active_subscribers_for_actions = await connection.fetch(
                     """
                     SELECT s.telegram_id, s.expiry_date, u.full_name, u.username 
                     FROM subscriptions s
                     LEFT JOIN users u ON s.telegram_id = u.telegram_id
-                    WHERE s.subscription_type_id = $1
-                      AND s.is_active = TRUE
-                      AND s.expiry_date > NOW()
+                    WHERE s.subscription_type_id = $1 AND s.is_active = TRUE AND s.expiry_date > NOW()
                     GROUP BY s.telegram_id, s.expiry_date, u.full_name, u.username; 
-                    """,
-                    type_id
+                    """, type_id
                 )
-
-                # <<< الخطوة الجديدة: إنشاء روابط الدعوة المشتركة للقنوات الجديدة >>>
-                shared_invite_links_map = {}  # {channel_id: "invite_link_str"}
-                if send_invites_for_new_channels and newly_added_secondary_channels_for_actions:
-                    logging.info(
-                        f"Generating shared invite links for {len(newly_added_secondary_channels_for_actions)} new channels.")
-                    for new_channel_data in newly_added_secondary_channels_for_actions:
-                        new_channel_id = new_channel_data['channel_id']
-                        new_channel_name = new_channel_data['channel_name']
-
-                        if new_channel_id == effective_main_channel_id_after_update:  # تجنب الرئيسية
-                            continue
-
-                        # اسم وصفي للرابط يمكن رؤيته في إعدادات القناة
-                        link_name_prefix = f"دعوة لـ {updated_type['name']}"
-
-                        invite_result = await generate_shared_invite_link_for_channel(
-                            channel_id=new_channel_id,
-                            channel_name=new_channel_name,
-                            link_name_prefix=link_name_prefix
-                        )
-                        if invite_result and invite_result.get("success"):
-                            shared_invite_links_map[new_channel_id] = invite_result.get("invite_link")
-                        else:
-                            logging.error(
-                                f"Failed to generate shared invite link for channel '{new_channel_name}' ({new_channel_id}). Error: {invite_result.get('error')}")
-                            # يمكنك هنا أن تقرر ما إذا كنت تريد إيقاف العملية أو المتابعة بدون هذا الرابط
+                shared_invite_links_map = {}
+                logging.info(
+                    f"Generating shared invite links for {len(newly_added_secondary_channels_for_actions)} new channels.")
+                for new_channel_data in newly_added_secondary_channels_for_actions:
+                    new_channel_id = new_channel_data['channel_id']
+                    new_channel_name = new_channel_data['channel_name']
+                    if new_channel_id == effective_main_channel_id_after_update: continue
+                    link_name_prefix = f"دعوة لـ {updated_type_dict['name']}"
+                    invite_result = await generate_shared_invite_link_for_channel(
+                        channel_id=new_channel_id, channel_name=new_channel_name, link_name_prefix=link_name_prefix
+                    )
+                    if invite_result and invite_result.get("success"):
+                        shared_invite_links_map[new_channel_id] = invite_result.get("invite_link")
+                    else:
+                        logging.error(
+                            f"Failed to generate invite for {new_channel_name} ({new_channel_id}). Error: {invite_result.get('error')}")
 
                 if active_subscribers_for_actions:
-                    logging.info(
-                        f"Found {len(active_subscribers_for_actions)} active subscribers for type {type_id} for post-update actions.")
-
                     for subscriber_idx, subscriber in enumerate(active_subscribers_for_actions):
                         subscriber_telegram_id = subscriber['telegram_id']
                         subscriber_expiry_date = subscriber['expiry_date']
-
-                        # 1. جدولة مهام 'remove_user' (كما هو)
                         for new_channel_data in newly_added_secondary_channels_for_actions:
                             new_channel_id = new_channel_data['channel_id']
-                            if new_channel_id == effective_main_channel_id_after_update:
-                                continue
+                            if new_channel_id == effective_main_channel_id_after_update: continue
                             await add_scheduled_task(
-                                connection=connection,
-                                task_type='remove_user',
-                                telegram_id=subscriber_telegram_id,
-                                channel_id=new_channel_id,
-                                execute_at=subscriber_expiry_date,
-                                clean_up=True
+                                connection=connection, task_type='remove_user', telegram_id=subscriber_telegram_id,
+                                channel_id=new_channel_id, execute_at=subscriber_expiry_date, clean_up=True
                             )
 
-                        # 2. إرسال روابط الدعوة إذا كان الخيار مفعلًا وكانت هناك روابط تم إنشاؤها
-                        if send_invites_for_new_channels and shared_invite_links_map:
-                            full_name = subscriber.get('full_name')
-                            username = subscriber.get('username')
-                            user_identifier = full_name or (f"@{username}" if username else str(subscriber_telegram_id))
-
-                            channel_links_to_send_in_message = []
-                            for new_channel_data in newly_added_secondary_channels_for_actions:
-                                new_channel_id = new_channel_data['channel_id']
-                                new_channel_name = new_channel_data['channel_name']
-
-                                if new_channel_id == effective_main_channel_id_after_update:
-                                    continue
-
-                                # استخدم الرابط المشترك الذي تم إنشاؤه مسبقًا
-                                invite_link_str = shared_invite_links_map.get(new_channel_id)
-                                if invite_link_str:
-                                    channel_links_to_send_in_message.append(
-                                        f"▫️ قناة <a href='{invite_link_str}'>{new_channel_name}</a>"
-                                    )
-                                # لا داعي للـ else هنا، فقد تم تسجيل الخطأ عند محاولة إنشاء الرابط المشترك
-
-                            if channel_links_to_send_in_message:
+                        if shared_invite_links_map:
+                            user_identifier = subscriber.get('full_name') or (
+                                f"@{subscriber.get('username')}" if subscriber.get('username') else str(
+                                    subscriber_telegram_id))
+                            channel_links_to_send = [
+                                f"▫️ قناة <a href='{link}'>{ch_data['channel_name']}</a>"
+                                for ch_data in newly_added_secondary_channels_for_actions
+                                if (link := shared_invite_links_map.get(ch_data['channel_id'])) and ch_data[
+                                    'channel_id'] != effective_main_channel_id_after_update
+                            ]
+                            if channel_links_to_send:
                                 message_text = (
                                         f"📬 مرحبًا {user_identifier},\n\n"
-                                        f"تمت إضافة قنوات جديدة إلى اشتراكك في \"<b>{updated_type['name']}</b>\":\n\n" +
-                                        "\n".join(channel_links_to_send_in_message) +
-                                        "\n\n💡 هذه الروابط صالحة للاستخدام للانضمام. يرجى الانضمام في أقرب وقت."
+                                        f"تمت إضافة قنوات جديدة إلى اشتراكك في \"<b>{updated_type_dict['name']}</b>\":\n\n" +
+                                        "\n".join(channel_links_to_send) +
+                                        "\n\n💡 هذه الروابط صالحة للاستخدام للانضمام."
                                 )
-                                try:
-                                    # أضف تأخير بسيط بين إرسال الرسائل للمستخدمين إذا كان عددهم كبيراً جداً
-                                    # لتجنب مشاكل flood مع send_message أيضاً (أقل شيوعاً ولكن ممكنة)
-                                    if subscriber_idx > 0 and subscriber_idx % 20 == 0:  # كل 20 رسالة
-                                        logging.info(
-                                            f"Pausing for 1 second before sending more messages (sent {subscriber_idx})")
-                                        await asyncio.sleep(1)
+                                if subscriber_idx > 0 and subscriber_idx % 20 == 0: await asyncio.sleep(1)
+                                await send_message_to_user(subscriber_telegram_id,
+                                                           message_text)
 
-                                    sent_successfully = await send_message_to_user(subscriber_telegram_id, message_text)
-                                    if sent_successfully:
-                                        logging.info(
-                                            f"Sent aggregated invite links message to user {subscriber_telegram_id} for type {type_id}")
-                                    else:
-                                        logging.warning(
-                                            f"Failed to send aggregated invite links message to user {subscriber_telegram_id} for type {type_id}")
-                                except Exception as e_send:
-                                    logging.error(
-                                        f"Exception in send_message_to_user for {subscriber_telegram_id}: {e_send}")
-                            else:
-                                logging.info(
-                                    f"No new channel links were available/generated to send to user {subscriber_telegram_id} for type {type_id}.")
-                else:
-                    logging.info(f"No active subscribers found for type {type_id} to schedule tasks or send invites.")
-
-            elif send_invites_for_new_channels and not newly_added_secondary_channels_for_actions:
-                logging.info(
-                    f"Send invites was checked, but no genuinely new secondary channels were added for type {type_id}, so no tasks scheduled or invites sent.")
-
-            return jsonify(updated_type), 200  # updated_type يحتوي الآن على linked_channels
+            return jsonify(updated_type_dict), 200
 
     except ValueError as ve:
         logging.error(f"ValueError in update_subscription_type for type_id {type_id}: {ve}", exc_info=True)
@@ -871,125 +945,392 @@ async def update_subscription_type(type_id: int):
 async def delete_subscription_type(type_id: int):
     try:
         async with current_app.db_pool.acquire() as connection:
-            # الحذف من subscription_types سيؤدي إلى حذف السجلات المرتبطة
-            # من subscription_type_channels بسبب ON DELETE CASCADE
-            # تأكد من أن هذا هو السلوك المطلوب.
-            # إذا كان هناك اشتراكات قائمة subscriptions أو خطط subscription_plans مرتبطة بهذا النوع،
-            # قد تحتاج إلى التعامل معها (منع الحذف أو حذفها أيضًا إذا كان ذلك مناسبًا).
-            # حاليًا، subscription_plans لديها ON DELETE CASCADE.
-            # subscriptions ليس لديها، لذا قد يحدث خطأ إذا كان هناك اشتراكات مرتبطة.
-            # يجب إما إضافة ON DELETE CASCADE أو SET NULL لـ subscriptions.subscription_type_id
-            # أو التحقق برمجيًا هنا.
+            async with connection.transaction():  # استخدام transaction هنا أفضل
+                # جلب image_file_id قبل الحذف من قاعدة البيانات
+                image_info = await connection.fetchrow(
+                    "SELECT image_file_id FROM subscription_types WHERE id = $1 FOR UPDATE", type_id
+                )  # FOR UPDATE لمنع التعديلات المتزامنة
 
-            # تحقق مبدئي إذا كان هناك اشتراكات مرتبطة (اختياري، لكن جيد)
-            active_subs_count = await connection.fetchval(
-                "SELECT COUNT(*) FROM subscriptions WHERE subscription_type_id = $1", type_id)
-            if active_subs_count > 0:
-                return jsonify({
-                    "error": f"Cannot delete. There are {active_subs_count} active subscriptions linked to this type."}), 409  # Conflict
+                if not image_info:
+                    return jsonify({"error": "Subscription type not found"}), 404
 
-            await connection.execute("DELETE FROM subscription_types WHERE id = $1", type_id)
-        return jsonify({"message": "Subscription type and its associated channels deleted successfully"}), 200
+                image_file_id_to_delete = image_info['image_file_id']
+
+                # ... (تحقق من active_subs_count كما هو)
+                active_subs_count = await connection.fetchval(
+                    "SELECT COUNT(*) FROM subscriptions WHERE subscription_type_id = $1", type_id)
+                if active_subs_count > 0:
+                    return jsonify({
+                        "error": f"Cannot delete. There are {active_subs_count} active subscriptions linked to this type."}), 409
+
+                await connection.execute("DELETE FROM subscription_types WHERE id = $1", type_id)
+
+                # إذا تم الحذف بنجاح من قاعدة البيانات، احذف الصورة من ImageKit
+                if image_file_id_to_delete:
+                    try:
+                        imagekit = get_imagekit_client()
+                        imagekit.delete_file(file_id=image_file_id_to_delete)
+                        logging.info(
+                            f"ImageKit file deleted upon subscription type deletion: {image_file_id_to_delete}")
+                    except Exception as e_delete_ik:
+                        # سجل الخطأ ولكن لا توقف العملية إذا فشل حذف ImageKit (يمكن التعامل معه لاحقًا)
+                        logging.error(
+                            f"Failed to delete ImageKit file {image_file_id_to_delete} during type deletion: {e_delete_ik}",
+                            exc_info=True)
+
+        return jsonify({"message": "Subscription type deleted successfully"}), 200  # تم تعديل الرسالة قليلاً
     except Exception as e:
         logging.error("Error deleting subscription type %s: %s", type_id, e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
-# --- جلب قائمة أنواع الاشتراكات ---
-@admin_routes.route("/subscription-types", methods=["GET"])
+def _format_subscription_type_data(row_data):
+    """Helper function to format subscription type data from a DB row."""
+    type_item = dict(row_data)
+
+    # معالجة حقول JSON (asyncpg قد يقوم بتحويلها تلقائياً)
+    for field in ["features", "terms_and_conditions", "linked_channels", "plans"]:
+        if isinstance(type_item.get(field), str):
+            type_item[field] = json.loads(type_item[field]) if type_item[field] else []
+        elif type_item.get(field) is None:
+            type_item[field] = []
+
+    # تجميع بيانات المجموعة في كائن واحد
+    if type_item.get("group_id"):
+        type_item["group"] = {
+            "id": type_item.get("group_id"),
+            "name": type_item.get("group_name"),
+            "color": type_item.get("group_color"),
+            "icon": type_item.get("group_icon")
+        }
+    else:
+        type_item["group"] = None
+
+    # إزالة الحقول المؤقتة
+    for key in ["group_name", "group_color", "group_icon"]:
+        type_item.pop(key, None)
+        
+    return type_item
+
+
+# --- نقطة النهاية الموحدة الجديدة لجلب كل بيانات الاشتراكات ---
+@admin_routes.route("/subscription-data", methods=["GET"])
 @permission_required("subscription_types.read")
-async def get_subscription_types():
+async def get_all_subscription_data():
     try:
         async with current_app.db_pool.acquire() as connection:
+            # استعلام واحد قوي لجلب كل شيء بشكل متداخل
             query = """
                 SELECT 
-                    st.id, st.name, st.channel_id AS main_channel_id, st.description, 
-                    st.image_url, st.features, st.usp, st.is_active, st.created_at,
-                    st.terms_and_conditions, -- <-- إضافة جديدة
-                    (SELECT json_agg(json_build_object('channel_id', stc.channel_id, 'channel_name', stc.channel_name, 'is_main', stc.is_main)) 
-                     FROM subscription_type_channels stc 
-                     WHERE stc.subscription_type_id = st.id) AS linked_channels
-                FROM subscription_types st
-                ORDER BY st.created_at DESC;
+                    sg.id as group_id, 
+                    sg.name as group_name, 
+                    sg.description as group_description,
+                    sg.color as group_color, 
+                    sg.icon as group_icon, 
+                    sg.sort_order as group_sort_order,
+                    (
+                        SELECT json_agg(st_details)
+                        FROM (
+                            SELECT 
+                                st.id, st.name, st.channel_id AS main_channel_id, st.group_id, st.sort_order,
+                                st.description, st.image_url, st.image_file_id, st.features, st.usp, st.is_active, 
+                                st.is_recommended, st.created_at, st.terms_and_conditions,
+                                (
+                                    SELECT json_agg(json_build_object('channel_id', stc.channel_id, 'channel_name', stc.channel_name, 'is_main', stc.is_main)) 
+                                    FROM subscription_type_channels stc 
+                                    WHERE stc.subscription_type_id = st.id
+                                ) AS linked_channels,
+                                (
+                                    SELECT json_agg(sp.*)
+                                    FROM subscription_plans sp
+                                    WHERE sp.subscription_type_id = st.id
+                                ) AS plans
+                            FROM subscription_types st
+                            WHERE st.group_id = sg.id AND st.is_active = TRUE
+                            ORDER BY st.sort_order, st.created_at DESC
+                        ) st_details
+                    ) as subscription_types
+                FROM subscription_groups sg
+                WHERE sg.is_active = TRUE
+                ORDER BY sg.sort_order;
             """
-            results = await connection.fetch(query)
+            grouped_results = await connection.fetch(query)
 
-        types_list = []
-        for row_data in results:
-            type_item = dict(row_data)
-            # features و terms_and_conditions يفترض أن تُرجع كـ list/dict من asyncpg/psycopg
-            # إذا كانت تُرجع كنص JSON، عندها ستحتاج للتحويل.
-            # asyncpg عادة ما يحول jsonb إلى Python dict/list تلقائيًا
-            if isinstance(type_item.get("features"), str):  # احتياطًا
-                type_item["features"] = json.loads(type_item["features"]) if type_item["features"] else []
-            elif type_item.get("features") is None:
-                type_item["features"] = []
+            # جلب الأنواع غير المجمعة (التي لا تنتمي لمجموعة)
+            ungrouped_query = """
+                 SELECT 
+                    st.id, st.name, st.channel_id AS main_channel_id, st.group_id, st.sort_order,
+                    st.description, st.image_url, st.image_file_id, st.features, st.usp, st.is_active, 
+                    st.is_recommended, st.created_at, st.terms_and_conditions,
+                    (
+                        SELECT json_agg(json_build_object('channel_id', stc.channel_id, 'channel_name', stc.channel_name, 'is_main', stc.is_main)) 
+                        FROM subscription_type_channels stc 
+                        WHERE stc.subscription_type_id = st.id
+                    ) AS linked_channels,
+                    (
+                        SELECT json_agg(sp.*)
+                        FROM subscription_plans sp
+                        WHERE sp.subscription_type_id = st.id
+                    ) AS plans
+                FROM subscription_types st
+                WHERE st.group_id IS NULL AND st.is_active = TRUE
+                ORDER BY st.sort_order, st.created_at DESC;
+            """
+            ungrouped_results = await connection.fetch(ungrouped_query)
 
-            if isinstance(type_item.get("terms_and_conditions"), str):  # <-- إضافة جديدة, احتياطًا
-                type_item["terms_and_conditions"] = json.loads(type_item["terms_and_conditions"]) if type_item[
-                    "terms_and_conditions"] else []
-            elif type_item.get("terms_and_conditions") is None:  # <-- إضافة جديدة
-                type_item["terms_and_conditions"] = []
+        # بناء الاستجابة
+        response_data = []
+        for group_row in grouped_results:
+            group_data = dict(group_row)
+            # استخدام الدالة المساعدة لمعالجة كل نوع داخل المجموعة
+            types_list = [_format_subscription_type_data(t) for t in json.loads(group_data.get("subscription_types", "[]") or "[]")]
+            
+            response_data.append({
+                "id": group_data["group_id"],
+                "name": group_data["group_name"],
+                "description": group_data["group_description"],
+                "color": group_data["group_color"],
+                "icon": group_data["group_icon"],
+                "sort_order": group_data["group_sort_order"],
+                "subscription_types": types_list
+            })
 
-            if isinstance(type_item.get("linked_channels"), str):
-                type_item["linked_channels"] = json.loads(type_item["linked_channels"]) if type_item[
-                    "linked_channels"] else []
-            elif type_item.get("linked_channels") is None:
-                type_item["linked_channels"] = []
+        # إضافة الأنواع غير المجمعة
+        if ungrouped_results:
+            ungrouped_types_list = [_format_subscription_type_data(row) for row in ungrouped_results]
+            if ungrouped_types_list:
+                response_data.append({
+                    "id": None, "name": "Other Subscriptions",
+                    "description": "Subscription types not assigned to any group",
+                    "color": "#757575", "icon": "category", "sort_order": 999,
+                    "subscription_types": ungrouped_types_list
+                })
 
-            types_list.append(type_item)
+        return jsonify(response_data), 200
 
-        return jsonify(types_list), 200
     except Exception as e:
-        logging.error("Error fetching subscription types: %s", e, exc_info=True)
+        logging.error("Error fetching all subscription data: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
-
-# --- جلب تفاصيل نوع اشتراك معين ---
+# --- جلب تفاصيل نوع اشتراك معين (مُحسّن) ---
+# هذا لا يزال مفيداً لصفحة التعديل إذا لم نرد جلب كل شيء
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["GET"])
 @permission_required("subscription_types.read")
 async def get_subscription_type(type_id: int):
     try:
         async with current_app.db_pool.acquire() as connection:
-            query_type = """
-                SELECT id, name, channel_id AS main_channel_id, description, image_url, 
-                       features, usp, is_active, created_at, terms_and_conditions -- <-- إضافة جديدة
-                FROM subscription_types
-                WHERE id = $1;
+            query = """
+                SELECT 
+                    st.*,
+                    sg.name AS group_name, sg.color AS group_color, sg.icon AS group_icon,
+                    (SELECT json_agg(json_build_object('channel_id', stc.channel_id, 'channel_name', stc.channel_name, 'is_main', stc.is_main)) 
+                     FROM subscription_type_channels stc WHERE stc.subscription_type_id = st.id) AS linked_channels,
+                    (SELECT json_agg(sp.*) FROM subscription_plans sp WHERE sp.subscription_type_id = st.id) AS plans
+                FROM subscription_types st
+                LEFT JOIN subscription_groups sg ON st.group_id = sg.id
+                WHERE st.id = $1;
             """
-            type_details = await connection.fetchrow(query_type, type_id)
+            type_details_row = await connection.fetchrow(query, type_id)
 
-            if not type_details:
+            if not type_details_row:
                 return jsonify({"error": "Subscription type not found"}), 404
+            
+            # استخدم الدالة المساعدة لتوحيد المعالجة
+            formatted_data = _format_subscription_type_data(type_details_row)
+            return jsonify(formatted_data), 200
 
-            query_channels = """
-                SELECT channel_id, channel_name, is_main
-                FROM subscription_type_channels
-                WHERE subscription_type_id = $1
-                ORDER BY is_main DESC, channel_name;
-            """
-            linked_channels_rows = await connection.fetch(query_channels, type_id)
-
-            response_data = dict(type_details)
-            # asyncpg عادة ما يحول jsonb إلى Python dict/list تلقائيًا
-            if isinstance(response_data.get("features"), str):  # احتياطًا
-                response_data["features"] = json.loads(response_data["features"]) if response_data["features"] else []
-            elif response_data.get("features") is None:
-                response_data["features"] = []
-
-            if isinstance(response_data.get("terms_and_conditions"), str):  # <-- إضافة جديدة, احتياطًا
-                response_data["terms_and_conditions"] = json.loads(response_data["terms_and_conditions"]) if \
-                response_data["terms_and_conditions"] else []
-            elif response_data.get("terms_and_conditions") is None:  # <-- إضافة جديدة
-                response_data["terms_and_conditions"] = []
-
-            response_data["linked_channels"] = [dict(row) for row in linked_channels_rows]
-
-        return jsonify(response_data), 200
     except Exception as e:
         logging.error("Error fetching subscription type %s: %s", type_id, e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+# --- إنشاء مجموعة جديدة ---
+@admin_routes.route("/subscription-groups", methods=["POST"])
+@permission_required("subscription_types.create")
+async def create_subscription_group():
+    try:
+        data = await request.get_json()
+        name = data.get("name")
+        description = data.get("description", "")
+        image_url = data.get("image_url", "")
+        color = data.get("color", "#3f51b5")
+        icon = data.get("icon", "category")
+        is_active = data.get("is_active", True)
+        sort_order = data.get("sort_order", 0)
+
+        if not name:
+            return jsonify({"error": "Missing required field: name"}), 400
+
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                INSERT INTO subscription_groups 
+                (name, description, image_url, color, icon, is_active, sort_order)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, name, description, image_url, color, icon, is_active, 
+                          sort_order, created_at, updated_at;
+            """
+            created_group = await connection.fetchrow(
+                query, name, description, image_url, color, icon, is_active, sort_order
+            )
+
+            if not created_group:
+                raise Exception("Failed to create subscription group record.")
+
+            return jsonify(dict(created_group)), 201
+
+    except Exception as e:
+        logging.error("Error creating subscription group: %s", e, exc_info=True)
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+
+# --- جلب قائمة المجموعات ---
+@admin_routes.route("/subscription-groups", methods=["GET"])
+@permission_required("subscription_types.read")
+async def get_subscription_groups():
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                SELECT 
+                    sg.id, sg.name, sg.description, sg.image_url, sg.color, sg.icon,
+                    sg.is_active, sg.sort_order, sg.created_at, sg.updated_at,
+                    COUNT(st.id) as subscription_types_count
+                FROM subscription_groups sg
+                LEFT JOIN subscription_types st ON sg.id = st.group_id
+                GROUP BY sg.id, sg.name, sg.description, sg.image_url, sg.color, 
+                         sg.icon, sg.is_active, sg.sort_order, sg.created_at, sg.updated_at
+                ORDER BY sg.sort_order, sg.created_at DESC;
+            """
+            results = await connection.fetch(query)
+
+        groups_list = [dict(row) for row in results]
+        return jsonify(groups_list), 200
+
+    except Exception as e:
+        logging.error("Error fetching subscription groups: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# --- جلب تفاصيل مجموعة معينة مع أنواع الاشتراكات ---
+@admin_routes.route("/subscription-groups/<int:group_id>", methods=["GET"])
+@permission_required("subscription_types.read")
+async def get_subscription_group(group_id: int):
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            # جلب بيانات المجموعة
+            group_query = """
+                SELECT id, name, description, image_url, color, icon, is_active,
+                       sort_order, created_at, updated_at
+                FROM subscription_groups
+                WHERE id = $1;
+            """
+            group_details = await connection.fetchrow(group_query, group_id)
+
+            if not group_details:
+                return jsonify({"error": "Subscription group not found"}), 404
+
+            # جلب أنواع الاشتراكات في هذه المجموعة
+            types_query = """
+                SELECT id, name, channel_id, description, image_url, features, usp,
+                       is_active, is_recommended, sort_order, created_at
+                FROM subscription_types
+                WHERE group_id = $1
+                ORDER BY sort_order, created_at DESC;
+            """
+            subscription_types = await connection.fetch(types_query, group_id)
+
+            response_data = dict(group_details)
+            response_data["subscription_types"] = []
+
+            for type_row in subscription_types:
+                type_data = dict(type_row)
+                # تحويل features إذا كان نص JSON
+                if isinstance(type_data.get("features"), str):
+                    type_data["features"] = json.loads(type_data["features"]) if type_data["features"] else []
+                elif type_data.get("features") is None:
+                    type_data["features"] = []
+                response_data["subscription_types"].append(type_data)
+
+        return jsonify(response_data), 200
+
+    except Exception as e:
+        logging.error("Error fetching subscription group %s: %s", group_id, e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# --- تعديل مجموعة ---
+@admin_routes.route("/subscription-groups/<int:group_id>", methods=["PUT"])
+@permission_required("subscription_types.update")
+async def update_subscription_group(group_id: int):
+    try:
+        data = await request.get_json()
+        if not data:
+            return jsonify({"error": "Request body must be JSON"}), 400
+
+        name = data.get("name")
+        description = data.get("description")
+        image_url = data.get("image_url")
+        color = data.get("color")
+        icon = data.get("icon")
+        is_active = data.get("is_active")
+        sort_order = data.get("sort_order")
+
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                UPDATE subscription_groups
+                SET name = COALESCE($1, name),
+                    description = COALESCE($2, description),
+                    image_url = COALESCE($3, image_url),
+                    color = COALESCE($4, color),
+                    icon = COALESCE($5, icon),
+                    is_active = COALESCE($6, is_active),
+                    sort_order = COALESCE($7, sort_order)
+                WHERE id = $8
+                RETURNING id, name, description, image_url, color, icon, is_active,
+                          sort_order, created_at, updated_at;
+            """
+            updated_group = await connection.fetchrow(
+                query, name, description, image_url, color, icon, is_active, sort_order, group_id
+            )
+
+            if not updated_group:
+                return jsonify({"error": "Subscription group not found"}), 404
+
+            return jsonify(dict(updated_group)), 200
+
+    except Exception as e:
+        logging.error("Error updating subscription group %s: %s", group_id, e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# --- حذف مجموعة ---
+@admin_routes.route("/subscription-groups/<int:group_id>", methods=["DELETE"])
+@permission_required("subscription_types.delete")
+async def delete_subscription_group(group_id: int):
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            async with connection.transaction():
+                # التحقق من وجود أنواع اشتراكات في المجموعة
+                types_count = await connection.fetchval(
+                    "SELECT COUNT(*) FROM subscription_types WHERE group_id = $1", group_id
+                )
+
+                if types_count > 0:
+                    return jsonify({
+                        "error": f"Cannot delete group with {types_count} subscription types. Please move or delete them first."
+                    }), 400
+
+                # حذف المجموعة
+                deleted = await connection.fetchval(
+                    "DELETE FROM subscription_groups WHERE id = $1 RETURNING id", group_id
+                )
+
+                if not deleted:
+                    return jsonify({"error": "Subscription group not found"}), 404
+
+                return jsonify({"message": "Subscription group deleted successfully"}), 200
+
+    except Exception as e:
+        logging.error("Error deleting subscription group %s: %s", group_id, e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 #######################################
 # نقاط API لإدارة خطط الاشتراك (subscription_plans)
