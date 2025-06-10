@@ -104,9 +104,10 @@ Quart==0.20.0
 quart-cors==0.8.0
 redis==5.2.1
 regex==2024.11.6
-requests-toolbelt
-requests
-urllib3
+imagekitio
+requests-toolbelt==0.9.1  # مثال لإصدار قديم قد يكون متوافقًا
+urllib3>=1.26,<2  # مثال لتحديد نطاق إصدار urllib3
+requests>=2.25,<3
 rlp==4.1.0
 rsa==4.9
 setuptools==75.8.0
@@ -137,7 +138,7 @@ wsproto==1.2.0
 x25519==0.0.2
 XlsxWriter==3.2.2
 yarl==1.18.3
-imagekitio
+
 transformers==4.51.3
 pgvector==0.4.0
 sentence-transformers
