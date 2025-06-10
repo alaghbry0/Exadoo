@@ -105,9 +105,9 @@ quart-cors==0.8.0
 redis==5.2.1
 regex==2024.11.6
 imagekitio
-requests-toolbelt==0.9.1  # مثال لإصدار قديم قد يكون متوافقًا
-urllib3>=1.26,<2  # مثال لتحديد نطاق إصدار urllib3
-requests>=2.25,<3
+requests-toolbelt
+urllib3
+requests
 rlp==4.1.0
 rsa==4.9
 setuptools==75.8.0
@@ -124,7 +124,7 @@ toolz==1.0.0
 tqdm==4.67.1
 tronpy==0.5.0
 tvm-valuetypes==0.0.12
-types-requests==2.32.0.20250306
+types-requests
 typing_extensions==4.12.2
 tzdata==2024.2
 tzlocal==5.2
