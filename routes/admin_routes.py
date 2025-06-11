@@ -1028,6 +1028,7 @@ async def get_all_subscription_data():
                     sg.color as group_color, 
                     sg.icon as group_icon, 
                     sg.sort_order as group_sort_order,
+                    sg.display_as_single_card,
                     (
                         SELECT json_agg(st_details)
                         FROM (
@@ -1092,6 +1093,7 @@ async def get_all_subscription_data():
                 "color": group_data["group_color"],
                 "icon": group_data["group_icon"],
                 "sort_order": group_data["group_sort_order"],
+                "display_as_single_card": group_data["display_as_single_card"],
                 "subscription_types": types_list
             })
 
@@ -1103,6 +1105,7 @@ async def get_all_subscription_data():
                     "id": None, "name": "Other Subscriptions",
                     "description": "Subscription types not assigned to any group",
                     "color": "#757575", "icon": "category", "sort_order": 999,
+                    "display_as_single_card": False,
                     "subscription_types": ungrouped_types_list
                 })
 
@@ -1207,6 +1210,7 @@ async def create_subscription_group():
         icon = data.get("icon", "category")
         is_active = data.get("is_active", True)
         sort_order = data.get("sort_order", 0)
+        display_as_single_card = data.get("display_as_single_card", False) # <--- الحقل الجديد
 
         if not name:
             return jsonify({"error": "Missing required field: name"}), 400
@@ -1214,13 +1218,13 @@ async def create_subscription_group():
         async with current_app.db_pool.acquire() as connection:
             query = """
                 INSERT INTO subscription_groups 
-                (name, description, image_url, color, icon, is_active, sort_order)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (name, description, image_url, color, icon, is_active, sort_order, display_as_single_card)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING id, name, description, image_url, color, icon, is_active, 
-                          sort_order, created_at, updated_at;
+                          sort_order, created_at, updated_at, display_as_single_card;
             """
             created_group = await connection.fetchrow(
-                query, name, description, image_url, color, icon, is_active, sort_order
+                query, name, description, image_url, color, icon, is_active, sort_order, display_as_single_card
             )
 
             if not created_group:
@@ -1243,11 +1247,13 @@ async def get_subscription_groups():
                 SELECT 
                     sg.id, sg.name, sg.description, sg.image_url, sg.color, sg.icon,
                     sg.is_active, sg.sort_order, sg.created_at, sg.updated_at,
+                    sg.display_as_single_card, -- <--- الحقل الجديد
                     COUNT(st.id) as subscription_types_count
                 FROM subscription_groups sg
                 LEFT JOIN subscription_types st ON sg.id = st.group_id
                 GROUP BY sg.id, sg.name, sg.description, sg.image_url, sg.color, 
-                         sg.icon, sg.is_active, sg.sort_order, sg.created_at, sg.updated_at
+                         sg.icon, sg.is_active, sg.sort_order, sg.created_at, sg.updated_at,
+                         sg.display_as_single_card -- <--- إضافة للحقل الجديد في GROUP BY
                 ORDER BY sg.sort_order, sg.created_at DESC;
             """
             results = await connection.fetch(query)
@@ -1257,6 +1263,92 @@ async def get_subscription_groups():
 
     except Exception as e:
         logging.error("Error fetching subscription groups: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# --- تعديل مجموعة ---
+@admin_routes.route("/subscription-groups/<int:group_id>", methods=["PUT"])
+@permission_required("subscription_types.update")
+async def update_subscription_group(group_id: int):
+    try:
+        data = await request.get_json()
+        if not data:
+            return jsonify({"error": "Request body must be JSON"}), 400
+
+        name = data.get("name")
+        description = data.get("description")
+        image_url = data.get("image_url")
+        color = data.get("color")
+        icon = data.get("icon")
+        is_active = data.get("is_active")
+        sort_order = data.get("sort_order")
+        display_as_single_card = data.get("display_as_single_card")  # <--- الحقل الجديد
+
+        # بناء جملة التحديث بشكل ديناميكي لتجنب تحديث الحقل إلى NULL إذا لم يتم إرساله
+        # ولكن مع COALESCE سيتم الحفاظ على القيمة القديمة إذا لم يُرسل الجديد
+        # باستثناء display_as_single_card، إذا لم يتم إرساله، لن يتم تحديثه
+        # إذا أردت تحديثه فقط عند إرساله، يمكن بناء set_clauses بشكل أكثر تفصيلاً
+        # ولكن COALESCE مع قيمة null إذا لم يأتِ شيء، أو قيمته إذا جاء، ثم قيمة الحقل الحالية هو الأسهل
+
+        set_clauses = []
+        params = []
+        param_idx = 1
+
+        if name is not None:
+            set_clauses.append(f"name = ${param_idx}")
+            params.append(name)
+            param_idx += 1
+        if description is not None:
+            set_clauses.append(f"description = ${param_idx}")
+            params.append(description)
+            param_idx += 1
+        if image_url is not None:
+            set_clauses.append(f"image_url = ${param_idx}")
+            params.append(image_url)
+            param_idx += 1
+        if color is not None:
+            set_clauses.append(f"color = ${param_idx}")
+            params.append(color)
+            param_idx += 1
+        if icon is not None:
+            set_clauses.append(f"icon = ${param_idx}")
+            params.append(icon)
+            param_idx += 1
+        if is_active is not None:  # Boolean يمكن أن يكون False
+            set_clauses.append(f"is_active = ${param_idx}")
+            params.append(is_active)
+            param_idx += 1
+        if sort_order is not None:
+            set_clauses.append(f"sort_order = ${param_idx}")
+            params.append(sort_order)
+            param_idx += 1
+        if display_as_single_card is not None:  # Boolean يمكن أن يكون False
+            set_clauses.append(f"display_as_single_card = ${param_idx}")
+            params.append(display_as_single_card)
+            param_idx += 1
+
+        if not set_clauses:
+            return jsonify({"error": "No fields to update"}), 400
+
+        params.append(group_id)  # لمعرف المجموعة في WHERE
+
+        async with current_app.db_pool.acquire() as connection:
+            query = f"""
+                UPDATE subscription_groups
+                SET {', '.join(set_clauses)}, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ${param_idx}
+                RETURNING id, name, description, image_url, color, icon, is_active,
+                          sort_order, created_at, updated_at, display_as_single_card;
+            """
+            updated_group = await connection.fetchrow(query, *params)
+
+            if not updated_group:
+                return jsonify({"error": "Subscription group not found"}), 404
+
+            return jsonify(dict(updated_group)), 200
+
+    except Exception as e:
+        logging.error("Error updating subscription group %s: %s", group_id, e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
@@ -1304,51 +1396,6 @@ async def get_subscription_group(group_id: int):
 
     except Exception as e:
         logging.error("Error fetching subscription group %s: %s", group_id, e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
-
-
-# --- تعديل مجموعة ---
-@admin_routes.route("/subscription-groups/<int:group_id>", methods=["PUT"])
-@permission_required("subscription_types.update")
-async def update_subscription_group(group_id: int):
-    try:
-        data = await request.get_json()
-        if not data:
-            return jsonify({"error": "Request body must be JSON"}), 400
-
-        name = data.get("name")
-        description = data.get("description")
-        image_url = data.get("image_url")
-        color = data.get("color")
-        icon = data.get("icon")
-        is_active = data.get("is_active")
-        sort_order = data.get("sort_order")
-
-        async with current_app.db_pool.acquire() as connection:
-            query = """
-                UPDATE subscription_groups
-                SET name = COALESCE($1, name),
-                    description = COALESCE($2, description),
-                    image_url = COALESCE($3, image_url),
-                    color = COALESCE($4, color),
-                    icon = COALESCE($5, icon),
-                    is_active = COALESCE($6, is_active),
-                    sort_order = COALESCE($7, sort_order)
-                WHERE id = $8
-                RETURNING id, name, description, image_url, color, icon, is_active,
-                          sort_order, created_at, updated_at;
-            """
-            updated_group = await connection.fetchrow(
-                query, name, description, image_url, color, icon, is_active, sort_order, group_id
-            )
-
-            if not updated_group:
-                return jsonify({"error": "Subscription group not found"}), 404
-
-            return jsonify(dict(updated_group)), 200
-
-    except Exception as e:
-        logging.error("Error updating subscription group %s: %s", group_id, e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 

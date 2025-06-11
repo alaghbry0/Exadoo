@@ -114,35 +114,158 @@ async def get_public_subscription_types():
 
 
 # نقطة API لجلب قائمة بخطط الاشتراك العامة (تبقى كما هي)
-@public_routes.route("/subscription-plans", methods=["GET"])
-async def get_public_subscription_plans():
+@public_routes.route("/subscription-groups", methods=["GET"])
+async def get_public_subscription_groups():
     try:
-        subscription_type_id = request.args.get("subscription_type_id")
         async with current_app.db_pool.acquire() as connection:
-            if subscription_type_id:
-                query = """
-                    SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
-                    FROM subscription_plans
-                    WHERE subscription_type_id = $1 AND is_active = true
-                    ORDER BY price ASC, created_at DESC -- ترتيب الخطط حسب السعر مهم
-                """
-                results = await connection.fetch(query, int(subscription_type_id))
-            else:
-                query = """
-                    SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
-                    FROM subscription_plans
-                    WHERE is_active = true
-                    ORDER BY price ASC, created_at DESC -- ترتيب الخطط حسب السعر مهم
-                """
-                results = await connection.fetch(query)
+            query = """
+                SELECT 
+                    sg.id, 
+                    sg.name, 
+                    sg.description, 
+                    sg.image_url, 
+                    sg.color, 
+                    sg.icon, 
+                    sg.is_active,
+                    sg.sort_order,
+                    sg.display_as_single_card, -- <--- الحقل الجديد
+                    sg.created_at,
+                    sg.updated_at
+                FROM subscription_groups sg -- تمت إضافة sg كاسم مستعار
+                WHERE sg.is_active = true  -- استخدام الاسم المستعار هنا أيضاً
+                ORDER BY sg.sort_order ASC, sg.name ASC
+            """
+            results = await connection.fetch(query)
 
-        plans = [dict(r) for r in results]
-        return jsonify(plans), 200, {
-            "Cache-Control": "public, max-age=300",
+        groups = [dict(row) for row in results]
+        return jsonify(groups), 200, {
+            "Cache-Control": "public, max-age=300", # أو أزله إذا كانت البيانات تتغير كثيرًا
             "Content-Type": "application/json; charset=utf-8"
         }
     except Exception as e:
-        logging.error("Error fetching public subscription plans: %s", e, exc_info=True)
+        logging.error("Error fetching public subscription groups: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# دالة مساعدة عامة لمعالجة بيانات نوع الاشتراك (يمكن تكييفها من دالة لوحة التحكم)
+def _format_public_subscription_type(type_data, plans_for_type):
+    data = dict(type_data)  # type_data ستكون Record من fetch
+
+    # معالجة features إذا كانت سلسلة JSON
+    if 'features' in data and isinstance(data['features'], str):
+        data['features'] = json.loads(data['features'] or "[]")
+    elif 'features' not in data or data['features'] is None:
+        data['features'] = []
+
+    # معالجة terms_and_conditions إذا كانت سلسلة JSON
+    if 'terms_and_conditions' in data and isinstance(data['terms_and_conditions'], str):
+        data['terms_and_conditions'] = json.loads(data['terms_and_conditions'] or "[]")
+    elif 'terms_and_conditions' not in data or data['terms_and_conditions'] is None:
+        data['terms_and_conditions'] = []
+
+    data['subscription_options'] = [dict(plan) for plan in plans_for_type]  # أو 'plans'
+    return data
+
+
+@public_routes.route("/all-subscription-data", methods=["GET"])
+async def get_public_all_subscription_data():
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            # 1. جلب المجموعات النشطة
+            groups_query = """
+                SELECT 
+                    id, name, description, image_url, color, icon, 
+                    sort_order, display_as_single_card
+                FROM subscription_groups
+                WHERE is_active = TRUE
+                ORDER BY sort_order;
+            """
+            groups_records = await connection.fetch(groups_query)
+
+            # 2. جلب كل أنواع الاشتراكات النشطة
+            types_query = """
+                SELECT 
+                    id, name, channel_id, group_id, sort_order,
+                    description, image_url, features, usp, is_recommended, 
+                    terms_and_conditions, created_at
+                FROM subscription_types
+                WHERE is_active = TRUE
+                ORDER BY group_id, sort_order, created_at DESC; 
+            """
+            types_records = await connection.fetch(types_query)
+
+            # 3. جلب كل خطط الاشتراكات النشطة
+            plans_query = """
+                SELECT 
+                    id, subscription_type_id, name, price, original_price, 
+                    telegram_stars_price, duration_days
+                FROM subscription_plans
+                WHERE is_active = TRUE
+                ORDER BY subscription_type_id, price ASC;
+            """
+            plans_records = await connection.fetch(plans_query)
+
+        # هيكلة البيانات:
+        # تحويل الخطط إلى قاموس لتسهيل البحث
+        plans_by_type_id = {}
+        for plan_row in plans_records:
+            plan_dict = dict(plan_row)
+            type_id = plan_dict['subscription_type_id']
+            if type_id not in plans_by_type_id:
+                plans_by_type_id[type_id] = []
+            plans_by_type_id[type_id].append(plan_dict)
+
+        # تحويل الأنواع إلى قاموس لتسهيل البحث وتضمين الخطط
+        types_by_group_id = {}
+        ungrouped_types = []
+
+        for type_row in types_records:
+            type_dict = dict(type_row)
+            type_id = type_dict['id']
+            group_id = type_dict.get('group_id')
+
+            # استخدام دالة التنسيق لتجهيز النوع وإضافة الخطط
+            formatted_type = _format_public_subscription_type(
+                type_row,  # تمرير السجل مباشرة
+                plans_by_type_id.get(type_id, [])
+            )
+
+            if group_id:
+                if group_id not in types_by_group_id:
+                    types_by_group_id[group_id] = []
+                types_by_group_id[group_id].append(formatted_type)
+            else:
+                ungrouped_types.append(formatted_type)
+
+        # بناء الاستجابة النهائية
+        response_data = []
+        for group_row in groups_records:
+            group_data = dict(group_row)
+            group_id = group_data['id']
+            group_data['subscription_types'] = types_by_group_id.get(group_id, [])
+            response_data.append(group_data)
+
+        # إضافة الأنواع غير المجمعة (إذا أردت عرضها بشكل منفصل)
+        if ungrouped_types:
+            response_data.append({
+                "id": None,  # أو معرف خاص للأنواع غير المجمعة
+                "name": "اشتراكات أخرى",  # "Other Subscriptions"
+                "description": "أنواع اشتراكات غير مخصصة لمجموعة",
+                "display_as_single_card": False,  # الأنواع غير المجمعة تعرض منفصلة دائمًا
+                "subscription_types": ungrouped_types,
+                "sort_order": 999  # لضمان ظهورها في الآخر
+            })
+
+        # يمكنك فلترة المجموعات التي ليس لديها أنواع اشتراكات إذا أردت
+        # response_data = [group for group in response_data if group['subscription_types']]
+
+        return jsonify(response_data), 200, {
+            "Cache-Control": "public, max-age=120",  # قلل max-age إذا كانت البيانات تتغير بسرعة
+            "Content-Type": "application/json; charset=utf-8"
+        }
+
+    except Exception as e:
+        logging.error("Error fetching all public subscription data: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 @public_routes.route("/payment-history", methods=["GET"])
