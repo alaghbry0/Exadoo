@@ -1112,6 +1112,57 @@ async def get_all_subscription_data():
         logging.error("Error fetching all subscription data: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
+
+# --- جلب قائمة أنواع الاشتراكات ---
+@admin_routes.route("/subscription-types", methods=["GET"])
+@permission_required("subscription_types.read")
+async def get_subscription_types():
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            query = """
+                SELECT 
+                    st.id, st.name, st.channel_id AS main_channel_id, st.description, 
+                    st.image_url, st.features, st.usp, st.is_active, st.created_at,
+                    st.terms_and_conditions, -- <-- إضافة جديدة
+                    (SELECT json_agg(json_build_object('channel_id', stc.channel_id, 'channel_name', stc.channel_name, 'is_main', stc.is_main)) 
+                     FROM subscription_type_channels stc 
+                     WHERE stc.subscription_type_id = st.id) AS linked_channels
+                FROM subscription_types st
+                ORDER BY st.created_at DESC;
+            """
+            results = await connection.fetch(query)
+
+        types_list = []
+        for row_data in results:
+            type_item = dict(row_data)
+            # features و terms_and_conditions يفترض أن تُرجع كـ list/dict من asyncpg/psycopg
+            # إذا كانت تُرجع كنص JSON، عندها ستحتاج للتحويل.
+            # asyncpg عادة ما يحول jsonb إلى Python dict/list تلقائيًا
+            if isinstance(type_item.get("features"), str):  # احتياطًا
+                type_item["features"] = json.loads(type_item["features"]) if type_item["features"] else []
+            elif type_item.get("features") is None:
+                type_item["features"] = []
+
+            if isinstance(type_item.get("terms_and_conditions"), str):  # <-- إضافة جديدة, احتياطًا
+                type_item["terms_and_conditions"] = json.loads(type_item["terms_and_conditions"]) if type_item[
+                    "terms_and_conditions"] else []
+            elif type_item.get("terms_and_conditions") is None:  # <-- إضافة جديدة
+                type_item["terms_and_conditions"] = []
+
+            if isinstance(type_item.get("linked_channels"), str):
+                type_item["linked_channels"] = json.loads(type_item["linked_channels"]) if type_item[
+                    "linked_channels"] else []
+            elif type_item.get("linked_channels") is None:
+                type_item["linked_channels"] = []
+
+            types_list.append(type_item)
+
+        return jsonify(types_list), 200
+    except Exception as e:
+        logging.error("Error fetching subscription types: %s", e, exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
 # --- جلب تفاصيل نوع اشتراك معين (مُحسّن) ---
 # هذا لا يزال مفيداً لصفحة التعديل إذا لم نرد جلب كل شيء
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["GET"])
