@@ -16,38 +16,37 @@ async def create_db_pool():
 public_routes = Blueprint("public_routes", __name__, url_prefix="/api/public")
 
 
-# --- إضافة جديدة: نقطة API لجلب مجموعات الاشتراكات العامة ---
 @public_routes.route("/subscription-groups", methods=["GET"])
 async def get_public_subscription_groups():
     try:
         async with current_app.db_pool.acquire() as connection:
             query = """
                 SELECT 
-                    id, 
-                    name, 
-                    description, 
-                    image_url, 
-                    color, 
-                    icon, 
-                    is_active,
-                    sort_order,
-                    created_at,
-                    updated_at
-                FROM subscription_groups
-                WHERE is_active = true
-                ORDER BY sort_order ASC, name ASC
+                    sg.id, 
+                    sg.name, 
+                    sg.description, 
+                    sg.image_url, 
+                    sg.color, 
+                    sg.icon, 
+                    sg.is_active,
+                    sg.sort_order,
+                    sg.display_as_single_card, -- <--- الحقل الجديد
+                    sg.created_at,
+                    sg.updated_at
+                FROM subscription_groups sg -- تمت إضافة sg كاسم مستعار
+                WHERE sg.is_active = true  -- استخدام الاسم المستعار هنا أيضاً
+                ORDER BY sg.sort_order ASC, sg.name ASC
             """
             results = await connection.fetch(query)
 
         groups = [dict(row) for row in results]
         return jsonify(groups), 200, {
-            "Cache-Control": "public, max-age=300",
+            "Cache-Control": "public, max-age=300", # أو أزله إذا كانت البيانات تتغير كثيرًا
             "Content-Type": "application/json; charset=utf-8"
         }
     except Exception as e:
         logging.error("Error fetching public subscription groups: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
 
 # نقطة API لجلب قائمة بأنواع الاشتراكات العامة
 @public_routes.route("/subscription-types", methods=["GET"])
@@ -112,39 +111,6 @@ async def get_public_subscription_types():
         logging.error("Error fetching public subscription types: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
-
-# نقطة API لجلب قائمة بخطط الاشتراك العامة (تبقى كما هي)
-@public_routes.route("/subscription-groups", methods=["GET"])
-async def get_public_subscription_groups():
-    try:
-        async with current_app.db_pool.acquire() as connection:
-            query = """
-                SELECT 
-                    sg.id, 
-                    sg.name, 
-                    sg.description, 
-                    sg.image_url, 
-                    sg.color, 
-                    sg.icon, 
-                    sg.is_active,
-                    sg.sort_order,
-                    sg.display_as_single_card, -- <--- الحقل الجديد
-                    sg.created_at,
-                    sg.updated_at
-                FROM subscription_groups sg -- تمت إضافة sg كاسم مستعار
-                WHERE sg.is_active = true  -- استخدام الاسم المستعار هنا أيضاً
-                ORDER BY sg.sort_order ASC, sg.name ASC
-            """
-            results = await connection.fetch(query)
-
-        groups = [dict(row) for row in results]
-        return jsonify(groups), 200, {
-            "Cache-Control": "public, max-age=300", # أو أزله إذا كانت البيانات تتغير كثيرًا
-            "Content-Type": "application/json; charset=utf-8"
-        }
-    except Exception as e:
-        logging.error("Error fetching public subscription groups: %s", e, exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
 
 
 # دالة مساعدة عامة لمعالجة بيانات نوع الاشتراك (يمكن تكييفها من دالة لوحة التحكم)
