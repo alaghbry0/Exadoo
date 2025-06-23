@@ -7,6 +7,7 @@ from config import DATABASE_CONFIG, SECRET_KEY
 from auth import get_current_user
 from datetime import datetime, timezone, timedelta
 import pytz
+from dataclasses import asdict
 from functools import wraps
 import jwt
 from imagekitio import ImageKit
@@ -25,7 +26,7 @@ from database.db_queries import (
     delete_scheduled_tasks_for_subscription
 )
 from database.db_queries import update_subscription as update_subscription_db
-
+from utils.messaging_batch import FailedSendDetail
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
@@ -598,7 +599,6 @@ async def create_subscription_type():
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 
-# --- تعديل بيانات نوع اشتراك موجود ---
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["PUT"])
 @permission_required("subscription_types.update")
 async def update_subscription_type(type_id: int):
@@ -607,7 +607,7 @@ async def update_subscription_type(type_id: int):
         if not data:
             return jsonify({"error": "Request body must be JSON"}), 400
 
-        # --- جلب الحقول من data (مع تعديلات الصورة) ---
+        # --- استخراج البيانات من الطلب ---
         name = data.get("name")
         new_main_channel_id_input = data.get("main_channel_id")
         main_channel_name_input = data.get("main_channel_name")
@@ -621,32 +621,27 @@ async def update_subscription_type(type_id: int):
         group_id_input = data.get("group_id")
         sort_order_input = data.get("sort_order")
         is_recommended_input = data.get("is_recommended")
-
-        # --- [تعديل جديد] استقبال حقول الصورة من الواجهة ---
         image_url_from_client = data.get("image_url")
         image_file_id_from_client = data.get("image_file_id")
         delete_image_flag = data.get("delete_image", False)
-        # --------------------------------------------------------
 
-        # التحقق من صحة group_id إذا تم تمريره (يسمح بـ null)
+        # --- التحقق من صحة البيانات المدخلة ---
         processed_group_id = None
         group_id_provided = "group_id" in data
-
         if group_id_provided:
             if group_id_input is not None:
                 try:
                     processed_group_id = int(group_id_input)
-                except ValueError:
+                except (ValueError, TypeError):
                     return jsonify({"error": "group_id must be an integer or null"}), 400
             else:
                 processed_group_id = None
 
-        # (بقية التحققات للحقول الأخرى كما هي)
         processed_sort_order = None
         if sort_order_input is not None:
             try:
                 processed_sort_order = int(sort_order_input)
-            except ValueError:
+            except (ValueError, TypeError):
                 return jsonify({"error": "sort_order must be an integer"}), 400
 
         processed_is_recommended = None
@@ -662,7 +657,7 @@ async def update_subscription_type(type_id: int):
                 if not temp_main_id_str:
                     return jsonify({"error": "main_channel_id cannot be an empty string if provided"}), 400
                 new_main_channel_id = int(temp_main_id_str)
-            except ValueError:
+            except (ValueError, TypeError):
                 return jsonify({
                     "error": f"main_channel_id '{new_main_channel_id_input}' must be a valid integer if provided"}), 400
 
@@ -676,47 +671,40 @@ async def update_subscription_type(type_id: int):
                         {"error": f"Each secondary channel (index {i}) must be an object with 'channel_id'"}), 400
                 ch_id_value = ch_data.get("channel_id")
                 if ch_id_value is None: continue
-                ch_id_as_str = str(ch_id_value).strip()
-                if not ch_id_as_str: continue
                 try:
-                    ch_id = int(ch_id_as_str)
+                    ch_id = int(str(ch_id_value).strip())
                     ch_name_value = ch_data.get("channel_name", f"Secondary Channel {ch_id}")
                     ch_name_processed = str(ch_name_value).strip() or f"Secondary Channel {ch_id}"
                     valid_new_secondary_channels.append({"channel_id": ch_id, "channel_name": ch_name_processed})
-                except ValueError:
+                except (ValueError, TypeError):
                     return jsonify(
                         {"error": f"Invalid channel_id format '{ch_id_value}' in secondary_channels (index {i})."}), 400
 
-        newly_added_secondary_channels_for_actions = []
-        effective_main_channel_id_after_update = None
-
-        # --- [تعديل جديد] متغير لتخزين ID الملف القديم لحذفه من ImageKit ---
-        old_image_file_id_to_delete_from_imagekit = None
-        # ----------------------------------------------------------------------
+        newly_added_secondary_channels_for_actions: List[Dict] = []
+        old_image_file_id_to_delete_from_imagekit: str = None
+        updated_type_dict: Dict = {}
 
         async with current_app.db_pool.acquire() as connection:
+            # --- المعاملة الرئيسية لتحديثات قاعدة البيانات ---
             async with connection.transaction():
-                # جلب النوع الحالي للتحقق من وجوده وللحصول على القيم الحالية
                 current_type = await connection.fetchrow("SELECT * FROM subscription_types WHERE id = $1", type_id)
                 if not current_type:
                     return jsonify({"error": "Subscription type not found"}), 404
 
-                # التحقق من وجود المجموعة إذا تم توفير group_id جديد
                 if group_id_provided and processed_group_id is not None:
-                    group_exists = await connection.fetchval(
-                        "SELECT id FROM subscription_groups WHERE id = $1", processed_group_id
-                    )
+                    group_exists = await connection.fetchval("SELECT id FROM subscription_groups WHERE id = $1",
+                                                             processed_group_id)
                     if not group_exists:
                         return jsonify({"error": "Invalid group_id: group does not exist"}), 400
 
                 effective_main_channel_id_after_update = new_main_channel_id if new_main_channel_id is not None else \
-                current_type['channel_id']
-                for sec_ch in valid_new_secondary_channels:
-                    if sec_ch["channel_id"] == effective_main_channel_id_after_update:
-                        return jsonify({
-                            "error": f"Secondary channel ID {sec_ch['channel_id']} conflicts with the effective main channel ID {effective_main_channel_id_after_update}."}), 400
+                    current_type['channel_id']
+                if effective_main_channel_id_after_update and any(
+                        sec_ch["channel_id"] == effective_main_channel_id_after_update for sec_ch in
+                        valid_new_secondary_channels):
+                    return jsonify(
+                        {"error": f"A secondary channel ID conflicts with the effective main channel ID."}), 400
 
-                # بناء جملة التحديث ديناميكيًا
                 update_fields = {}
                 if name is not None: update_fields["name"] = name
                 if new_main_channel_id is not None: update_fields["channel_id"] = new_main_channel_id
@@ -730,210 +718,154 @@ async def update_subscription_type(type_id: int):
                 if terms_and_conditions is not None: update_fields["terms_and_conditions"] = json.dumps(
                     terms_and_conditions)
 
-                # --- [تعديل جديد] منطق تحديث الصورة ---
                 current_image_file_id_db = current_type.get('image_file_id')
-
                 if delete_image_flag:
-                    # إذا طلب العميل حذف الصورة
                     if current_image_file_id_db:
                         old_image_file_id_to_delete_from_imagekit = current_image_file_id_db
                     update_fields["image_url"] = None
                     update_fields["image_file_id"] = None
                 elif image_url_from_client is not None or image_file_id_from_client is not None:
-                    # إذا تم إرسال صورة جديدة
                     if current_image_file_id_db and current_image_file_id_db != image_file_id_from_client:
                         old_image_file_id_to_delete_from_imagekit = current_image_file_id_db
                     update_fields["image_url"] = image_url_from_client
                     update_fields["image_file_id"] = image_file_id_from_client
-                # إذا لم يتم إرسال أي شيء بخصوص الصورة، لا يتم تحديث حقولها في قاعدة البيانات
-                # ------------------------------------------
 
-                if not update_fields and secondary_channels_data is None and main_channel_name_input is None:
-                    updated_type_row = current_type
+                if update_fields:
+                    set_clauses = [f"{key} = ${i + 1}" for i, key in enumerate(update_fields)]
+                    params = list(update_fields.values()) + [type_id]
+                    updated_type_row = await connection.fetchrow(
+                        f"UPDATE subscription_types SET {', '.join(set_clauses)} WHERE id = ${len(params)} RETURNING *",
+                        *params)
                 else:
-                    set_clauses = []
-                    params = []
-                    i = 1
-                    for key, value in update_fields.items():
-                        set_clauses.append(f"{key} = ${i}")
-                        params.append(value)
-                        i += 1
-
-                    params.append(type_id)
-
-                    if set_clauses:
-                        query_type_update = f"""
-                            UPDATE subscription_types
-                            SET {', '.join(set_clauses)}
-                            WHERE id = ${i}
-                            RETURNING *; 
-                        """
-                        updated_type_row = await connection.fetchrow(query_type_update, *params)
-                        if not updated_type_row:
-                            return jsonify({"error": "Failed to update subscription type, or type not found."}), 404
-                    else:
-                        updated_type_row = current_type
+                    updated_type_row = current_type
 
                 updated_type_dict = dict(updated_type_row)
-                effective_main_channel_id_after_update = updated_type_dict["channel_id"]
+                effective_main_channel_id_after_update = updated_type_dict.get("channel_id")
 
-                # --- إدارة القنوات (main and secondary) ---
-                # (الكود الخاص بإدارة القنوات يبقى كما هو)
-                current_main_channel_name_db = await connection.fetchval(
-                    """SELECT channel_name FROM subscription_type_channels 
-                       WHERE subscription_type_id = $1 AND channel_id = $2 AND is_main = TRUE""",
-                    type_id, effective_main_channel_id_after_update
-                )
-                main_channel_name_to_use = main_channel_name_input.strip() if main_channel_name_input is not None else None
-                if not main_channel_name_to_use:
-                    if current_main_channel_name_db and current_main_channel_name_db.strip():
-                        main_channel_name_to_use = current_main_channel_name_db.strip()
-                    else:
-                        main_channel_name_to_use = f"Main Channel for {updated_type_dict['name']}"
-
-                await connection.execute(
-                    "UPDATE subscription_type_channels SET is_main = FALSE WHERE subscription_type_id = $1", type_id
-                )
-                await connection.execute(
-                    """
-                    INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
-                    VALUES ($1, $2, $3, TRUE)
-                    ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET
-                    channel_name = EXCLUDED.channel_name, is_main = TRUE;
-                    """, type_id, effective_main_channel_id_after_update, main_channel_name_to_use
-                )
+                if effective_main_channel_id_after_update:
+                    current_main_channel_name_db = await connection.fetchval(
+                        "SELECT channel_name FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = TRUE",
+                        type_id)
+                    main_channel_name_to_use = (
+                            main_channel_name_input or current_main_channel_name_db or f"Main Channel for {updated_type_dict['name']}").strip()
+                    await connection.execute(
+                        "UPDATE subscription_type_channels SET is_main = FALSE WHERE subscription_type_id = $1",
+                        type_id)
+                    await connection.execute(
+                        "INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main) VALUES ($1, $2, $3, TRUE) ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET channel_name = EXCLUDED.channel_name, is_main = TRUE;",
+                        type_id, effective_main_channel_id_after_update, main_channel_name_to_use)
 
                 if secondary_channels_data is not None:
-                    current_secondary_channel_ids_db = {
-                        row['channel_id'] for row in await connection.fetch(
-                            "SELECT channel_id FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = FALSE",
-                            type_id
-                        )
-                    }
+                    current_secondary_channel_ids_db = {row['channel_id'] for row in await connection.fetch(
+                        "SELECT channel_id FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = FALSE",
+                        type_id)}
                     ids_in_new_secondary_list = {ch['channel_id'] for ch in valid_new_secondary_channels}
                     channels_to_delete = current_secondary_channel_ids_db - ids_in_new_secondary_list
                     if channels_to_delete:
                         await connection.execute(
                             "DELETE FROM subscription_type_channels WHERE subscription_type_id = $1 AND is_main = FALSE AND channel_id = ANY($2::bigint[])",
-                            type_id, list(channels_to_delete)
-                        )
+                            type_id, list(channels_to_delete))
+
                     for sec_channel_data in valid_new_secondary_channels:
-                        ch_id = sec_channel_data["channel_id"]
-                        ch_name = sec_channel_data["channel_name"]
-                        if ch_id == effective_main_channel_id_after_update: continue
+                        if sec_channel_data['channel_id'] == effective_main_channel_id_after_update: continue
                         await connection.execute(
-                            """
-                            INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main)
-                            VALUES ($1, $2, $3, FALSE)
-                            ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET
-                            channel_name = EXCLUDED.channel_name, is_main = FALSE;
-                            """, type_id, ch_id, ch_name
-                        )
-                        if ch_id not in current_secondary_channel_ids_db:
+                            "INSERT INTO subscription_type_channels (subscription_type_id, channel_id, channel_name, is_main) VALUES ($1, $2, $3, FALSE) ON CONFLICT (subscription_type_id, channel_id) DO UPDATE SET channel_name = EXCLUDED.channel_name, is_main = FALSE;",
+                            type_id, sec_channel_data["channel_id"], sec_channel_data["channel_name"])
+                        if sec_channel_data['channel_id'] not in current_secondary_channel_ids_db:
                             newly_added_secondary_channels_for_actions.append(sec_channel_data)
-                # --- نهاية إدارة القنوات ---
 
                 linked_channels_rows = await connection.fetch(
                     "SELECT channel_id, channel_name, is_main FROM subscription_type_channels WHERE subscription_type_id = $1 ORDER BY is_main DESC, channel_name",
-                    type_id
-                )
+                    type_id)
                 updated_type_dict["linked_channels"] = [dict(row) for row in linked_channels_rows]
 
                 updated_type_dict["group"] = None
                 if updated_type_dict.get("group_id"):
                     group_info = await connection.fetchrow(
                         "SELECT id, name, color, icon FROM subscription_groups WHERE id = $1",
-                        updated_type_dict["group_id"]
-                    )
-                    if group_info:
-                        updated_type_dict["group"] = dict(group_info)
+                        updated_type_dict["group_id"])
+                    if group_info: updated_type_dict["group"] = dict(group_info)
 
-                if isinstance(updated_type_dict.get("features"), str):
-                    updated_type_dict["features"] = json.loads(updated_type_dict["features"])
-                if isinstance(updated_type_dict.get("terms_and_conditions"), str):
-                    updated_type_dict["terms_and_conditions"] = json.loads(updated_type_dict["terms_and_conditions"])
+                if isinstance(updated_type_dict.get("features"), str): updated_type_dict["features"] = json.loads(
+                    updated_type_dict["features"])
+                if isinstance(updated_type_dict.get("terms_and_conditions"), str): updated_type_dict[
+                    "terms_and_conditions"] = json.loads(updated_type_dict["terms_and_conditions"])
 
-            # --- نهاية Transaction ---
+            # --- نهاية المعاملة ---
 
-            # --- [تعديل جديد] حذف الصورة القديمة من ImageKit بعد نجاح الـ transaction ---
+            # --- حذف الصورة من ImageKit (خارج المعاملة) ---
             if old_image_file_id_to_delete_from_imagekit:
                 try:
-                    imagekit = get_imagekit_client()  # تأكد من أن هذه الدالة موجودة
+                    imagekit = get_imagekit_client()
                     imagekit.delete_file(file_id=old_image_file_id_to_delete_from_imagekit)
                     logging.info(f"Old ImageKit file deleted successfully: {old_image_file_id_to_delete_from_imagekit}")
                 except Exception as e_delete:
-                    # نسجل الخطأ ولكن لا نوقف العملية لأن تحديث قاعدة البيانات قد نجح
                     logging.error(
                         f"Failed to delete old ImageKit file {old_image_file_id_to_delete_from_imagekit}: {e_delete}",
-                        exc_info=True
-                    )
-            # ---------------------------------------------------------------------------------
+                        exc_info=True)
 
-            # --- منطق إرسال الدعوات للقنوات الجديدة (يبقى كما هو) ---
+            # --- [الكود المعدل يبدأ هنا] ---
+            # --- جدولة المهام وإرسال الدعوات (خارج المعاملة الرئيسية ولكن داخل اتصال DB) ---
+            invite_and_schedule_error = None
+
             if newly_added_secondary_channels_for_actions and send_invites_for_new_channels:
-                active_subscribers_for_actions = await connection.fetch(
-                    """
-                    SELECT s.telegram_id, s.expiry_date, u.full_name, u.username 
-                    FROM subscriptions s
-                    LEFT JOIN users u ON s.telegram_id = u.telegram_id
-                    WHERE s.subscription_type_id = $1 AND s.is_active = TRUE AND s.expiry_date > NOW()
-                    GROUP BY s.telegram_id, s.expiry_date, u.full_name, u.username; 
-                    """, type_id
-                )
-                shared_invite_links_map = {}
-                logging.info(
-                    f"Generating shared invite links for {len(newly_added_secondary_channels_for_actions)} new channels.")
-                for new_channel_data in newly_added_secondary_channels_for_actions:
-                    new_channel_id = new_channel_data['channel_id']
-                    new_channel_name = new_channel_data['channel_name']
-                    if new_channel_id == effective_main_channel_id_after_update: continue
-                    link_name_prefix = f"دعوة لـ {updated_type_dict['name']}"
-                    invite_result = await generate_shared_invite_link_for_channel(
-                        channel_id=new_channel_id, channel_name=new_channel_name, link_name_prefix=link_name_prefix
-                    )
-                    if invite_result and invite_result.get("success"):
-                        shared_invite_links_map[new_channel_id] = invite_result.get("invite_link")
-                    else:
-                        logging.error(
-                            f"Failed to generate invite for {new_channel_name} ({new_channel_id}). Error: {invite_result.get('error')}")
+                # سيتم تشغيل كلتا المهمتين في الخلفية بشكل مستقل
+                try:
+                    # الخطوة 1: بدء مهمة جدولة الإزالة في الخلفية (سريعة جدًا)
+                    try:
+                        scheduling_batch_id = await current_app.messaging_service.start_channel_removal_scheduling_batch(
+                            subscription_type_id=type_id,
+                            channels_to_schedule=newly_added_secondary_channels_for_actions
+                        )
+                        logging.info(
+                            f"Started background removal scheduling batch: {scheduling_batch_id} for type {type_id}")
+                        updated_type_dict["scheduling_batch_id"] = scheduling_batch_id
+                    except ValueError as ve_schedule:
+                        # يحدث هذا إذا لم يكن هناك مشتركين للجدولة، وهذا ليس خطأً حقيقيًا
+                        logging.warning(f"Could not start scheduling batch for type {type_id}: {ve_schedule}")
+                        updated_type_dict["scheduling_batch_info"] = str(ve_schedule)  # إرسال معلومات للواجهة
+                    except Exception as e_schedule:
+                        logging.error(f"Failed to start scheduling batch for type {type_id}: {e_schedule}",
+                                      exc_info=True)
+                        if not invite_and_schedule_error:
+                            invite_and_schedule_error = f"Failed to start scheduling process: {str(e_schedule)}"
 
-                if active_subscribers_for_actions:
-                    for subscriber_idx, subscriber in enumerate(active_subscribers_for_actions):
-                        subscriber_telegram_id = subscriber['telegram_id']
-                        subscriber_expiry_date = subscriber['expiry_date']
-                        for new_channel_data in newly_added_secondary_channels_for_actions:
-                            new_channel_id = new_channel_data['channel_id']
-                            if new_channel_id == effective_main_channel_id_after_update: continue
-                            await add_scheduled_task(
-                                connection=connection, task_type='remove_user', telegram_id=subscriber_telegram_id,
-                                channel_id=new_channel_id, execute_at=subscriber_expiry_date, clean_up=True
-                            )
+                    # الخطوة 2: بدء مهمة إرسال الدعوات في الخلفية (سريعة جدًا)
+                    try:
+                        type_name_for_invite = updated_type_dict.get('name', "your subscription")
+                        invite_batch_id = await current_app.messaging_service.start_invite_batch(
+                            subscription_type_id=type_id,
+                            newly_added_channels=newly_added_secondary_channels_for_actions,
+                            subscription_type_name=type_name_for_invite
+                        )
+                        logging.info(
+                            f"Started background invite batch: {invite_batch_id} for subscription type {type_id}")
+                        updated_type_dict["invite_batch_id"] = invite_batch_id
+                    except ValueError as ve_invite:
+                        logging.warning(f"Could not start invite batch for type {type_id}: {ve_invite}")
+                        updated_type_dict["invite_batch_info"] = str(ve_invite)
+                    except Exception as e_invite:
+                        logging.error(f"Failed to start invite batch for type {type_id}: {e_invite}", exc_info=True)
+                        if not invite_and_schedule_error:
+                            invite_and_schedule_error = f"Failed to start invite process: {str(e_invite)}"
 
-                        if shared_invite_links_map:
-                            user_identifier = subscriber.get('full_name') or (
-                                f"@{subscriber.get('username')}" if subscriber.get('username') else str(
-                                    subscriber_telegram_id))
-                            channel_links_to_send = [
-                                f"▫️ قناة <a href='{link}'>{ch_data['channel_name']}</a>"
-                                for ch_data in newly_added_secondary_channels_for_actions
-                                if (link := shared_invite_links_map.get(ch_data['channel_id'])) and ch_data[
-                                    'channel_id'] != effective_main_channel_id_after_update
-                            ]
-                            if channel_links_to_send:
-                                message_text = (
-                                        f"📬 مرحبًا {user_identifier},\n\n"
-                                        f"تمت إضافة قنوات جديدة إلى اشتراكك في \"<b>{updated_type_dict['name']}</b>\":\n\n" +
-                                        "\n".join(channel_links_to_send) +
-                                        "\n\n💡 هذه الروابط صالحة للاستخدام للانضمام."
-                                )
-                                if subscriber_idx > 0 and subscriber_idx % 20 == 0: await asyncio.sleep(1)
-                                await send_message_to_user(subscriber_telegram_id,
-                                                           message_text)
+                except Exception as e_process:
+                    # للالتقاط أي أخطاء غير متوقعة
+                    logging.error(
+                        f"An unexpected error occurred during background task initiation for type {type_id}: {e_process}",
+                        exc_info=True)
+                    if not invite_and_schedule_error:
+                        invite_and_schedule_error = f"An unexpected error occurred: {str(e_process)}"
 
+                if invite_and_schedule_error:
+                    updated_type_dict["invite_batch_error"] = invite_and_schedule_error
+
+            # الاستجابة النهائية مع البيانات المحدثة
             return jsonify(updated_type_dict), 200
+            # --- [الكود المعدل ينتهي هنا] ---
 
     except ValueError as ve:
-        logging.error(f"ValueError in update_subscription_type for type_id {type_id}: {ve}", exc_info=True)
+        logging.warning(f"ValueError in update_subscription_type for type_id {type_id}: {ve}")
         return jsonify({"error": f"Invalid data format: {str(ve)}"}), 400
     except Exception as e:
         logging.error(f"Error updating subscription type {type_id}: {e}", exc_info=True)
@@ -2062,6 +1994,7 @@ async def handle_single_pending_subscription(record_id: int):  # تغيير 'id'
             # استخدام الهيكل المبسّط الذي اقترحته سابقًا
             try:
                 bot_removed_user = await remove_users_from_channel(
+                    self.telegram_bot,
                     telegram_id=telegram_id_to_remove,
                     channel_id=channel_id_to_remove_from
                 )
@@ -2144,7 +2077,7 @@ async def handle_bulk_pending_subscriptions_action():  # تم تغيير الا�
 
                 try:
                     bot_removed_user = await remove_users_from_channel(
-
+                        self.telegram_bot,
                         telegram_id=telegram_id_to_remove,
                         channel_id=channel_id_to_remove_from
                     )
@@ -2840,9 +2773,11 @@ async def add_subscription_admin():  # تم تغيير اسم الدالة لت�
             return jsonify({"error": "Invalid data type for telegram_id, subscription_type_id, or days_to_add"}), 400
 
         db_pool = getattr(current_app, "db_pool", None)
-        if not db_pool:
-            logging.critical("❌ Database connection is missing!")
-            return jsonify({"error": "Internal Server Error"}), 500
+        telegram_bot = getattr(current_app, "bot", None)  # <-- جلب البوت
+
+        if not db_pool or not telegram_bot:
+            logging.critical("❌ Database connection or Telegram Bot is missing from app context!")
+            return jsonify({"error": "Internal Server Error - App not configured"}), 500
 
         async with db_pool.acquire() as connection:
             # 1. تأكد من وجود المستخدم أو قم بإنشائه/تحديثه
@@ -2877,9 +2812,14 @@ async def add_subscription_admin():  # تم تغيير اسم الدالة لت�
             )
 
             # 4. إنشاء رابط دعوة للقناة الرئيسية
-            main_invite_result = await generate_channel_invite_link(telegram_id, main_channel_id,
-                                                                    subscription_type_name)
+            main_invite_result = await generate_channel_invite_link(
+                telegram_bot,
+                telegram_id,
+                main_channel_id,
+                subscription_type_name
+            )
             if not main_invite_result["success"]:
+
                 logging.error(
                     f"ADMIN: Failed to generate invite link for main channel {main_channel_id}: {main_invite_result.get('error')}")
                 return jsonify(
@@ -2947,7 +2887,7 @@ async def add_subscription_admin():  # تم تغيير اسم الدالة لت�
                 is_current_channel_main = channel_data["is_main"]
 
                 if not is_current_channel_main:
-                    invite_res = await generate_channel_invite_link(telegram_id, current_channel_id_being_processed,
+                    invite_res = await generate_channel_invite_link(telegram_bot, telegram_id, current_channel_id_being_processed,
                                                                     current_channel_name)
                     if invite_res["success"]:
                         secondary_channel_links_to_send.append(
@@ -3038,7 +2978,7 @@ async def add_subscription_admin():  # تم تغيير اسم الدالة لت�
                         "\n".join(secondary_channel_links_to_send) +
                         "\n\n💡 هذه الروابط خاصة بك وصالحة لفترة محدودة. يرجى الانضمام في أقرب وقت."
                 )
-                await send_message_to_user(telegram_id, secondary_links_message_text)
+                await send_message_to_user(telegram_bot, telegram_id, secondary_links_message_text)
 
             # 10. إرجاع استجابة ناجحة للأدمن
             formatted_response_message_html = (
@@ -3116,7 +3056,7 @@ async def cancel_subscription_admin():
                 )
                 channels += [int(r["channel_id"]) for r in rows if int(r["channel_id"]) != main_channel]
                 for ch in channels:
-                    await remove_users_from_channel(telegram_id, ch)
+                    await remove_users_from_channel(telegram_bot, telegram_id, ch)
 
                 # 3. إلغاء الاشتراك في الـ DB باستخدام subscription_id فقط
                 cancel_time = datetime.now(timezone.utc)
@@ -3879,4 +3819,492 @@ async def get_recent_payments():
 
     except Exception as e:
         logging.error(f"Error in recent payments: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# ✅ --- تعديل: تغيير اسم المسار وتحديث المنطق ليتوافق مع الخدمة الجديدة ---
+@admin_routes.route("/messaging-batches/<string:batch_id>", methods=["GET"])
+@permission_required("subscription_types.read")
+async def get_batch_details(batch_id: str):
+    try:
+        # messaging_service.get_batch_status يعيد الآن MessagingBatchResult
+        details_obj = await current_app.messaging_service.get_batch_status(batch_id)
+        if not details_obj:
+            return jsonify({"error": "Batch not found"}), 404
+
+        # تحويل MessagingBatchResult إلى dict، مع تحويل Enums و datetimes
+        details_dict = asdict(details_obj) # asdict يتعامل مع dataclasses
+
+        # asdict قد لا يحول Enums إلى قيمها تلقائيًا، لذا تأكد
+        details_dict['status'] = details_obj.status.value
+        details_dict['batch_type'] = details_obj.batch_type.value
+
+        # تحويل datetimes إلى سلاسل ISO format إذا لزم الأمر للـ JSON
+        # (asdict قد يفعل هذا، أو jsonify، تحقق من سلوك مكتبتك)
+        for key, value in details_dict.items():
+            if isinstance(value, datetime):
+                details_dict[key] = value.isoformat()
+            # تحويل FailedSendDetail إلى dicts إذا لم يتم ذلك بالفعل بواسطة asdict (إذا كانت error_details قائمة من الكائنات)
+            elif key == 'error_details' and value and isinstance(value[0], FailedSendDetail):
+                 details_dict[key] = [asdict(err_detail) for err_detail in value]
+
+
+        return jsonify(details_dict), 200
+    except Exception as e:
+        logging.error(f"Error fetching details for batch {batch_id}: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# ✅ --- تعديل: تغيير اسم المسار وتحديث المنطق ---
+@admin_routes.route("/messaging-batches/<string:batch_id>/retry", methods=["POST"])
+@permission_required("subscription_types.update")
+async def retry_failed_batch_sends(batch_id: str):
+    """إعادة محاولة الإرسال للمستخدمين الذين فشلت عمليتهم في مهمة سابقة."""
+    try:
+        # ✅ استخدام الخدمة مباشرة من سياق التطبيق
+        service = current_app.messaging_service
+        new_batch_id = await service.retry_failed_sends_in_batch(batch_id)
+        return jsonify({"message": "Retry batch started.", "new_batch_id": new_batch_id}), 202
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        logging.error(f"Error retrying batch {batch_id}: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error during retry"}), 500
+
+
+
+@admin_routes.route("/messaging-batches/latest-for-type/<int:type_id>", methods=["GET"])
+@permission_required("subscription_types.read")
+async def get_latest_batch_for_type(type_id: int):
+    # ... (الكود الحالي جيد، فقط تأكد أن asdict و Enums تتعامل بشكل صحيح)
+    # الكود الذي قدمته هنا يبدو سليمًا
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            latest_batch_record = await connection.fetchrow("""
+                SELECT batch_id, status, batch_type, total_users, successful_sends, failed_sends, completed_at, created_at, started_at, subscription_type_id
+            FROM messaging_batches
+                WHERE subscription_type_id = $1
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, type_id)
+
+            if not latest_batch_record:
+                return jsonify(None), 200
+
+            # تحويل السجل إلى قاموس وتحويل قيم Enum
+            latest_batch_dict = dict(latest_batch_record)
+            if 'status' in latest_batch_dict and latest_batch_dict['status'] is not None:
+                try:
+                    latest_batch_dict['status'] = BatchStatus(latest_batch_dict['status']).value
+                except ValueError: # إذا كانت القيمة في DB غير صالحة لـ Enum
+                    logging.warning(f"Invalid status value '{latest_batch_dict['status']}' in DB for batch type {type_id}")
+                    # يمكنك اختيار ترك القيمة كما هي أو تعيينها إلى قيمة افتراضية
+            if 'batch_type' in latest_batch_dict and latest_batch_dict['batch_type'] is not None:
+                try:
+                    latest_batch_dict['batch_type'] = BatchType(latest_batch_dict['batch_type']).value
+                except ValueError:
+                    logging.warning(f"Invalid batch_type value '{latest_batch_dict['batch_type']}' in DB for batch type {type_id}")
+
+            # تحويل حقول JSON إذا كانت مخزنة كسلاسل نصية
+            for field_name in ['message_content', 'context_data', 'error_details']:
+                if field_name in latest_batch_dict and isinstance(latest_batch_dict[field_name], str):
+                    try:
+                        latest_batch_dict[field_name] = json.loads(latest_batch_dict[field_name])
+                    except json.JSONDecodeError:
+                        logging.warning(f"Could not parse JSON for field {field_name} in latest batch for type {type_id}")
+                        latest_batch_dict[field_name] = None # أو اتركه كسلسلة نصية أو أعد الخطأ
+
+
+            return jsonify(latest_batch_dict), 200
+    except Exception as e:
+        logging.error(f"Error in get_latest_batch_for_type for type_id {type_id}: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# في ملف admin_routes.py - إضافات جديدة
+
+@admin_routes.route("/messaging/target-groups", methods=["GET"])
+@permission_required("broadcast.read")
+async def get_target_groups():
+    """يجلب قائمة بمجموعات الاستهداف المتاحة مع إحصائياتها."""
+    try:
+        async with current_app.db_pool.acquire() as conn:
+            # إحصائيات أساسية
+            stats = {}
+
+            # جميع المستخدمين
+            # ✅ --- تعديل: إزالة شرط is_active من جدول users ---
+            all_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            stats['all_users'] = all_users
+
+            # المستخدمون بدون اشتراكات
+            # ✅ --- تعديل: إزالة شرط u.is_active ---
+            no_subscription = await conn.fetchval("""
+                SELECT COUNT(DISTINCT u.telegram_id) 
+                FROM users u 
+                LEFT JOIN subscriptions s ON u.telegram_id = s.telegram_id 
+                WHERE s.telegram_id IS NULL
+            """)
+            stats['no_subscription'] = no_subscription
+
+            # المشتركون النشطون حاليا (هنا نستخدم s.is_active وهذا صحيح)
+            active_subscribers = await conn.fetchval("""
+                SELECT COUNT(DISTINCT u.telegram_id) 
+                FROM users u 
+                JOIN subscriptions s ON u.telegram_id = s.telegram_id 
+                WHERE s.is_active = true AND s.expiry_date > NOW()
+            """)
+            stats['active_subscribers'] = active_subscribers
+
+            # المشتركون المنتهيو الصلاحية (هنا لا نحتاج لفلترة المستخدمين، فقط الاشتراكات)
+            # ✅ --- تعديل: إزالة شرط u.is_active ---
+            expired_subscribers = await conn.fetchval("""
+                SELECT COUNT(DISTINCT u.telegram_id) 
+                FROM users u 
+                JOIN subscriptions s ON u.telegram_id = s.telegram_id 
+                WHERE u.telegram_id IN (
+                    SELECT telegram_id FROM subscriptions WHERE expiry_date <= NOW()
+                ) AND u.telegram_id NOT IN (
+                    SELECT telegram_id FROM subscriptions WHERE is_active = true AND expiry_date > NOW()
+                )
+            """)
+            stats['expired_subscribers'] = expired_subscribers
+
+            # إحصائيات حسب نوع الاشتراك
+            # ✅ --- تعديل: إزالة شرط st.is_active إذا كان لا يوجد في جدول subscription_types ---
+            # إذا كان العمود موجودًا، فاترك هذا الاستعلام كما هو. سأفترض أنه موجود.
+            subscription_types = await conn.fetch("""
+                SELECT 
+                    st.id, 
+                    st.name,
+                    COUNT(CASE WHEN s.is_active = true AND s.expiry_date > NOW() THEN 1 END) as active_count,
+                    COUNT(CASE WHEN s.expiry_date <= NOW() THEN 1 END) as expired_count
+                FROM subscription_types st
+                LEFT JOIN subscriptions s ON st.id = s.subscription_type_id
+                WHERE st.is_active = true
+                GROUP BY st.id, st.name
+                ORDER BY st.name
+            """)
+
+            # ... (باقي الكود كما هو) ...
+            subscription_stats = []
+            for row in subscription_types:
+                subscription_stats.append({
+                    'id': row['id'],
+                    'name': row['name'],
+                    'active_count': row['active_count'],
+                    'expired_count': row['expired_count'],
+                    'total_count': row['active_count'] + row['expired_count']
+                })
+
+            return jsonify({
+                'general_stats': stats,
+                'subscription_types': subscription_stats
+            })
+
+    except Exception as e:
+        logging.error(f"Error fetching target groups: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@admin_routes.route("/messaging/preview-users", methods=["POST"])
+@permission_required("broadcast.read")
+async def preview_target_users():
+    """يعرض عينة من المستخدمين الذين سيتم استهدافهم."""
+    try:
+        data = await request.get_json()
+        target_group = data.get("target_group")
+        subscription_type_id = data.get("subscription_type_id")
+        limit = min(int(data.get("limit", 10)), 50)
+
+        # ✨ تعريف المتغيرات مبدئياً لتجنب أي مشاكل
+        base_query = None
+        count_query = None
+        final_query = None
+        query_params = []
+        count_query_params = []
+
+        if target_group == 'all_users':
+            base_query = "SELECT u.id, u.telegram_id, u.full_name, u.username, NULL as subscription_name, NULL as expiry_date FROM users u"
+            count_query = "SELECT COUNT(u.id) FROM users u"
+            # تعيين final_query هنا مباشرة
+            final_query = f"{base_query} ORDER BY u.id DESC LIMIT ${len(query_params) + 1}"
+
+        elif target_group == 'no_subscription':
+            base_query = """
+                SELECT DISTINCT ON (u.telegram_id) u.id, u.telegram_id, u.full_name, u.username,
+                       NULL as subscription_name, NULL as expiry_date
+                FROM users u 
+                LEFT JOIN subscriptions s ON u.telegram_id = s.telegram_id 
+                WHERE s.id IS NULL
+            """
+            count_query = "SELECT COUNT(DISTINCT u.telegram_id) FROM users u LEFT JOIN subscriptions s ON u.telegram_id = s.telegram_id WHERE s.id IS NULL"
+            # الترتيب هنا ضروري لـ DISTINCT ON
+            final_query = f"{base_query} ORDER BY u.telegram_id, u.id DESC LIMIT ${len(query_params) + 1}"
+
+        elif target_group == 'active_subscribers':
+            base_query = """
+                SELECT DISTINCT ON (u.telegram_id) u.id, u.telegram_id, u.full_name, u.username,
+                       st.name as subscription_name, s.expiry_date
+                FROM users u 
+                JOIN subscriptions s ON u.telegram_id = s.telegram_id 
+                JOIN subscription_types st ON s.subscription_type_id = st.id
+                WHERE s.is_active = true AND s.expiry_date > NOW()
+            """
+            count_query = "SELECT COUNT(DISTINCT u.telegram_id) FROM users u JOIN subscriptions s ON u.telegram_id = s.telegram_id WHERE s.is_active = true AND s.expiry_date > NOW()"
+            # الترتيب هنا ضروري لـ DISTINCT ON
+            final_query = f"{base_query} ORDER BY u.telegram_id, u.id DESC LIMIT ${len(query_params) + 1}"
+
+        elif target_group == 'expired_subscribers':
+            base_query = """
+                SELECT DISTINCT ON (u.telegram_id) u.id, u.telegram_id, u.full_name, u.username,
+                       st.name as subscription_name, s.expiry_date
+                FROM users u
+                LEFT JOIN subscriptions s ON u.telegram_id = s.telegram_id
+                LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
+                WHERE u.telegram_id IN (
+                    SELECT telegram_id FROM subscriptions WHERE expiry_date <= NOW()
+                ) AND u.telegram_id NOT IN (
+                    SELECT telegram_id FROM subscriptions WHERE is_active = true AND expiry_date > NOW()
+                )
+            """
+            count_query = """
+                SELECT COUNT(DISTINCT u.telegram_id) FROM users u
+                WHERE u.telegram_id IN (SELECT telegram_id FROM subscriptions WHERE expiry_date <= NOW()) 
+                AND u.telegram_id NOT IN (SELECT telegram_id FROM subscriptions WHERE is_active = true AND expiry_date > NOW())
+            """
+            # الترتيب هنا ضروري لـ DISTINCT ON
+            final_query = f"{base_query} ORDER BY u.telegram_id, u.id DESC LIMIT ${len(query_params) + 1}"
+
+        elif target_group == 'subscription_type_active' and subscription_type_id:
+            base_query = """
+                SELECT u.id, u.telegram_id, u.full_name, u.username,
+                       st.name as subscription_name, s.expiry_date
+                FROM users u 
+                JOIN subscriptions s ON u.telegram_id = s.telegram_id 
+                JOIN subscription_types st ON s.subscription_type_id = st.id
+                WHERE s.subscription_type_id = $1 AND s.is_active = true AND s.expiry_date > NOW()
+            """
+            count_query = "SELECT COUNT(u.id) FROM users u JOIN subscriptions s ON u.telegram_id = s.telegram_id WHERE s.subscription_type_id = $1 AND s.is_active = true AND s.expiry_date > NOW()"
+            query_params.append(subscription_type_id)
+            count_query_params.append(subscription_type_id)
+            # تعيين final_query هنا مباشرة
+            final_query = f"{base_query} ORDER BY u.id DESC LIMIT ${len(query_params) + 1}"
+
+        elif target_group == 'subscription_type_expired' and subscription_type_id:
+            base_query = """
+                SELECT u.id, u.telegram_id, u.full_name, u.username,
+                       st.name as subscription_name, s.expiry_date
+                FROM users u 
+                JOIN subscriptions s ON u.telegram_id = s.telegram_id 
+                JOIN subscription_types st ON s.subscription_type_id = st.id
+                WHERE s.subscription_type_id = $1 AND s.expiry_date <= NOW()
+            """
+            count_query = "SELECT COUNT(u.id) FROM users u JOIN subscriptions s ON u.telegram_id = s.telegram_id WHERE s.subscription_type_id = $1 AND s.expiry_date <= NOW()"
+            query_params.append(subscription_type_id)
+            count_query_params.append(subscription_type_id)
+            # تعيين final_query هنا مباشرة
+            final_query = f"{base_query} ORDER BY u.id DESC LIMIT ${len(query_params) + 1}"
+
+        # إذا لم يتطابق أي شرط، فلن يكون final_query معرفًا
+        if not final_query:
+            return jsonify({"error": "Invalid target group or missing parameters"}), 400
+
+        # تمت إزالة كتلة `if` المنفصلة من هنا
+
+        query_params.append(limit)
+
+        async with current_app.db_pool.acquire() as conn:
+            users = await conn.fetch(final_query, *query_params)
+            total_count = await conn.fetchval(count_query, *count_query_params)
+
+            users_data = [
+                {
+                    'telegram_id': user['telegram_id'],
+                    'full_name': user['full_name'],
+                    'username': user['username'],
+                    'subscription_name': user['subscription_name'],
+                    'expiry_date': user['expiry_date'].isoformat() if user.get('expiry_date') else None,
+                }
+                for user in users
+            ]
+
+            return jsonify({
+                'users': users_data,
+                'total_count': total_count,
+                'showing_count': len(users_data)
+            })
+
+    except Exception as e:
+        logging.error(f"Error in preview_target_users: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+
+@admin_routes.route("/messaging/available-variables", methods=["GET"])
+@permission_required("broadcast.read")
+async def get_available_variables():
+    """يجلب قائمة بالمتغيرات المتاحة للاستخدام في الرسائل."""
+    variables = {
+        'user_variables': [
+            {
+                'key': '{FULL_NAME}',
+                'description': 'الاسم الكامل للمستخدم',
+                'example': 'أحمد محمد'
+            },
+            {
+                'key': '{FIRST_NAME}',
+                'description': 'الاسم الأول للمستخدم',
+                'example': 'أحمد'
+            },
+            {
+                'key': '{USERNAME}',
+                'description': 'اسم المستخدم في تليجرام (مع @)',
+                'example': '@ahmed123'
+            },
+            {
+                'key': '{USER_ID}',
+                'description': 'معرف المستخدم في تليجرام',
+                'example': '123456789'
+            }
+        ],
+        'subscription_variables': [
+            {
+                'key': '{SUBSCRIPTION_NAME}',
+                'description': 'اسم نوع الاشتراك',
+                'example': 'قنوات الفوركس'
+            },
+            {
+                'key': '{EXPIRY_DATE}',
+                'description': 'تاريخ انتهاء الاشتراك',
+                'example': '2024-12-31'
+            },
+            {
+                'key': '{DAYS_REMAINING}',
+                'description': 'عدد الأيام المتبقية في الاشتراك',
+                'example': '15'
+            },
+            {
+                'key': '{DAYS_SINCE_EXPIRY}',
+                'description': 'عدد الأيام منذ انتهاء الاشتراك',
+                'example': '5'
+            }
+        ]
+    }
+    return jsonify(variables)
+
+
+# تحديث دالة البث لتشمل معالجة المتغيرات
+@admin_routes.route("/messaging/broadcast", methods=["POST"])
+@permission_required("broadcast.send")
+async def send_broadcast_message(): # تم تغيير الاسم هنا ليكون هو الاسم الوحيد المستخدم
+    """بدء مهمة إرسال رسالة عامة محسنة مع دعم المتغيرات."""
+    data = await request.get_json()
+    message_text = data.get("message_text")
+    target_group = data.get("target_group")
+    subscription_type_id = data.get("subscription_type_id")
+
+    if not message_text or not target_group:
+        return jsonify({"error": "message_text and target_group are required"}), 400
+
+    # التحقق من صحة target_group
+    valid_groups = [
+        'all_users', 'no_subscription', 'active_subscribers',
+        'expired_subscribers', 'subscription_type_active', 'subscription_type_expired'
+    ]
+    if target_group not in valid_groups:
+        return jsonify({"error": "Invalid target_group"}), 400
+    if target_group.startswith('subscription_type_') and not subscription_type_id:
+        return jsonify({"error": "subscription_type_id is required for subscription-specific targeting"}), 400
+
+    try:
+        service = current_app.messaging_service
+        # استدعاء الدالة بالاسم الصحيح
+        batch_id = await service.start_enhanced_broadcast_batch(
+            message_text=message_text,
+            target_group=target_group,
+            subscription_type_id=subscription_type_id
+        )
+        return jsonify({"message": "Enhanced broadcast batch started.", "batch_id": batch_id}), 202
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logging.error(f"Failed to start enhanced broadcast batch: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@admin_routes.route("/messaging/batches", methods=["GET"])
+@permission_required("broadcast.read")
+async def get_messaging_batches():
+    """يجلب قائمة بمهام الإرسال مع التصفح والبحث."""
+    try:
+        page = int(request.args.get("page", 1))
+        page_size = min(int(request.args.get("page_size", 20)), 100)
+        offset = (page - 1) * page_size
+
+        batch_type_filter = request.args.get("batch_type")  # 'invite' أو 'broadcast'
+        status_filter = request.args.get("status")  # 'pending', 'in_progress', إلخ
+
+        where_conditions = ["1=1"]
+        where_params = []
+
+        if batch_type_filter:
+            where_conditions.append(f"batch_type = ${len(where_params) + 1}")
+            where_params.append(batch_type_filter)
+
+        if status_filter:
+            where_conditions.append(f"status = ${len(where_params) + 1}")
+            where_params.append(status_filter)
+
+        where_clause = " AND ".join(where_conditions)
+
+        query = f"""
+            SELECT 
+                mb.batch_id, mb.batch_type, mb.status, mb.total_users,
+                mb.successful_sends, mb.failed_sends, mb.created_at,
+                mb.started_at, mb.completed_at, mb.subscription_type_id,
+                st.name as subscription_type_name
+            FROM messaging_batches mb
+            LEFT JOIN subscription_types st ON mb.subscription_type_id = st.id
+            WHERE {where_clause}
+            ORDER BY mb.created_at DESC
+            LIMIT ${len(where_params) + 1} OFFSET ${len(where_params) + 2}
+        """
+
+        count_query = f"""
+            SELECT COUNT(*) FROM messaging_batches mb 
+            WHERE {where_clause}
+        """
+
+        query_params = where_params + [page_size, offset]
+
+        async with current_app.db_pool.acquire() as conn:
+            batches = await conn.fetch(query, *query_params)
+            total_count = await conn.fetchval(count_query, *where_params)
+
+            batches_data = []
+            for batch in batches:
+                batches_data.append({
+                    'batch_id': batch['batch_id'],
+                    'batch_type': batch['batch_type'],
+                    'status': batch['status'],
+                    'total_users': batch['total_users'],
+                    'successful_sends': batch['successful_sends'] or 0,
+                    'failed_sends': batch['failed_sends'] or 0,
+                    'created_at': batch['created_at'].isoformat() if batch['created_at'] else None,
+                    'started_at': batch['started_at'].isoformat() if batch['started_at'] else None,
+                    'completed_at': batch['completed_at'].isoformat() if batch['completed_at'] else None,
+                    'subscription_type_id': batch['subscription_type_id'],
+                    'subscription_type_name': batch['subscription_type_name']
+                })
+
+            return jsonify({
+                'batches': batches_data,
+                'total': total_count,
+                'page': page,
+                'page_size': page_size
+            })
+
+    except Exception as e:
+        logging.error(f"Error fetching messaging batches: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500

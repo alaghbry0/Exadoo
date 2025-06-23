@@ -78,9 +78,11 @@ async def subscribe():
             return jsonify({"error": "Missing payment_token"}), 400
 
         db_pool = getattr(current_app, "db_pool", None)
-        if not db_pool:
-            logging.critical("❌ Database connection is missing!")
-            return jsonify({"error": "Internal Server Error"}), 500
+        telegram_bot = getattr(current_app, "bot", None)  # <-- جلب البوت
+
+        if not db_pool or not telegram_bot:
+            logging.critical("❌ Database connection or Telegram Bot is missing from app context!")
+            return jsonify({"error": "Internal Server Error - App not configured"}), 500
 
         async with db_pool.acquire() as connection:
             # --- Preliminary checks and fetching initial data ---
@@ -177,8 +179,12 @@ async def subscribe():
                 logging.info(
                     f"Processing channel: {current_channel_name} (ID: {current_channel_id_being_processed}, Main: {is_current_channel_main}) for user {telegram_id}")
 
-                invite_result = await generate_channel_invite_link(telegram_id, current_channel_id_being_processed,
-                                                                   current_channel_name)
+                invite_result = await generate_channel_invite_link(
+                    telegram_bot,
+                    telegram_id,
+                    current_channel_id_being_processed,
+                    current_channel_name
+                )
                 if not invite_result["success"]:
                     logging.error(
                         f"❌ Failed to generate invite link for {current_channel_name}: {invite_result.get('error')}")
@@ -296,7 +302,11 @@ async def subscribe():
                         "\n".join(secondary_channel_links_to_send) +
                         "\n\n💡 هذه الروابط خاصة بك وصالحة لفترة محدودة. يرجى الانضمام في أقرب وقت."
                 )
-                await send_message_to_user(telegram_id, secondary_links_message_text)
+                await send_message_to_user(
+                    telegram_bot,
+                    telegram_id,
+                    secondary_links_message_text
+                )
 
             previous_history_exists = await connection.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM subscription_history WHERE telegram_id=$1 AND subscription_type_name=$2 AND action_type IN ('NEW', 'RENEWAL') AND payment_id = $3)",

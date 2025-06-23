@@ -1,4 +1,4 @@
-#app.py
+# app.py
 
 import asyncpg
 import logging
@@ -24,6 +24,7 @@ from routes.ws_routes import ws_bp
 from routes.payment_status import payment_status_bp
 from routes.payment_confirmation import payment_confirmation_bp
 from routes.auth_routes import auth_routes
+from services.messaging_service import BackgroundMessagingService
 from telegram_bot import start_bot, bot, telegram_bot_bp
 from chatbot.chatbot import chatbot_bp
 from chatbot.knowledge_base import knowledge_base
@@ -33,18 +34,20 @@ from chatbot.admin_panel import admin_chatbot_bp
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
 
+from pytoniq import LiteBalancer
+
 # تأكد من المتغيرات البيئية الأساسية
 REQUIRED_ENV_VARS = ["PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET", "PORT"]
 for var in REQUIRED_ENV_VARS:
     if not os.environ.get(var):
         raise ValueError(f"❌ متغير البيئة {var} غير مضبوط.")
 
+
 # دالة تُنفّذ على كل اتصال جديد في pool
 async def _on_connect(conn):
-    # تأكد من وجود امتداد vector
     await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    # سجّل codec للـ vector type
     await register_vector(conn)
+
 
 # تهيئة التطبيق
 app = Quart(__name__)
@@ -52,20 +55,15 @@ app.db_pool = None
 app.aiohttp_session = None
 app.bot = None
 app.bot_running = False
-logging.basicConfig(level=logging.INFO)
-# هنا نسجل خدمة الذكاء الاصطناعي
+app.lite_balancer = None
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# تسجيل الخدمات والـ Blueprints
 app.chat_manager = ChatManager(app)
-app.kb           = knowledge_base
+app.kb = knowledge_base
 app = cors(app, allow_origin="*")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-# تسجيل Blueprints
 app.register_blueprint(notifications_bp, url_prefix="/api")
 app.register_blueprint(public_routes)
 app.register_blueprint(admin_routes)
@@ -81,7 +79,7 @@ app.register_blueprint(telegram_bot_bp)
 app.register_blueprint(chatbot_bp, url_prefix="/bot")
 app.register_blueprint(ws_bp)
 
-# إضافة رؤوس أمان
+
 @app.after_request
 async def add_security_headers(response):
     headers = {
@@ -96,15 +94,13 @@ async def add_security_headers(response):
     response.headers.update(headers)
     return response
 
+
 # تهيئة التطبيق والاتصالات
 async def initialize_app():
     try:
         logging.info("🔄 Creating database connection pool...")
         app.db_pool = await asyncpg.create_pool(
-            **DATABASE_CONFIG,
-            init=_on_connect,
-            min_size=5,
-            max_size=50,
+            **DATABASE_CONFIG, init=_on_connect, min_size=5, max_size=50
         )
         logging.info("✅ Database pool created with pgvector support")
 
@@ -112,28 +108,43 @@ async def initialize_app():
         app.aiohttp_session = aiohttp.ClientSession()
         logging.info("✅ aiohttp session initialized")
 
+        logging.info("🔄 Initializing TON LiteBalancer...")
+        config_url = 'https://ton.org/global-config.json'
+
+        logging.info(f"Downloading TON config from {config_url}...")
+        async with app.aiohttp_session.get(config_url) as response:
+            response.raise_for_status()
+            ton_config = await response.json()
+        logging.info("✅ TON config downloaded successfully.")
+
+        # --- 🟢 تصحيح: إزالة 'await' من هنا لأن from_config دالة متزامنة ---
+        app.lite_balancer = LiteBalancer.from_config(
+            config=ton_config, trust_level=2
+        )
+        # --- نهاية التصحيح ---
+
+        await app.lite_balancer.start_up()  # الـ await هنا صحيح لأن start_up غير متزامنة
+        logging.info("✅ TON LiteBalancer initialized and connected.")
+
         logging.info("🔄 Initializing AI service...")
         app.ai_service = DeepSeekService(app)
         logging.info("✅ AI service initialized")
 
-        # 1. تهيئة الخدمة التضمينية أولاً
         logging.info("🔄 Initializing Embedding service...")
         app.embedding_service = ImprovedEmbeddingService()
         await app.embedding_service.initialize()
         logging.info("✅ Embedding service initialized")
 
-        # 2. تهيئة KnowledgeBase بعد وجود embedding_service
         knowledge_base.init_app(app)
         logging.info("✅ KnowledgeBase initialized")
-
-        # 3. تهيئة ChatManager
         app.chat_manager.init_app(app)
 
-        # 3. تهيئة باقي المكونات
         logging.info("🔄 Starting Telegram bot and scheduler...")
         app.bot = bot
-
-        await start_scheduler(app.db_pool)
+        logging.info("🔄 Initializing Background Messaging Service...")
+        app.messaging_service = BackgroundMessagingService(app.db_pool, app.bot)
+        logging.info("✅ Background Messaging Service initialized")
+        await start_scheduler(app.bot, app.db_pool)
         if not app.bot_running:
             app.bot_running = True
             asyncio.create_task(start_bot())
@@ -146,6 +157,7 @@ async def initialize_app():
         await close_resources()
         raise
 
+
 # إغلاق الموارد
 @app.after_serving
 async def close_resources():
@@ -153,36 +165,34 @@ async def close_resources():
         if app.aiohttp_session and not app.aiohttp_session.closed:
             await app.aiohttp_session.close()
             logging.info("✅ aiohttp session closed")
-
         if app.db_pool:
             await app.db_pool.close()
             logging.info("✅ Database pool closed")
-
-        await close_telegram_bot_session()
-        logging.info("✅ Telegram bot session closed")
-
+        if app.lite_balancer:
+            await app.lite_balancer.close_all()
+            logging.info("✅ TON LiteBalancer connections closed")
+        if app.bot:
+            await close_telegram_bot_session(app.bot)
     except Exception as e:
         logging.error(f"❌ Error during cleanup: {e}")
+
 
 # تشغيل التهيئة قبل البدء في استقبال الطلبات
 @app.before_serving
 async def setup():
     try:
         await initialize_app()
-        # التحقق من التهيئة النهائية
-        logging.info("Final initialization check:")
-        logging.info(f"AI Service initialized: {hasattr(app, 'ai_service')}")
-        logging.info(f"Embedding Service: {hasattr(app, 'embedding_service')}")
-        logging.info(f"KnowledgeBase AI ref: {knowledge_base.ai_service is not None}")
-        logging.info(f"ChatManager initialized: {app.chat_manager is not None}")
+        logging.info("✅ Final initialization check complete.")
     except Exception as e:
-        logging.critical(f"Initialization failed: {e}")
+        logging.critical(f"Initialization failed in setup: {e}")
         raise
+
 
 # نقطة فحص صحية
 @app.route("/")
 async def home():
     return "🚀 Exadoo API is running!"
+
 
 # نقطة الدخول الرئيسية
 if __name__ == "__main__":

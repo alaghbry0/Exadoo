@@ -618,25 +618,28 @@ async def update_payment_with_txhash(
 
 async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Optional[dict]:
     """
-    جلب سجل دفع معلق من قاعدة البيانات بناءً على payment_token فقط.
+    جلب سجل دفع من قاعدة البيانات بناءً على payment_token.
+    تم تحديث هذه الدالة لتشمل عمود 'status' وإزالة الشرط المسبق على الحالة.
     """
     try:
+        # لاحظ إضافة 'status' و 'id' إلى جملة SELECT وإزالة "AND status = 'pending'"
         sql = """
-            SELECT telegram_id, subscription_plan_id, payment_token, username, full_name, user_wallet_address, amount
+            SELECT id, telegram_id, subscription_plan_id, payment_token, 
+                   username, full_name, user_wallet_address, amount, status
             FROM payments
             WHERE TRIM(payment_token) = TRIM($1)
-              AND status = 'pending'
             LIMIT 1;
         """
         row = await conn.fetchrow(sql, payment_token)
         if row:
-            logging.info(f"✅ تم العثور على سجل دفع معلق لـ payment_token: {payment_token}")
+            logging.info(f"✅ تم العثور على سجل دفع لـ payment_token: {payment_token} (الحالة: {row['status']})")
             return dict(row)
         else:
-            logging.warning(f"⚠️ لم يتم العثور على سجل دفع معلق لـ payment_token: {payment_token}")
+            # هذه ليست رسالة تحذير بالضرورة، قد يكون التوكن من معاملة لا علاقة لها بالدفعات
+            logging.info(f"ℹ️ لم يتم العثور على سجل دفع مطابق لـ payment_token: {payment_token}")
             return None
     except Exception as e:
-        logging.error(f"❌ فشل في جلب سجل الدفع المعلق: {e}", exc_info=True)
+        logging.error(f"❌ فشل في جلب سجل الدفع: {e}", exc_info=True)
         return None
 
 
@@ -644,7 +647,7 @@ async def record_incoming_transaction(
         conn,
         txhash: str,
         sender: str,
-        amount: float,
+        amount: Decimal,
         payment_token: Optional[str] = None,
         memo: Optional[str] = None
 ):
