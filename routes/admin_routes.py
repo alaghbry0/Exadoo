@@ -3022,7 +3022,9 @@ async def cancel_subscription_admin():
             return jsonify({"error": "telegram_id and subscription_type_id are required"}), 400
 
         db_pool = current_app.db_pool
+        telegram_bot = current_app.bot
         async with db_pool.acquire() as conn:
+
             async with conn.transaction():
                 # 1. اعثر على الاشتراك النشط الأقل انتهاءً
                 active = await conn.fetchrow(
@@ -3056,7 +3058,7 @@ async def cancel_subscription_admin():
                 )
                 channels += [int(r["channel_id"]) for r in rows if int(r["channel_id"]) != main_channel]
                 for ch in channels:
-                    await remove_users_from_channel(telegram_bot, telegram_id, ch)
+                    await remove_user_from_channel(telegram_bot, conn, telegram_id, ch)
 
                 # 3. إلغاء الاشتراك في الـ DB باستخدام subscription_id فقط
                 cancel_time = datetime.now(timezone.utc)
