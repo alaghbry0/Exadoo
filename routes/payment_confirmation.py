@@ -32,10 +32,10 @@ payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 getcontext().prec = 30
 
 # ضبط مستوى التسجيل (logging) ليكون أكثر تفصيلاً أثناء التطوير
-logging.basicConfig(
-    level=logging.WARNING,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+#logging.basicConfig(
+    #level=logging.WARNING,
+#format='%(asctime)s - %(levelname)s - %(message)s'
+#)
 
 
 # --- دوال مساعدة ---
@@ -69,22 +69,29 @@ def convert_amount(raw_value: int, decimals: int) -> Decimal:
     return Decimal(raw_value) / (10 ** decimals)
 
 
-async def call_subscription_api(session, telegram_id, subscription_plan_id, payment_details):
+async def call_subscription_api(session, payment_data: dict):
     """
     دالة مخصصة لاستدعاء API الخاص بتجديد الاشتراك.
+    تستخدم قاموسًا واحدًا يحتوي على بيانات الدفع الكاملة.
     """
     headers = {
         "Authorization": f"Bearer {WEBHOOK_SECRET_BACKEND}",
         "Content-Type": "application/json"
     }
+    # استخراج البيانات من القاموس مباشرة
     payload = {
-        "telegram_id": telegram_id,
-        "subscription_plan_id": subscription_plan_id,
-        "payment_id": payment_details.get('tx_hash'),
-        "payment_token": payment_details.get('payment_token'),
-        "username": str(payment_details.get('username')),
-        "full_name": str(payment_details.get('full_name')),
+        "telegram_id": payment_data.get('telegram_id'),
+        "subscription_plan_id": payment_data.get('subscription_plan_id'),
+        "payment_id": payment_data.get('tx_hash'), # سيحتوي الآن على القيمة الصحيحة
+        "payment_token": payment_data.get('payment_token'),
+        "username": str(payment_data.get('username')),
+        "full_name": str(payment_data.get('full_name')),
     }
+    # التحقق من أن الحقول الأساسية ليست فارغة قبل الإرسال
+    if not all([payload["telegram_id"], payload["subscription_plan_id"], payload["payment_id"]]):
+        logging.error(f"❌ بيانات غير مكتملة قبل استدعاء API التجديد: {payload}")
+        return
+
     logging.info(f"📞 استدعاء API التجديد بالبيانات: {json.dumps(payload, indent=2)}")
     try:
         async with session.post(subscribe_api_url, json=payload, headers=headers) as response:
