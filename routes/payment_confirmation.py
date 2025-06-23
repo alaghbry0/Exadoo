@@ -318,9 +318,10 @@ async def parse_transactions(provider: LiteBalancer):
 
                 # استدعاء API التجديد إذا نجح الدفع
                 if updated_payment_data and updated_payment_data.get('status') == 'completed':
-                    logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل'. استدعاء API التجديد...")
+                    logging.info(f"✅ تم تحديث سجل الدفع إلى 'مكتمل'. استدعاء API التجديد بالبيانات المحدثة...")
                     async with aiohttp.ClientSession() as session:
-                        await call_subscription_api(session, telegram_id, subscription_plan_id, pending_payment)
+                        # نمرر القاموس الذي يحتوي على كل البيانات المحدثة، بما في ذلك tx_hash
+                        await call_subscription_api(session, updated_payment_data)
 
             except Exception as e:
                 logging.error(f"❌ خطأ فادح أثناء معالجة الدفع لـ token '{payment_token_from_payload}': {e}",
