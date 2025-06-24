@@ -15,7 +15,7 @@ from utils.permissions import permission_required, owner_required, log_action
 import asyncpg
 import asyncio
 from utils.notifications import create_notification
-from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user, generate_shared_invite_link_for_channel
+from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user, generate_shared_invite_link_for_channel, remove_user_from_channel
 import io
 import pandas as pd
 from database.db_queries import (
