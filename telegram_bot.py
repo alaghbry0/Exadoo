@@ -759,7 +759,7 @@ async def send_payment_to_subscribe_api(
         return False
 
 
-@dp.message()
+@dp.message(F.successful_payment)
 async def handle_successful_payment(message: types.Message):
     """✅ معالجة الدفع الناجح مع التحسينات الجديدة"""
     payment = message.successful_payment
