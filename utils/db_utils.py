@@ -57,13 +57,11 @@ async def generate_shared_invite_link_for_channel(
 
     while current_retry < max_retries:
         try:
-            expire_date = int(time.time()) + (30 * 24 * 60 * 60)
             # ✅ تعديل: استخدام `bot` المستلم
             invite_link_obj = await bot.create_chat_invite_link(
                 chat_id=channel_id,
                 creates_join_request=True,
-                name=f"{link_name_prefix} {channel_name}",
-                expire_date=expire_date
+                name=f"الرابط الدائم لـ {channel_name}"
             )
             invite_link_str = invite_link_obj.invite_link
 
@@ -108,13 +106,11 @@ async def generate_channel_invite_link(bot: Bot, telegram_id: int, channel_id: i
         except TelegramAPIError as e:
             logging.warning(f"⚠️ Could not unban user {telegram_id} from channel {channel_id}: {e.message}")
 
-        expire_date = int(time.time()) + (30 * 24 * 60 * 60)
         # ✅ تعديل: استخدام `bot` المستلم
         invite_link_obj = await bot.create_chat_invite_link(
             chat_id=channel_id,
             creates_join_request=True,
-            name=f"اشتراك {telegram_id} في {channel_name}",
-            expire_date=expire_date
+            name=f"الرابط الدائم لـ {channel_name}"
         )
         invite_link_str = invite_link_obj.invite_link
 

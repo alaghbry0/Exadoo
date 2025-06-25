@@ -139,18 +139,17 @@ async def add_subscription_for_legacy(
     is_active: bool = True,
     source: Optional[str] = None,
     payment_id: Optional[str] = None,
-    invite_link: Optional[str] = None
 ):
     try:
         await connection.execute("""
             INSERT INTO subscriptions
             (user_id, telegram_id, channel_id, subscription_type_id,
              start_date, expiry_date, subscription_plan_id,
-             is_active, source, payment_id, invite_link, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+             is_active, source, payment_id, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         """, user_id, telegram_id, channel_id, subscription_type_id,
             start_date, expiry_date, subscription_plan_id,
-            is_active, source, payment_id, invite_link)
+            is_active, source, payment_id)
 
         logging.info(f"✅ Subscription added for user_id {user_id} (TG: {telegram_id}, Channel: {channel_id}, Source: {source})")
         return True
@@ -172,7 +171,6 @@ async def add_subscription(
     is_active: bool = True,
     subscription_plan_id: int = None, # اجعلها تقبل None
     payment_id: str = None,          # اجعلها تقبل None
-    invite_link: str = None,
     source: str = "unknown",         # إضافة source
     returning_id: bool = False
 ):
@@ -181,12 +179,12 @@ async def add_subscription(
         query = """
             INSERT INTO subscriptions
             (telegram_id, channel_id, subscription_type_id, subscription_plan_id,
-             start_date, expiry_date, is_active, payment_id, invite_link, source, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+             start_date, expiry_date, is_active, payment_id,  source, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,  NOW(), NOW())
         """
         params = [
             telegram_id, channel_id, subscription_type_id, subscription_plan_id, # يمكن أن يكون None
-            start_date, expiry_date, is_active, payment_id, invite_link, source  # يمكن أن يكون None
+            start_date, expiry_date, is_active, payment_id,  source  # يمكن أن يكون None
         ]
 
         if returning_id:
@@ -217,7 +215,6 @@ async def update_subscription(
     is_active: bool = True,
     subscription_plan_id: int | None = None,
     payment_id: str | None = None,
-    invite_link: str | None = None,
     source: str | None = None
 ):
     try:
@@ -229,12 +226,11 @@ async def update_subscription(
             "start_date = $4",
             "is_active = $5",
             "payment_id = $6",          # سيمرر None كـ NULL إذا كان payment_id هو None
-            "invite_link = $7",
             "updated_at = NOW()"
         ]
         params = [
             subscription_type_id, subscription_plan_id, new_expiry_date,
-            start_date, is_active, payment_id, invite_link
+            start_date, is_active, payment_id
         ]
 
         if source: # فقط قم بتحديث source إذا تم توفيره، وإلا اتركه كما هو
@@ -481,25 +477,34 @@ async def update_task_status(connection, task_id: int, status: str):
 
 async def get_user_subscriptions(connection, telegram_id: int):
     """
-    🔹 جلب اشتراكات المستخدم الفعلية مع تاريخ البدء
+    🔹 جلب اشتراكات المستخدم الفعلية مع رابط الدعوة العام للقناة الرئيسية.
     """
     try:
+        # 🌟 [الاستعلام المعدل] 🌟
+        # نقوم بـ JOIN مع subscription_type_channels حيث is_main=TRUE
+        # ونربط بين subscription_type_id في جدول الاشتراكات والجدول الجديد
         subscriptions = await connection.fetch("""
             SELECT 
                 s.subscription_type_id, 
                 s.start_date,
                 s.expiry_date, 
                 s.is_active,
-                s.invite_link,
-                st.name AS subscription_name
-            FROM subscriptions s
-            JOIN subscription_types st ON s.subscription_type_id = st.id
-            WHERE s.telegram_id = $1
+                st.name AS subscription_name,
+                -- جلب رابط الدعوة من القناة الرئيسية المرتبطة بنوع الاشتراك
+                stc.invite_link
+            FROM 
+                subscriptions s
+            JOIN 
+                subscription_types st ON s.subscription_type_id = st.id
+            LEFT JOIN 
+                subscription_type_channels stc ON st.id = stc.subscription_type_id AND stc.is_main = TRUE
+            WHERE 
+                s.telegram_id = $1
         """, telegram_id)
 
         return subscriptions
     except Exception as e:
-        logging.error(f"❌ خطأ أثناء جلب اشتراكات المستخدم {telegram_id}: {e}")
+        logging.error(f"❌ خطأ أثناء جلب اشتراكات المستخدم {telegram_id}: {e}", exc_info=True)
         return []
 
 
@@ -510,7 +515,7 @@ async def record_payment(
         payment_token: str,
         amount: Optional[Decimal] = None,
         status: str = 'pending',
-        payment_method: str = 'crypto',
+        payment_method: str = 'USDT (TON)',
         currency: Optional[str] = 'USDT',
         tx_hash: Optional[str] = None,
         username: Optional[str] = None,
