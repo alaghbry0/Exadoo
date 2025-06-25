@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 from quart import Blueprint, current_app, request, jsonify
 from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, \
     get_active_subscription_types, get_subscription_type_details_by_id, add_subscription_for_legacy, \
-    add_pending_subscription
+    add_pending_subscription,  record_telegram_stars_payment
+from routes.subscriptions import process_subscription_renewal
 import asyncpg
 from aiogram.enums import ChatMemberStatus
 from functools import partial
@@ -559,285 +560,137 @@ async def manage_user(connection, telegram_id, username=None, full_name=None):
         return None
 
 
-# 🔹 وظيفة تسجيل الدفعة الناجحة
-async def record_successful_payment(
-        user_db_id: int,
-        telegram_id: int,
-        plan_id: int,
-        payment_id: str, # يستخدم كـ tx_hash
-        payment_token: str,
-        amount: float,
-        username: Optional[str] = None,
-        full_name: Optional[str] = None
-):
+# ==============================================================================
+# 🌟 الدالة الوسيطة الجديدة لمعالجة دفع النجوم 🌟
+# ==============================================================================
+async def process_stars_payment_and_renew(bot: Bot, payment_details: dict):
     """
-    تسجيل الدفعة الناجحة في جدول payments.
-    يتم تعيين created_at و processed_at إلى الوقت الحالي (UTC+3) عند التسجيل.
+    تتولى هذه الدالة تسجيل دفعة النجوم ثم استدعاء محرك التجديد الموحد.
+    تحتوي على آلية إعادة المحاولة الخاصة بها لضمان الموثوقية.
     """
-    try:
-        async with current_app.db_pool.acquire() as connection:
-            # التوقيت الحالي المحسوب في قاعدة البيانات (UTC+3)
-            db_timestamp_expression = "(NOW() AT TIME ZONE 'UTC' + INTERVAL '3 hours')::timestamp"
+    telegram_id = payment_details['telegram_id']
+    payment_token = payment_details['payment_token']
+    max_retries = 3
 
-            payment_record_id = await connection.fetchval(f"""
-                INSERT INTO payments (
-                    user_id,
-                    telegram_id,
-                    subscription_plan_id,
-                    amount,
-                    status,
-                    currency,
-                    payment_token,
-                    tx_hash,
-                    username,
-                    full_name,
-                    payment_method,
-                    processed_at,  -- سيتم تعيينه بواسطة SQL
-                    created_at     -- سيتم تعيينه بواسطة SQL
-                ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8,
-                    COALESCE($9, NULL),  -- username
-                    COALESCE($10, NULL), -- full_name
-                    $11,                 -- payment_method
-                    {db_timestamp_expression}, -- processed_at
-                    {db_timestamp_expression}  -- created_at
-                )
-                RETURNING id
-            """,
-                user_db_id,             # $1
-                telegram_id,            # $2
-                plan_id,                # $3
-                amount,                 # $4
-                'completed',            # $5 status
-                'Stars',       # $6 currency
-                payment_token,          # $7 payment_token
-                payment_id,             # $8 tx_hash (using payment_id from Telegram)
-                username,               # $9 username
-                full_name,              # $10 full_name
-                'Telegram stars'        # $11 payment_method
-            )
-
-            logging.info(f"✅ تم تسجيل الدفعة الناجحة برقم {payment_record_id}")
-            return payment_record_id
-
-    except Exception as e:
-        logging.error(f"❌ خطأ في تسجيل الدفعة: {e}")
-        return None
-
-# 🔹 وظيفة معالجة الدفع الناجح مع آلية إعادة المحاولة
-async def process_successful_payment_with_retry(
-        telegram_id,
-        plan_id,
-        payment_id,
-        payment_token,
-        amount,
-        full_name=None,
-        username=None,
-        max_retries=3
-):
-    """
-    معالجة الدفع الناجح مع آلية إعادة المحاولة باستخدام current_app.db_pool
-    """
     for attempt in range(1, max_retries + 1):
         try:
-            logging.info(f"🔄 محاولة معالجة الدفع {attempt}/{max_retries} للمستخدم {telegram_id}")
+            logging.info(
+                f"🔄 [Stars] Attempt {attempt}/{max_retries} to process payment for user={telegram_id}, token={payment_token}")
 
-            # الاتصال بقاعدة البيانات باستخدام current_app.db_pool
             async with current_app.db_pool.acquire() as connection:
-                # بدء المعاملة
                 async with connection.transaction():
-                    # 1. إدارة المستخدم (إضافة أو تحديث)
-                    #    نمرر 'connection' المكتسبة لهذه الدالة
-                    user_db_id = await manage_user(connection, telegram_id, username, full_name)
-                    if not user_db_id:
-                        raise Exception("فشل في إدارة بيانات المستخدم")
-
-                    # 2. تسجيل الدفعة الناجحة
-                    #    نمرر 'connection' المكتسبة لهذه الدالة
-                    payment_record_id = await record_successful_payment(
-                        user_db_id,
-                        telegram_id,
-                        plan_id,
-                        payment_id,
-                        payment_token,
-                        amount,
-                        username,
-                        full_name
-                    )
-
-                    if not payment_record_id:
-                        raise Exception("فشل في تسجيل الدفعة")
-
-                    # 3. إرسال البيانات إلى API الاشتراك
-                    #    هذه الدالة لا تحتاج إلى اتصال قاعدة بيانات
-                    api_success = await send_payment_to_subscribe_api(
+                    # الخطوة 1: تسجيل الدفعة في جدول payments باستخدام دالة موحدة.
+                    payment_record = await record_payment(
+                        conn=connection,
                         telegram_id=telegram_id,
-                        plan_id=plan_id,
-                        payment_id=payment_id,
+                        subscription_plan_id=payment_details['plan_id'],
+                        amount=Decimal(payment_details['amount']),
                         payment_token=payment_token,
-                        full_name=full_name or "غير معروف",
-                        username=username or "غير معروف"
+                        status='pending',
+                        payment_method='Telegram Stars', # <-- استخدام payment_method
+                        currency='Stars',
+                        tx_hash=payment_details['payment_id'],
+                        username=payment_details['username'],
+                        full_name=payment_details['full_name']
                     )
 
-                    if not api_success:
-                        raise Exception("فشل في إرسال البيانات إلى API الاشتراك")
+                    if not payment_record:
+                        raise Exception("Failed to record initial pending payment for Telegram Stars.")
 
-                # إذا وصلت هنا، فالمعاملة تمت بنجاح (تم عمل commit تلقائياً)
-                logging.info(f"✅ تم معالجة الدفع بنجاح للمستخدم {telegram_id}")
-                return True
+                    # الخطوة 2: تجهيز البيانات لدالة التجديد (لا تغيير هنا)
+                    payment_data_for_renewal = {
+                        **payment_record,
+                        "tx_hash": payment_record['tx_hash'],
+                        "amount_received": payment_record['amount_received']
+                    }
 
-        except Exception as e:
-            logging.error(f"❌ خطأ في المحاولة {attempt}/{max_retries} لمعالجة الدفع للمستخدم {telegram_id}: {str(e)}")
+                    # الخطوة 3: استدعاء محرك التجديد الموحد
+                    await process_subscription_renewal(
+                        connection=connection,
+                        bot=bot,
+                        payment_data=payment_data_for_renewal
+                    )
 
-            try:
-                async with current_app.db_pool.acquire() as error_conn:
-                    await error_conn.execute("""
-                        UPDATE payments 
-                        SET status = 'failed', error_message = $1 
-                        WHERE payment_token = $2 AND status = 'completed'
-                    """, str(e), payment_token)
-                    logging.info(f"⚠️ تم تحديث حالة الدفعة إلى 'failed' للمستخدم {telegram_id} بسبب: {str(e)}")
-            except Exception as db_update_err:
-                logging.error(f"❌ فشل في تحديث حالة الدفعة إلى 'failed' للمستخدم {telegram_id}: {db_update_err}")
-
-        # انتظار قبل إعادة المحاولة (exponential backoff)
-        if attempt < max_retries:
-            wait_time = 2 ** attempt
-            logging.info(f"⏳ انتظار {wait_time} ثانية قبل المحاولة التالية للمستخدم {telegram_id}...")
-            await asyncio.sleep(wait_time)
-
-    logging.critical(f"🚨 فشل جميع المحاولات لمعالجة الدفع للمستخدم {telegram_id}")
-    return False
-
-
-# 🔹 وظيفة معدلة لمعالجة الدفع الناجح
-async def send_payment_to_subscribe_api(
-        telegram_id: int,
-        plan_id: int,
-        payment_id: str,
-        payment_token: str,
-        full_name: str,
-        username: str,
-        retries=3
-):
-    """✅ إرسال بيانات الدفع مع المعلومات الجديدة"""
-    headers = {
-        "Authorization": f"Bearer {WEBHOOK_SECRET}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "telegram_id": telegram_id,
-        "subscription_plan_id": plan_id,
-        "payment_id": payment_id,
-        "payment_token": payment_token,
-        "full_name": full_name,
-        "telegram_username": username
-    }
-
-    async with aiohttp.ClientSession() as session:
-        for attempt in range(1, retries + 1):
-            try:
-                logging.info(f"🚀 إرسال بيانات الاشتراك (المحاولة {attempt}/{retries})...")
-
-                async with session.post(
-                        SUBSCRIBE_URL,
-                        json=payload,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-
-                    if response.status == 200:
-                        logging.info(f"✅ تم تحديث الاشتراك لـ {telegram_id}")
-                        return True
-
-                    response_text = await response.text()
-                    logging.error(f"❌ فشل الاستجابة ({response.status}): {response_text}")
-
-            except Exception as e:
-                logging.error(f"❌ خطأ في المحاولة {attempt}/{retries}: {str(e)}")
-
-            if attempt < retries:
-                await asyncio.sleep(2 ** attempt)
-
-        logging.critical("🚨 فشل جميع المحاولات!")
-        return False
-
-
-@dp.message()
-async def handle_successful_payment(message: types.Message):
-    """✅ معالجة الدفع الناجح مع التحسينات الجديدة"""
-    payment = message.successful_payment
-    if not payment:
-        return
-
-    try:
-        logging.info(f"📥 استلام دفعة ناجحة من {message.from_user.id}")
-
-        # استخراج البيانات مباشرة من payload الفاتورة
-        payload = json.loads(payment.invoice_payload)
-        telegram_id = payload.get("userId")
-        plan_id = payload.get("planId")
-        payment_id = payment.telegram_payment_charge_id
-        payment_token = payload.get("paymentToken")
-        full_name = payload.get("fullName") or message.from_user.full_name
-        username = payload.get("telegramUsername") or message.from_user.username
-        amount = payment.total_amount  # المبلغ بـ Telegram Stars
-
-        # التحقق من البيانات الأساسية
-        required_fields = [
-            (telegram_id, "telegram_id"),
-            (plan_id, "plan_id"),
-            (payment_id, "payment_id"),
-            (payment_token, "payment_token"),
-            (amount, "amount")
-        ]
-
-        missing_fields = [name for value, name in required_fields if not value]
-        if missing_fields:
-            logging.error(f"❌ بيانات ناقصة: {', '.join(missing_fields)}")
+            logging.info(f"✅ [Stars] Successfully handed over payment for user={telegram_id} to renewal system.")
             return
 
-        # معالجة الدفع مع آلية إعادة المحاولة
-        success = await process_successful_payment_with_retry(
-            telegram_id=telegram_id,
-            plan_id=plan_id,
-            payment_id=payment_id,
-            payment_token=payment_token,
-            amount=amount,
-            full_name=full_name,
-            username=username,
-            max_retries=3
-        )
+        except Exception as e:
+            logging.error(f"❌ [Stars] Error in attempt {attempt}/{max_retries} for user={telegram_id}: {e}", exc_info=True)
+            if attempt < max_retries:
+                wait_time = 2 ** attempt
+                logging.info(f"⏳ [Stars] Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
 
-        if not success:
-            logging.error("❌ فشل إرسال البيانات إلى خدمة الاشتراك")
+    # --- فشلت كل المحاولات ---
+    logging.critical(f"🚨 [Stars] All attempts failed for user={telegram_id}, token={payment_token}. Manual check required.")
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🚨 فشل حرج في معالجة دفعة نجوم!\n\nUser ID: `{telegram_id}`\nToken: `{payment_token}`\n\nيرجى المراجعة اليدوية.",
+                parse_mode="Markdown"
+            )
+        except Exception as notify_err:
+            logging.error(f"Failed to send critical failure notification to admin: {notify_err}")
+
+
+# ==============================================================================
+# 📥 معالج الدفع الناجح (مع تحسين التحقق) 📥
+# ==============================================================================
+@dp.message(lambda message: message.successful_payment is not None)
+async def handle_successful_payment(message: types.Message, bot: Bot):
+    """
+    يعالج رسالة الدفع الناجح، يستخرج البيانات، ويسلمها للمعالج الجديد.
+    """
+    payment = message.successful_payment
+    try:
+        logging.info(f"📥 [Stars] Received successful payment from user={message.from_user.id}")
+        payload = json.loads(payment.invoice_payload)
+
+        payment_details = {
+            "telegram_id": payload.get("userId"),
+            "plan_id": payload.get("planId"),
+            "payment_id": payment.telegram_payment_charge_id,
+            "payment_token": payload.get("paymentToken"),
+            "amount": payment.total_amount,
+            "full_name": payload.get("fullName") or message.from_user.full_name,
+            "username": payload.get("telegramUsername") or message.from_user.username
+        }
+
+        # --- تحقق محسن من الحقول الإلزامية ---
+        required_keys = ["telegram_id", "plan_id", "payment_id", "payment_token", "amount"]
+        if not all(payment_details.get(key) for key in required_keys):
+            logging.error(f"❌ [Stars] Missing mandatory data in payment details: {payment_details}")
+            # يمكنك إرسال رسالة للمستخدم هنا إذا أردت
+            await message.reply("عذرًا، حدث خطأ في معالجة دفعتك بسبب بيانات ناقصة. يرجى التواصل مع الدعم.")
+            return
+
+        asyncio.create_task(process_stars_payment_and_renew(bot, payment_details))
 
     except json.JSONDecodeError as e:
-        logging.error(f"❌ خطأ في تنسيق JSON: {str(e)}")
+        logging.error(f"❌ [Stars] Invalid JSON in invoice_payload: {e}")
     except Exception as e:
-        logging.error(f"❌ خطأ غير متوقع: {str(e)}")
+        logging.error(f"❌ [Stars] Unexpected error in handle_successful_payment: {e}", exc_info=True)
 
 
+# ==============================================================================
+# 🧐 معالج التحقق المسبق (لا يتطلب تغيير) 🧐
+# ==============================================================================
 @dp.pre_checkout_query()
-async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
-    """✅ التحقق من صحة الفاتورة قبل إتمام الدفع"""
+async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery, bot: Bot):
+    """التحقق من صحة الفاتورة قبل إتمام الدفع"""
     try:
-        logging.info(f"📥 استلام pre_checkout_query من {pre_checkout.from_user.id}: {pre_checkout}")
-
-        # ✅ التحقق من صحة invoice_payload
         payload = json.loads(pre_checkout.invoice_payload)
         if not payload.get("userId") or not payload.get("planId"):
-            logging.error("❌ `invoice_payload` غير صالح!")
+            logging.error("❌ `invoice_payload` is invalid in pre_checkout!")
             await bot.answer_pre_checkout_query(pre_checkout.id, ok=False, error_message="بيانات الدفع غير صالحة!")
             return
 
-        # ✅ إذا كان كل شيء صحيح، الموافقة على الدفع
         await bot.answer_pre_checkout_query(pre_checkout.id, ok=True)
-        logging.info(f"✅ تمت الموافقة على الدفع لـ {pre_checkout.from_user.id}")
+        logging.info(f"✅ [Stars] Pre-checkout approved for user={pre_checkout.from_user.id}")
 
     except Exception as e:
-        logging.error(f"❌ خطأ في pre_checkout_query: {e}")
+        logging.error(f"❌ Error in pre_checkout_query: {e}")
         await bot.answer_pre_checkout_query(pre_checkout.id, ok=False, error_message="حدث خطأ غير متوقع")
 
 

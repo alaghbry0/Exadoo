@@ -503,60 +503,109 @@ async def get_user_subscriptions(connection, telegram_id: int):
         return []
 
 
-# db_queries.py - record_payment function signature
 async def record_payment(
         conn,
-        telegram_id,
-        user_wallet_address,
-        amount,
-        subscription_plan_id,
-        username=None,
-        full_name=None,
-        payment_token=None  # استخدام payment_token فقط
-):
-    """تسجيل بيانات الدفع مع payment_token الفريد"""
+        telegram_id: int,
+        subscription_plan_id: int,
+        payment_token: str,
+        amount: Optional[Decimal] = None,
+        status: str = 'pending',
+        payment_method: str = 'crypto',
+        currency: Optional[str] = 'USDT',
+        tx_hash: Optional[str] = None,
+        username: Optional[str] = None,
+        full_name: Optional[str] = None,
+        user_wallet_address: Optional[str] = None
+) -> Optional[dict]:
+    """
+    دالة موحدة ومرنة لتسجيل أي نوع من الدفعات.
+    """
+    query = """
+    INSERT INTO payments (
+        user_id, telegram_id, subscription_plan_id, amount, amount_received, payment_token, 
+        status, payment_method, currency, tx_hash, username, full_name, 
+        user_wallet_address, created_at
+    ) VALUES (
+        $1, $1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW()
+    )
+    ON CONFLICT (payment_token) DO UPDATE 
+    SET 
+        tx_hash = COALESCE(EXCLUDED.tx_hash, payments.tx_hash), 
+        status = EXCLUDED.status,
+        updated_at = NOW()
+    RETURNING *;
+    """
     try:
-        sql = """
-            INSERT INTO payments (
-                user_id, 
-                subscription_plan_id, 
-                amount, 
-                telegram_id, 
-                username, 
-                full_name, 
-                user_wallet_address, 
-                status, 
-                payment_token
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
-            RETURNING payment_token, amount;
-        """
-        result = await conn.fetchrow(
-            sql,
-            telegram_id,
-            subscription_plan_id,
-            amount,
-            telegram_id,
-            username,
-            full_name,
-            user_wallet_address,
-            payment_token
+        final_amount = amount if amount is not None else Decimal('0.0')
+
+        payment_record = await conn.fetchrow(
+            query,
+            telegram_id, subscription_plan_id, final_amount, payment_token,
+            status, payment_method, currency, tx_hash, username,
+            full_name, user_wallet_address
         )
 
-        if result:
-            logging.info(f"✅ تم تسجيل الدفعة: {payment_token}")
-            return {
-                "payment_token": payment_token,
-                "amount": result["amount"]
-            }
-        else:
-            logging.error("❌ فشل إدخال الدفعة")
-            return None
+        if not payment_record:
+            raise Exception("Failed to record or retrieve payment from database.")
+
+        logging.info(f"✅ Payment recorded/updated for token {payment_token} with method '{payment_method}'.")
+
+        payment_dict = dict(payment_record)
+        if 'amount_received' in payment_dict and payment_dict['amount_received'] is not None and not isinstance(
+                payment_dict['amount_received'], Decimal):
+            payment_dict['amount_received'] = Decimal(payment_dict['amount_received'])
+
+        return payment_dict
 
     except Exception as e:
-        logging.error(f"❌ خطأ في record_payment: {str(e)}")
+        logging.error(f"❌ Error in record_payment for token {payment_token}: {e}", exc_info=True)
         return None
 
+# --- دالة منفصلة لمدفوعات النجوم (Stars Payments) ---
+async def record_telegram_stars_payment(
+        conn,
+        telegram_id: int,
+        plan_id: int,
+        payment_id: str, # tx_hash
+        payment_token: str,
+        amount: int,
+        username: Optional[str] = None,
+        full_name: Optional[str] = None
+) -> Optional[dict]:
+    """
+    تسجل دفعة نجوم تليجرام. مصممة خصيصًا لمعالج دفع النجوم.
+    """
+    query = """
+    INSERT INTO payments (
+        telegram_id, subscription_plan_id, amount_received, payment_token,
+        status, payment_method, currency, tx_hash, username, full_name,
+        created_at
+    ) VALUES (
+        $1, $2, $3, $4, 'pending', 'Telegram Stars', 'Stars', $5, $6, $7, NOW()
+    )
+    ON CONFLICT (payment_token) DO UPDATE
+    SET
+        tx_hash = EXCLUDED.tx_hash,
+        status = 'pending',
+        updated_at = NOW()  -- <-- هذا الآن سيعمل بعد تعديل الجدول
+    RETURNING *;
+    """
+    try:
+        payment_record = await conn.fetchrow(
+            query,
+            telegram_id, plan_id, Decimal(amount), payment_token,
+            payment_id, username, full_name
+        )
+
+        if not payment_record:
+            raise Exception("Failed to record or retrieve Telegram Stars payment.")
+
+        logging.info(f"✅ Stars payment recorded/updated for token {payment_token}.")
+        return dict(payment_record)
+
+    except Exception as e:
+        logging.error(f"❌ Error in record_telegram_stars_payment for token {payment_token}: {e}", exc_info=True)
+        return None
 
 async def update_payment_with_txhash(
         conn,
@@ -679,6 +728,24 @@ async def record_incoming_transaction(
         logging.info(f"✅ تم تسجيل المعاملة {txhash}")
     except Exception as e:
         logging.error(f"❌ فشل تسجيل المعاملة {txhash}: {str(e)}")
+
+async def update_payment_status_to_manual_check(conn, payment_token: str, error_message: str):
+    """
+    تحديث حالة الدفع للإشارة إلى أنه يحتاج لمراجعة يدوية بعد فشل تفعيل الاشتراك.
+    """
+    try:
+        await conn.execute(
+            """
+            UPDATE payments
+            SET status = 'manual_check', error_message = $1, processed_at = NOW()
+            WHERE payment_token = $2
+            """,
+            f"Subscription activation failed: {error_message}",
+            payment_token
+        )
+        logging.warning(f"⚠️ تم تحديد الدفعة {payment_token} على أنها تحتاج لمراجعة يدوية.")
+    except Exception as e:
+        logging.error(f"❌ فشل تحديث حالة الدفع إلى 'manual_check' لـ {payment_token}: {e}")
 
 
 async def get_unread_notifications_count(connection, telegram_id: int) -> int:
