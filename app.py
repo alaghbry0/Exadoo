@@ -8,16 +8,8 @@ import hypercorn.config
 import hypercorn.asyncio
 import aiohttp
 from pgvector.asyncpg import register_vector
-from quart import Quart, request  # --- تعديل: إضافة request
+from quart import Quart
 from quart_cors import cors
-
-# --- إضافة: استيرادات خاصة بالويب هوك ---
-from aiogram.types import Update
-
-# --- تعديل: التأكد من استيراد bot و dp ---
-# تأكد من أن ملف telegram_bot.py يحتوي على dp = Dispatcher()
-from telegram_bot import bot, dp, telegram_bot_bp
-
 from chatbot.ai_service import DeepSeekService
 from config import DATABASE_CONFIG
 from routes.users import user_bp
@@ -32,6 +24,7 @@ from routes.payment_status import payment_status_bp
 from routes.payment_confirmation import payment_confirmation_bp
 from routes.auth_routes import auth_routes
 from services.messaging_service import BackgroundMessagingService
+from telegram_bot import start_bot, bot, telegram_bot_bp
 from chatbot.chatbot import chatbot_bp
 from chatbot.knowledge_base import knowledge_base
 from chatbot.chat_manager import ChatManager
@@ -42,20 +35,11 @@ from utils.db_utils import close_telegram_bot_session
 
 from pytoniq import LiteBalancer
 
-# --- تعديل: إضافة PUBLIC_DOMAIN إلى المتغيرات المطلوبة ---
-REQUIRED_ENV_VARS = ["PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET", "PORT", "PUBLIC_DOMAIN"]
+# تأكد من المتغيرات البيئية الأساسية
+REQUIRED_ENV_VARS = ["PRIVATE_KEY", "TELEGRAM_BOT_TOKEN", "WEBHOOK_SECRET", "PORT"]
 for var in REQUIRED_ENV_VARS:
     if not os.environ.get(var):
         raise ValueError(f"❌ متغير البيئة {var} غير مضبوط.")
-
-# --- إضافة: تعريف ثوابت الويب هوك ---
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-# يجب أن يكون هذا هو النطاق العام لتطبيقك، e.g., https://your-app.onrender.com
-PUBLIC_DOMAIN = os.environ.get("PUBLIC_DOMAIN")
-
-WEBHOOK_PATH = f"/webhook/{TELEGRAM_BOT_TOKEN}"
-WEBHOOK_URL = f"{PUBLIC_DOMAIN.rstrip('/')}{WEBHOOK_PATH}"
 
 
 # دالة تُنفّذ على كل اتصال جديد في pool
@@ -69,7 +53,7 @@ app = Quart(__name__)
 app.db_pool = None
 app.aiohttp_session = None
 app.bot = None
-app.bot_running = False  # هذا المتغير لم يعد له تأثير كبير لكن يمكن إبقاؤه
+app.bot_running = False
 app.lite_balancer = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -91,6 +75,7 @@ app.register_blueprint(shop)
 app.register_blueprint(admin_chatbot_bp)
 app.register_blueprint(telegram_bot_bp)
 app.register_blueprint(chatbot_bp, url_prefix="/bot")
+
 app.register_blueprint(ws_bp)
 
 
@@ -131,10 +116,13 @@ async def initialize_app():
             ton_config = await response.json()
         logging.info("✅ TON config downloaded successfully.")
 
+        # --- 🟢 تصحيح: إزالة 'await' من هنا لأن from_config دالة متزامنة ---
         app.lite_balancer = LiteBalancer.from_config(
             config=ton_config, trust_level=2
         )
-        await app.lite_balancer.start_up()
+        # --- نهاية التصحيح ---
+
+        await app.lite_balancer.start_up()  # الـ await هنا صحيح لأن start_up غير متزامنة
         logging.info("✅ TON LiteBalancer initialized and connected.")
 
         logging.info("🔄 Initializing AI service...")
@@ -150,18 +138,15 @@ async def initialize_app():
         logging.info("✅ KnowledgeBase initialized")
         app.chat_manager.init_app(app)
 
-        logging.info("🔄 Initializing bot and scheduler...")
-        app.bot = bot  # تعيين البوت على كائن التطبيق
+        logging.info("🔄 Starting Telegram bot and scheduler...")
+        app.bot = bot
         logging.info("🔄 Initializing Background Messaging Service...")
         app.messaging_service = BackgroundMessagingService(app.db_pool, app.bot)
         logging.info("✅ Background Messaging Service initialized")
         await start_scheduler(app.bot, app.db_pool)
-
-        # --- ⚠️ حذف: تم إزالة السطر التالي لأنه خاص بالـ polling ---
-        # if not app.bot_running:
-        #     app.bot_running = True
-        #     asyncio.create_task(start_bot())
-        logging.info("✅ Bot is configured for Webhook mode. Polling is disabled.")
+        if not app.bot_running:
+            app.bot_running = True
+            asyncio.create_task(start_bot())
 
         app.register_blueprint(payment_confirmation_bp)
         logging.info("✅ Application initialization completed")
@@ -172,16 +157,10 @@ async def initialize_app():
         raise
 
 
-# إغلاق الموارد عند إيقاف التشغيل
+# إغلاق الموارد
 @app.after_serving
 async def close_resources():
     try:
-        # --- إضافة: حذف الويب هوك عند إيقاف التطبيق ---
-        if app.bot:
-            logging.info("🔄 Deleting webhook...")
-            await app.bot.delete_webhook()
-            logging.info("✅ Webhook has been deleted.")
-
         if app.aiohttp_session and not app.aiohttp_session.closed:
             await app.aiohttp_session.close()
             logging.info("✅ aiohttp session closed")
@@ -193,67 +172,25 @@ async def close_resources():
             logging.info("✅ TON LiteBalancer connections closed")
         if app.bot:
             await close_telegram_bot_session(app.bot)
-
     except Exception as e:
         logging.error(f"❌ Error during cleanup: {e}")
 
 
-# تشغيل التهيئة وإعداد الويب هوك قبل بدء استقبال الطلبات
+# تشغيل التهيئة قبل البدء في استقبال الطلبات
 @app.before_serving
 async def setup():
     try:
         await initialize_app()
         logging.info("✅ Final initialization check complete.")
-
-        # --- إضافة: إعداد الويب هوك عند بدء التشغيل ---
-        logging.info(f"🔄 Setting up webhook to: {WEBHOOK_URL}")
-         # ✅ الخطوة 1: عرف قائمة بأنواع التحديثات المسموح بها
-        allowed_updates = ["message", "chat_join_request", "pre_checkout_query"]
-
-        logging.info(f"🔄 Setting up webhook to: {WEBHOOK_URL}")
-        logging.info(f"🔔 Allowing update types: {allowed_updates}") # رسالة سجل إضافية للتأكد
-
-        webhook_info = await bot.get_webhook_info()
-
-        # سنقوم بتحديث الويب هوك إذا كان عنوان URL مختلفًا أو إذا كانت قائمة التحديثات المسموح بها مختلفة
-        if webhook_info.url != WEBHOOK_URL or set(webhook_info.allowed_updates or []) != set(allowed_updates):
-            # ✅ الخطوة 2: أضف `allowed_updates` إلى الاستدعاء
-            await bot.set_webhook(
-                url=WEBHOOK_URL,
-                secret_token=WEBHOOK_SECRET,
-                allowed_updates=allowed_updates
-            )
-            logging.info("✅ Webhook has been set/updated successfully.")
-        else:
-            logging.info("✅ Webhook is already set correctly.")
-
     except Exception as e:
-        logging.critical(f"Initialization or webhook setup failed in setup: {e}")
+        logging.critical(f"Initialization failed in setup: {e}")
         raise
+
 
 # نقطة فحص صحية
 @app.route("/")
 async def home():
-    return "🚀 Exadoo API is running with Telegram Webhook!"
-
-
-# --- إضافة: نقطة النهاية (endpoint) لاستقبال التحديثات من تيليجرام ---
-@app.route(WEBHOOK_PATH, methods=["POST"])
-async def bot_webhook():
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        return "Forbidden", 403
-
-    try:
-        update_data = await request.get_json(force=True)
-        update_obj = Update.model_validate(update_data, context={"bot": bot})
-        
-        await dp.feed_update(update=update_obj) 
-        
-        return "", 200
-    except Exception as e:
-        logging.error(f"Error processing webhook: {e}", exc_info=True)
-        return "Internal Server Error", 500
-
+    return "🚀 Exadoo API is running!"
 
 
 # نقطة الدخول الرئيسية
