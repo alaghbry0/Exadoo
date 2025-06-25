@@ -207,20 +207,29 @@ async def setup():
 
         # --- إضافة: إعداد الويب هوك عند بدء التشغيل ---
         logging.info(f"🔄 Setting up webhook to: {WEBHOOK_URL}")
+         # ✅ الخطوة 1: عرف قائمة بأنواع التحديثات المسموح بها
+        allowed_updates = ["message", "chat_join_request", "pre_checkout_query"]
+
+        logging.info(f"🔄 Setting up webhook to: {WEBHOOK_URL}")
+        logging.info(f"🔔 Allowing update types: {allowed_updates}") # رسالة سجل إضافية للتأكد
+
         webhook_info = await bot.get_webhook_info()
-        if webhook_info.url != WEBHOOK_URL:
+
+        # سنقوم بتحديث الويب هوك إذا كان عنوان URL مختلفًا أو إذا كانت قائمة التحديثات المسموح بها مختلفة
+        if webhook_info.url != WEBHOOK_URL or set(webhook_info.allowed_updates or []) != set(allowed_updates):
+            # ✅ الخطوة 2: أضف `allowed_updates` إلى الاستدعاء
             await bot.set_webhook(
                 url=WEBHOOK_URL,
-                secret_token=WEBHOOK_SECRET
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=allowed_updates
             )
-            logging.info("✅ Webhook has been set successfully.")
+            logging.info("✅ Webhook has been set/updated successfully.")
         else:
             logging.info("✅ Webhook is already set correctly.")
 
     except Exception as e:
         logging.critical(f"Initialization or webhook setup failed in setup: {e}")
         raise
-
 
 # نقطة فحص صحية
 @app.route("/")
@@ -231,22 +240,20 @@ async def home():
 # --- إضافة: نقطة النهاية (endpoint) لاستقبال التحديثات من تيليجرام ---
 @app.route(WEBHOOK_PATH, methods=["POST"])
 async def bot_webhook():
-    # التحقق من الـ secret token للأمان
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         return "Forbidden", 403
 
     try:
-        # تحويل الطلب إلى كائن Update وتمريره إلى Dispatcher
         update_data = await request.get_json(force=True)
-        update_obj = Update.model_validate(update_data, context={"bot": bot}) # غيّرت اسم المتغير لتجنب الارتباك
+        update_obj = Update.model_validate(update_data, context={"bot": bot})
         
-        # ✅  التصحيح الرئيسي هنا
         await dp.feed_update(update=update_obj) 
         
         return "", 200
     except Exception as e:
         logging.error(f"Error processing webhook: {e}", exc_info=True)
         return "Internal Server Error", 500
+
 
 
 # نقطة الدخول الرئيسية
