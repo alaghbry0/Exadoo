@@ -238,8 +238,11 @@ async def bot_webhook():
     try:
         # تحويل الطلب إلى كائن Update وتمريره إلى Dispatcher
         update_data = await request.get_json(force=True)
-        update = Update.model_validate(update_data, context={"bot": bot})
-        await dp.feed_update(update)
+        update_obj = Update.model_validate(update_data, context={"bot": bot}) # غيّرت اسم المتغير لتجنب الارتباك
+        
+        # ✅  التصحيح الرئيسي هنا
+        await dp.feed_update(update=update_obj) 
+        
         return "", 200
     except Exception as e:
         logging.error(f"Error processing webhook: {e}", exc_info=True)
