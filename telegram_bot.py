@@ -1,3 +1,4 @@
+# telegram_bot.py
 import logging
 import os
 import asyncio
@@ -44,12 +45,6 @@ dp = Dispatcher()
 # 🔹 إنشاء Blueprint لاستخدامه في `app.py`
 telegram_bot_bp = Blueprint("telegram_bot", __name__)  # ✅ تغيير الاسم إلى `telegram_bot_bp`
 
-
-# 🔹 إزالة Webhook تمامًا قبل تشغيل Polling
-async def remove_webhook():
-    """🔄 إزالة Webhook حتى يعمل Polling"""
-    await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("✅ تم إزالة Webhook بنجاح!")
 
 
 async def check_if_legacy_migration_done(conn: asyncpg.Connection, user_db_id: int) -> bool:
@@ -839,23 +834,3 @@ async def handle_pre_checkout(pre_checkout: types.PreCheckoutQuery):
     except Exception as e:
         logging.error(f"❌ خطأ في pre_checkout_query: {e}")
         await bot.answer_pre_checkout_query(pre_checkout.id, ok=False, error_message="حدث خطأ غير متوقع")
-
-
-# 🔹 تشغيل Polling بدلاً من Webhook
-is_bot_running = False
-
-
-async def start_bot():
-    global is_bot_running
-    if is_bot_running:
-        logging.warning("⚠️ البوت يعمل بالفعل! تجاهل تشغيل Polling مرة أخرى.")
-        return
-
-    is_bot_running = True
-    await remove_webhook()
-    logging.info("🚀 بدء تشغيل Polling للبوت...")
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        logging.error(f"❌ خطأ أثناء تشغيل Polling: {e}")
-        sys.exit(1)
