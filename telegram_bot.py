@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from quart import Blueprint, current_app, request, jsonify
 from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, \
     get_active_subscription_types, get_subscription_type_details_by_id, add_subscription_for_legacy, \
-    add_pending_subscription,  record_telegram_stars_payment
+    add_pending_subscription,  record_telegram_stars_payment, record_payment
 from routes.subscriptions import process_subscription_renewal
 import asyncpg
 from aiogram.enums import ChatMemberStatus
