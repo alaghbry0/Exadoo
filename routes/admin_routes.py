@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 import json
+import uuid
 import logging
 from quart import Blueprint, request, jsonify, abort, current_app, send_file
 from config import DATABASE_CONFIG, SECRET_KEY
@@ -777,7 +778,7 @@ async def update_subscription_type(type_id: int):
                     # استدعاء الدالة الآن آمن وموجود داخل التحقق
                     # التحذير سيختفي من هنا
                     invite_result_main = await generate_shared_invite_link_for_channel(
-                        bot, effective_main_channel_id_after_update, main_channel_name_to_use
+                        bot, int(effective_main_channel_id_after_update), main_channel_name_to_use
                     )
                     main_invite_link = invite_result_main.get("invite_link") if invite_result_main.get(
                         "success") else None
@@ -871,7 +872,7 @@ async def update_subscription_type(type_id: int):
                 try:
                     # الخطوة 1: بدء مهمة جدولة الإزالة في الخلفية (سريعة جدًا)
                     try:
-                        scheduling_batch_id = await current_app.messaging_service.start_channel_removal_scheduling_batch(
+                        scheduling_batch_id = await current_app.background_task_service.start_channel_removal_scheduling_batch(
                             subscription_type_id=type_id,
                             channels_to_schedule=newly_added_secondary_channels_for_actions
                         )
@@ -891,7 +892,7 @@ async def update_subscription_type(type_id: int):
                     # الخطوة 2: بدء مهمة إرسال الدعوات في الخلفية (سريعة جدًا)
                     try:
                         type_name_for_invite = updated_type_dict.get('name', "your subscription")
-                        invite_batch_id = await current_app.messaging_service.start_invite_batch(
+                        invite_batch_id = await current_app.background_task_service.start_invite_batch(
                             subscription_type_id=type_id,
                             newly_added_channels=newly_added_secondary_channels_for_actions,
                             subscription_type_name=type_name_for_invite
@@ -3790,8 +3791,8 @@ async def get_recent_payments():
 @permission_required("subscription_types.read")
 async def get_batch_details(batch_id: str):
     try:
-        # messaging_service.get_batch_status يعيد الآن MessagingBatchResult
-        details_obj = await current_app.messaging_service.get_batch_status(batch_id)
+        # background_task_service.get_batch_status يعيد الآن MessagingBatchResult
+        details_obj = await current_app.background_task_service.get_batch_status(batch_id)
         if not details_obj:
             return jsonify({"error": "Batch not found"}), 404
 
@@ -3825,7 +3826,7 @@ async def retry_failed_batch_sends(batch_id: str):
     """إعادة محاولة الإرسال للمستخدمين الذين فشلت عمليتهم في مهمة سابقة."""
     try:
         # ✅ استخدام الخدمة مباشرة من سياق التطبيق
-        service = current_app.messaging_service
+        service = current_app.background_task_service
         new_batch_id = await service.retry_failed_sends_in_batch(batch_id)
         return jsonify({"message": "Retry batch started.", "new_batch_id": new_batch_id}), 202
     except ValueError as ve:
@@ -4181,7 +4182,7 @@ async def send_broadcast_message(): # تم تغيير الاسم هنا ليكو
         return jsonify({"error": "subscription_type_id is required for subscription-specific targeting"}), 400
 
     try:
-        service = current_app.messaging_service
+        service = current_app.background_task_service
         # استدعاء الدالة بالاسم الصحيح
         batch_id = await service.start_enhanced_broadcast_batch(
             message_text=message_text,
@@ -4270,4 +4271,122 @@ async def get_messaging_batches():
 
     except Exception as e:
         logging.error(f"Error fetching messaging batches: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@admin_routes.route("/channels/audit/start", methods=["POST"])
+@permission_required("broadcast.read")  # صلاحية جديدة مقترحة
+async def start_new_channel_audit():
+    """
+    يبدأ مهمة فحص جديدة في الخلفية لجميع القنوات.
+    """
+    try:
+        service = current_app.background_task_service
+        audit_uuid = await service.start_channel_audit()
+        return jsonify({
+            "message": "Channel audit process has been started.",
+            "audit_uuid": audit_uuid
+        }), 202
+    except Exception as e:
+        logging.error(f"Failed to start channel audit: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@admin_routes.route("/channels/audit/status/<audit_uuid>", methods=["GET"])
+@permission_required("broadcast.read")
+async def get_channel_audit_status(audit_uuid):
+    """
+    يجلب حالة ونتائج عملية فحص معينة.
+    """
+    try:
+        # التحقق من صحة الـ UUID
+        val_uuid = uuid.UUID(audit_uuid, version=4)
+    except ValueError:
+        return jsonify({"error": "Invalid audit UUID format."}), 400
+
+    async with current_app.db_pool.acquire() as conn:
+        records = await conn.fetch(
+            "SELECT * FROM channel_audits WHERE audit_uuid = $1 ORDER BY channel_name",
+            val_uuid
+        )
+
+    if not records:
+        return jsonify({"error": "Audit not found or not yet started."}), 404
+
+    results = [dict(rec) for rec in records]
+    # معرفة ما إذا كانت أي قناة لا تزال قيد التشغيل
+    is_running = any(res['status'] == 'RUNNING' or res['status'] == 'PENDING' for res in results)
+
+    return jsonify({
+        "audit_uuid": audit_uuid,
+        "is_running": is_running,
+        "results": results
+    })
+
+
+@admin_routes.route("/channels/cleanup/start", methods=["POST"])
+@permission_required("broadcast.read")  # صلاحية جديدة مقترحة
+async def start_channel_cleanup():
+    """
+    يبدأ مهمة إزالة للمستخدمين الذين تم تحديدهم في فحص معين.
+    """
+    data = await request.get_json()
+    audit_uuid = data.get("audit_uuid")
+    channel_id = data.get("channel_id")
+
+    if not audit_uuid or not channel_id:
+        return jsonify({"error": "audit_uuid and channel_id are required"}), 400
+
+    try:
+        service = current_app.background_task_service
+        batch_id = await service.start_channel_cleanup_batch(audit_uuid, channel_id)
+        return jsonify({
+            "message": "Channel cleanup batch started.",
+            "batch_id": batch_id
+        }), 202
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logging.error(f"Failed to start channel cleanup batch: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@admin_routes.route("/channels/audits/history", methods=["GET"])
+@permission_required("broadcast.read") # استخدم نفس الصلاحية أو صلاحية جديدة
+async def get_channel_audits_history():
+    """
+    يجلب قائمة بآخر 5 عمليات فحص شاملة.
+    """
+    try:
+        async with current_app.db_pool.acquire() as conn:
+            # هذا الاستعلام معقد قليلاً ولكنه فعال جداً
+            # يستخدم DISTINCT ON للحصول على أحدث سجل لكل audit_uuid
+            # ثم يقوم بتجميع النتائج
+            query = """
+                SELECT 
+                    audit_uuid,
+                    MAX(created_at) as started_at,
+                    MAX(completed_at) as completed_at,
+                    (SELECT status FROM channel_audits ca2 WHERE ca2.audit_uuid = ca.audit_uuid ORDER BY 
+                        CASE status 
+                            WHEN 'RUNNING' THEN 1 
+                            WHEN 'PENDING' THEN 2
+                            WHEN 'FAILED' THEN 3
+                            ELSE 4
+                        END, completed_at DESC NULLS FIRST 
+                    LIMIT 1) as overall_status,
+                    SUM(total_members_api) as total_members,
+                    SUM(active_subscribers_db) as total_active_subs,
+                    SUM(inactive_in_channel_db) as total_removed_candidates
+                FROM channel_audits ca
+                GROUP BY audit_uuid
+                ORDER BY started_at DESC
+                LIMIT 20;
+            """
+            history_records = await conn.fetch(query)
+
+        return jsonify([dict(rec) for rec in history_records])
+
+    except Exception as e:
+        logging.error(f"Failed to fetch channel audits history: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500

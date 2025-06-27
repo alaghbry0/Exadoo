@@ -24,7 +24,7 @@ from routes.payment_streaming_confirmation import payment_streaming_bp
 from routes.payment_status import payment_status_bp
 from routes.payment_confirmation import payment_confirmation_bp
 from routes.auth_routes import auth_routes
-from services.messaging_service import BackgroundMessagingService
+from services.background_task_service import BackgroundTaskService
 from telegram_bot import start_bot, bot, telegram_bot_bp
 from chatbot.chatbot import chatbot_bp
 from chatbot.knowledge_base import knowledge_base
@@ -142,8 +142,8 @@ async def initialize_app():
         logging.info("🔄 Starting Telegram bot and scheduler...")
         app.bot = bot
         logging.info("🔄 Initializing Background Messaging Service...")
-        app.messaging_service = BackgroundMessagingService(app.db_pool, app.bot)
-        logging.info("✅ Background Messaging Service initialized")
+        app.background_task_service = BackgroundTaskService(app.db_pool, app.bot)
+        logging.info("✅ Background Task Service initialized")
         await start_scheduler(app.bot, app.db_pool)
         if not app.bot_running:
             app.bot_running = True

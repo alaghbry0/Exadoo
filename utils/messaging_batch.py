@@ -16,9 +16,11 @@ class BatchStatus(Enum):
 
 
 class BatchType(Enum):
-    INVITE = "invite"                       # لإرسال دعوات القنوات الجديدة
-    BROADCAST = "broadcast"                 # لإرسال رسالة عامة من لوحة التحكم
+    INVITE = "invite"
+    BROADCAST = "broadcast"
     SCHEDULE_REMOVAL = "schedule_removal"
+    CHANNEL_CLEANUP = "channel_cleanup"
+
 
 # --- كلاسات هياكل البيانات (Data Structures) ---
 
