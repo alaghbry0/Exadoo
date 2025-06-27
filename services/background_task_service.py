@@ -146,6 +146,7 @@ class BackgroundTaskService:
         return audit_uuid
 
     # --- دالة start_channel_cleanup_batch تحتاج تعديلاً طفيفاً ---
+
     async def start_channel_cleanup_batch(self, audit_uuid: str, channel_id: int) -> str:
         """
         يبدأ مهمة خلفية لإزالة المستخدمين الذين تم رصدهم في فحص معين.
@@ -153,16 +154,35 @@ class BackgroundTaskService:
         self.logger.info(f"Preparing cleanup batch for audit {audit_uuid}, channel {channel_id}")
 
         async with self.db_pool.acquire() as conn:
-            audit_record = await conn.fetchrow(
+            # لاحظ أننا نجلب السجل بأكمله الآن، وليس فقط عمود واحد
+            audit_record_row = await conn.fetchrow(
                 "SELECT users_to_remove FROM channel_audits WHERE audit_uuid = $1 AND channel_id = $2 AND status = 'COMPLETED'",
                 uuid.UUID(audit_uuid), channel_id
             )
 
-        if not audit_record or not audit_record.get('users_to_remove') or not audit_record['users_to_remove'].get(
-                'ids'):
+        # --- ▼▼▼▼▼ بداية التعديل ▼▼▼▼▼ ---
+
+        if not audit_record_row or not audit_record_row['users_to_remove']:
             raise ValueError("لم يتم العثور على فحص مكتمل لهذه القناة أو لا يوجد مستخدمين لإزالتهم.")
 
-        user_ids_to_remove = audit_record['users_to_remove']['ids']
+        # استخراج بيانات users_to_remove
+        users_to_remove_data = audit_record_row['users_to_remove']
+
+        # التأكد من أن البيانات هي قاموس (إذا كانت سلسلة نصية، قم بتحليلها)
+        if isinstance(users_to_remove_data, str):
+            try:
+                users_to_remove_data = json.loads(users_to_remove_data)
+            except json.JSONDecodeError:
+                raise ValueError("بيانات المستخدمين للإزالة تالفة (ليست بصيغة JSON صالحة).")
+
+        # الآن users_to_remove_data هو بالتأكيد قاموس
+        # يمكننا استخدام .get() بأمان
+        if not isinstance(users_to_remove_data, dict) or not users_to_remove_data.get('ids'):
+            raise ValueError("قائمة معرفات المستخدمين للإزالة مفقودة أو فارغة.")
+
+        user_ids_to_remove = users_to_remove_data['ids']
+
+        # --- ▲▲▲▲▲ نهاية التعديل ▲▲▲▲▲ ---
 
         if not user_ids_to_remove:
             raise ValueError("قائمة المستخدمين للإزالة فارغة.")
@@ -188,7 +208,6 @@ class BackgroundTaskService:
             users=target_users,
             context_data=context_data
         )
-
     async def retry_failed_sends_in_batch(self, original_batch_id: str) -> str:
         """إعادة محاولة الإرسال للفاشلين في مهمة."""
         self.logger.info(f"Attempting to retry failed sends for batch {original_batch_id}")

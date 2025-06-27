@@ -119,10 +119,10 @@ class TaskProcessor:
                     telegram_id=telegram_id or 0,
                     error_message=translated_message,
                     is_retryable=is_retryable,
-                    full_name=user_data.get('full_name'),
-                    username=user_data.get('username'),
-                    error_type=type(e).__name__,
-                    error_key=error_key
+                    full_name=item_data.get('full_name'),
+                    username = item_data.get('username'),
+                    error_type = type(e).__name__,
+                    error_key = error_key
                 ))
                 self.logger.warning(f"Batch {batch_id}: Failed to process item for user {telegram_id}. Error: {e}")
 
@@ -146,8 +146,15 @@ class TaskProcessor:
         error_summary = dict(Counter(err.error_key for err in send_errors if err.error_key))
         await self._update_final_batch_status(batch_id, total_successful, total_failed, send_errors, error_summary)
 
+        successful_items = [item for item in users if
+                            item.get('telegram_id') not in {err.telegram_id for err in send_errors}]
+        failed_items = [err for err in send_errors]
+
+        await handler.on_batch_complete(batch_id, full_context, successful_items, failed_items)
+
         self.logger.info(
-            f"Batch {batch_id} completed. Total Success: {total_successful}, Total Failed: {total_failed}.")
+            f"Batch {batch_id} completed. Total Success: {total_successful}, Total Failed: {total_failed}."
+        )
 
     async def _update_batch_progress(self, batch_id: str, successful_count: int, failed_count: int):
         """تحديث دوري لعدادات التقدم في مهمة معينة."""

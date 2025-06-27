@@ -173,78 +173,108 @@ async def remove_user_from_channel(bot: Bot, connection, telegram_id: int, chann
         return False
 
 
-# ✅ تعديل: إضافة `bot: Bot` كأول معامل
+# utils/db_utils.py
+
+import logging
+from aiogram import Bot
+from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramForbiddenError,
+    TelegramBadRequest,
+    TelegramNotFound,
+)
+
+
 async def remove_users_from_channel(bot: Bot, telegram_id: int, channel_id: int) -> bool:
     """
     Removes a user from a channel and sends them a notification.
+    It safely skips owners and administrators.
     """
+    logger = logging.getLogger(__name__)  # استخدام المسجل (Logger)
+
     message_text_template = (
         "🔔 تنبيه مهم\n\n"
         "تم الغاء اشتراكك وازالتك من {channel_display_name}\n"
         "لتتمكن من الانضمام مجددًا، يرجى تجديد اشتراكك."
     )
 
-    # الخطوة 1: قم بإنشاء الرسالة بقيمة افتراضية أولاً
-    # هذا يضمن أن المتغير موجود دائماً
-    channel_display_name = f"القناة (ID: {channel_id})"
-    final_message_text = message_text_template.format(channel_display_name=channel_display_name)
-
     try:
-        # الخطوة 2: حاول تحسين الرسالة باسم القناة الفعلي
+        # --- ✅ الخطوة 1: التحقق من رتبة المستخدم أولاً ---
+        try:
+            member = await bot.get_chat_member(chat_id=channel_id, user_id=telegram_id)
+
+            if member.status in [ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR]:
+                logger.warning(
+                    f"Skipping removal of user {telegram_id} from channel {channel_id} because they are an {member.status.value}."
+                )
+                return True  # نعتبر هذه العملية ناجحة لأننا تعاملنا معها بشكل صحيح
+        except TelegramBadRequest as e:
+            # حالة خاصة: إذا كان المستخدم غير موجود أصلاً في القناة
+            if "user not found" in str(e).lower() or "participant_id_invalid" in str(e).lower():
+                logger.warning(f"User {telegram_id} not found in channel {channel_id} to begin with. Skipping removal.")
+                return True  # نعتبره نجاحاً لأنه ليس هناك ما نفعله
+            else:
+                raise e  # نرفع الأخطاء الأخرى من نوع BadRequest
+
+        # --- الخطوة 2: إذا كان المستخدم عضواً عادياً، قم بالإزالة ---
+
+        # تحسين الرسالة باسم القناة الفعلي
+        channel_display_name = f"القناة (ID: {channel_id})"
         try:
             channel_info = await bot.get_chat(channel_id)
             title = getattr(channel_info, "title", None)
             if title:
                 channel_display_name = f'"{title}"'
-                # قم بتحديث الرسالة النهائية إذا نجحت في الحصول على العنوان
-                final_message_text = message_text_template.format(channel_display_name=channel_display_name)
-        except TelegramNotFound:
-            logging.warning(f"Channel {channel_id} not found when fetching title. Using default name for notification.")
         except Exception as e_title:
-            logging.warning(f"Could not get channel info for {channel_id} to get title: {e_title}")
+            logger.warning(f"Could not get channel info for {channel_id} to get title: {e_title}")
 
-        # الآن يمكنك المتابعة وأنت متأكد أن 'final_message_text' له قيمة
-        logging.info(f"Attempting to ban user {telegram_id} from channel {channel_id}")
+        final_message_text = message_text_template.format(channel_display_name=channel_display_name)
+
+        # عملية الطرد المؤقت
+        logger.info(f"Attempting to ban user {telegram_id} from channel {channel_id}")
         await bot.ban_chat_member(
             chat_id=channel_id,
             user_id=telegram_id,
             revoke_messages=False,
         )
-        logging.info(f"User {telegram_id} banned from channel {channel_id}.")
+        logger.info(f"User {telegram_id} banned from channel {channel_id}.")
 
-        logging.info(f"Attempting to unban user {telegram_id} to allow rejoining")
+        logger.info(f"Attempting to unban user {telegram_id} to allow rejoining")
         await bot.unban_chat_member(
             chat_id=channel_id,
             user_id=telegram_id,
             only_if_banned=True,
         )
-        logging.info(f"User {telegram_id} unbanned (if was banned).")
+        logger.info(f"User {telegram_id} unbanned (if was banned).")
 
-        logging.info(f"Sending notification to user {telegram_id}")
+        # إرسال الإشعار
+        logger.info(f"Sending notification to user {telegram_id}")
         await bot.send_message(chat_id=telegram_id, text=final_message_text)
-        logging.info(f"Notification sent to user {telegram_id}.")
+        logger.info(f"Notification sent to user {telegram_id}.")
+
         return True
 
-    # الآن، حتى لو حدث خطأ، المتغير `final_message_text` موجود بالفعل
-    except TelegramNotFound as e:
-        logging.warning(f"Resource (user {telegram_id} or channel {channel_id}) not found: {e}.")
-        try:
-            # هذا الاستدعاء آمن الآن
-            await bot.send_message(chat_id=telegram_id, text=final_message_text)
-            logging.info(f"Notification sent to user {telegram_id} despite earlier resource not found issue.")
-        except Exception as notify_err:
-            logging.error(f"Failed to send notification to {telegram_id} after resource not found error: {notify_err}")
-        return True
-    except TelegramForbiddenError as e:
-        logging.warning(f"Forbidden error for user {telegram_id}, channel {channel_id}: {e}")
-        return True
+    except TelegramBadRequest as e:
+        # معالجة خاصة للأخطاء التي قد تحدث رغم التحقق (حالات نادرة)
+        if "can't remove chat owner" in str(e).lower() or "user is an administrator of the chat" in str(e).lower():
+            logger.warning(f"Attempted to remove an admin/owner {telegram_id} despite check: {e}")
+            return True  # نعتبره نجاحاً لتجنب تسجيل خطأ غير ضروري
+        else:
+            logger.error(f"Telegram bad request for {telegram_id} in {channel_id}: {e}", exc_info=True)
+            return False
+
+    except TelegramForbiddenError:
+        # إذا كان البوت محظوراً من قبل المستخدم، لا يمكننا إرسال رسالة لكن الإزالة قد تكون نجحت
+        logger.warning(f"User {telegram_id} has blocked the bot. Cannot send removal notification.")
+        return True  # نعتبر الإزالة ناجحة
+
     except TelegramAPIError as e:
-        logging.error(f"Telegram API error for user {telegram_id}, channel {channel_id}: {e}", exc_info=True)
+        logger.error(f"Telegram API error for user {telegram_id}, channel {channel_id}: {e}", exc_info=True)
         return False
     except Exception as e:
-        logging.error(f"Unexpected error for user {telegram_id}, channel {channel_id}: {e}", exc_info=True)
+        logger.error(f"Unexpected error for user {telegram_id}, channel {channel_id}: {e}", exc_info=True)
         return False
-
 
 
 # ----------------- 🔹 إغلاق جلسة بوت تيليجرام -----------------

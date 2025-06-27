@@ -29,3 +29,11 @@ class BaseTaskHandler(ABC):
         يجب أن تثير استثناء (raise exception) في حالة الفشل.
         """
         pass
+
+    async def on_batch_complete(self, batch_id: str, context_data: Dict[str, Any], successful_items: list,
+                                failed_items: list) -> None:
+        """
+        دالة اختيارية يتم استدعاؤها بعد اكتمال معالجة الدفعة بأكملها.
+        يمكن استخدامها لتنفيذ إجراءات التنظيف أو التحديث النهائية.
+        """
+        pass

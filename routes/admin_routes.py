@@ -4406,3 +4406,51 @@ async def get_channel_audits_history():
     except Exception as e:
         logging.error(f"Failed to fetch channel audits history: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
+
+# في نفس ملف admin_routes.py
+
+@admin_routes.route("/channels/audit/removable_users/<audit_uuid>/<channel_id>", methods=["GET"])
+@permission_required("broadcast.read")
+async def get_removable_users_for_audit(audit_uuid, channel_id):
+    """
+    يجلب تفاصيل المستخدمين المرشحين للإزالة من فحص معين.
+    """
+    try:
+        val_uuid = uuid.UUID(audit_uuid, version=4)
+        val_channel_id = int(channel_id)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid UUID or channel ID format."}), 400
+
+    async with current_app.db_pool.acquire() as conn:
+        # استخراج قائمة المعرفات من سجل الفحص
+        users_data_raw = await conn.fetchval(
+            "SELECT users_to_remove FROM channel_audits WHERE audit_uuid = $1 AND channel_id = $2",
+            val_uuid, val_channel_id
+        )
+
+    if not users_data_raw:
+        return jsonify([])  # إرجاع قائمة فارغة إذا لم يتم العثور على شيء
+
+    try:
+        # التأكد من تحليل الـ JSON بشكل صحيح
+        if isinstance(users_data_raw, str):
+            users_data = json.loads(users_data_raw)
+        else:
+            users_data = users_data_raw
+
+        user_ids = users_data.get('ids', [])
+        if not user_ids:
+            return jsonify([])
+
+    except (json.JSONDecodeError, AttributeError):
+        return jsonify({"error": "Corrupted removable user data."}), 500
+
+    # جلب تفاصيل المستخدمين من جدول users
+    async with current_app.db_pool.acquire() as conn:
+        user_records = await conn.fetch(
+            "SELECT telegram_id, full_name, username FROM users WHERE telegram_id = ANY($1::bigint[])",
+            user_ids
+        )
+
+    return jsonify([dict(rec) for rec in user_records])
