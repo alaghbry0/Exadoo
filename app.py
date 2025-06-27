@@ -33,7 +33,7 @@ from chatbot.embedding_service import ImprovedEmbeddingService
 from chatbot.admin_panel import admin_chatbot_bp
 from utils.scheduler import start_scheduler
 from utils.db_utils import close_telegram_bot_session
-
+from utils.startup_tasks import mark_stale_tasks_as_failed
 from pytoniq import LiteBalancer
 
 # تأكد من المتغيرات البيئية الأساسية
@@ -107,6 +107,8 @@ async def initialize_app():
         logging.info("🔄 Initializing aiohttp session...")
         app.aiohttp_session = aiohttp.ClientSession()
         logging.info("✅ aiohttp session initialized")
+
+        await mark_stale_tasks_as_failed(app.db_pool)
 
         logging.info("🔄 Initializing TON LiteBalancer...")
         config_url = 'https://ton.org/global-config.json'

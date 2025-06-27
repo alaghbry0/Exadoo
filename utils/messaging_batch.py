@@ -20,6 +20,7 @@ class BatchType(Enum):
     BROADCAST = "broadcast"
     SCHEDULE_REMOVAL = "schedule_removal"
     CHANNEL_CLEANUP = "channel_cleanup"
+    CHANNEL_AUDIT = "channel_audit"
 
 
 # --- كلاسات هياكل البيانات (Data Structures) ---

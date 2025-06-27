@@ -108,152 +108,78 @@ class BackgroundTaskService:
 
     async def start_channel_audit(self) -> str:
         """
-        يبدأ مهمة فحص شاملة لجميع القنوات المدارة.
+        يبدأ مهمة فحص شاملة لجميع القنوات المدارة باستخدام نظام المهام.
         """
+        self.logger.info("Starting a new channel audit task.")
+
+        async with self.db_pool.acquire() as conn:
+            # جلب كل القنوات التي يديرها البوت
+            managed_channels_records = await conn.fetch(
+                "SELECT DISTINCT channel_id, channel_name FROM subscription_type_channels"
+            )
+
+        if not managed_channels_records:
+            raise ValueError("No managed channels found to audit.")
+
+        # قائمة القنوات التي سيتم معالجتها، عنصر واحد لكل قناة
+        channels_to_audit = [dict(rec) for rec in managed_channels_records]
+
+        # إنشاء UUID فريد لهذه العملية الشاملة
         audit_uuid = str(uuid.uuid4())
-        self.logger.info(f"Scheduling a new channel audit with UUID: {audit_uuid}")
 
-        # لا ننشئ سجل في messaging_batches، بل سنعتمد على جدولنا الجديد channel_audits
-        # ونطلق المهمة في الخلفية مباشرة
-        asyncio.create_task(self._perform_channel_audit(audit_uuid))
+        # بيانات السياق التي سيتم تمريرها إلى المعالج
+        context_data = {"audit_uuid": audit_uuid}
 
+        # هنا نستخدم دالة _start_task العامة.
+        # لاحظ أننا نمرر `channels_to_audit` إلى معامل `users`،
+        # لأن `_start_task` مصمم لهذا الغرض (قائمة من العناصر للمعالجة)
+        batch_id = await self._start_task(
+            batch_type=BatchType.CHANNEL_AUDIT,
+            users=channels_to_audit,  # نمرر القنوات هنا
+            context_data=context_data,
+            # لا نحتاج لـ message_content أو target_group
+        )
+
+        # يمكن أن نرجع batch_id أو audit_uuid. بما أن audit_uuid يجمع كل القنوات، فهو أفضل.
+        # سنحتاج إلى ربط batch_id بـ audit_uuid في مكان ما أو تعديل الواجهة.
+        # الحل الأبسط: يمكن لواجهة برمجة التطبيقات البحث عن طريق audit_uuid مباشرة في جدول channel_audits.
         return audit_uuid
 
-    async def _perform_channel_audit(self, audit_uuid: str):
-        """
-        المنطق الفعلي لمهمة الفحص. تعمل هذه الدالة في الخلفية.
-        """
-        self.logger.info(f"[{audit_uuid}] Starting audit process...")
-        try:
-            async with self.db_pool.acquire() as conn:
-                # 1. جلب كل القنوات التي يديرها البوت
-                managed_channels = await conn.fetch(
-                    "SELECT DISTINCT channel_id, channel_name FROM subscription_type_channels")
-                if not managed_channels:
-                    self.logger.warning(f"[{audit_uuid}] No managed channels found to audit.")
-                    return
-
-                # 2. جلب كل المستخدمين المسجلين في قاعدة بياناتنا
-                all_db_users_records = await conn.fetch("SELECT telegram_id FROM users")
-                all_db_user_ids = {rec['telegram_id'] for rec in all_db_users_records}
-
-                for channel in managed_channels:
-                    channel_id = channel['channel_id']
-                    channel_name = channel['channel_name']
-                    self.logger.info(f"[{audit_uuid}] Auditing channel: {channel_name} ({channel_id})")
-
-                    # إنشاء سجل أولي للفحص لهذه القناة
-                    await conn.execute(
-                        """
-                        INSERT INTO channel_audits (audit_uuid, channel_id, channel_name, status)
-                        VALUES ($1, $2, $3, 'RUNNING')
-                        """,
-                        uuid.UUID(audit_uuid), channel_id, channel_name
-                    )
-
-                    # 3. جلب عدد الأعضاء الفعلي من تيليجرام
-                    try:
-                        total_members_api = await self.bot.get_chat_member_count(channel_id)
-                        # --- تعديل: تحديث مبكر لعدد الأعضاء ---
-                        await conn.execute(
-                            "UPDATE channel_audits SET total_members_api = $1 WHERE audit_uuid = $2 AND channel_id = $3",
-                            total_members_api, uuid.UUID(audit_uuid), channel_id
-                        )
-                    except Exception as e:
-                        self.logger.error(f"[{audit_uuid}] Failed to get member count for {channel_id}: {e}")
-                        # تحديث حالة الفحص للفشل والمتابعة للقناة التالية
-                        await conn.execute(
-                            "UPDATE channel_audits SET status = 'FAILED' WHERE audit_uuid = $1 AND channel_id = $2",
-                            uuid.UUID(audit_uuid), channel_id)
-                        continue
-
-                    # 4. جلب المشتركين النشطين لهذه القناة من قاعدة البيانات
-                    active_subs_records = await conn.fetch(
-                        "SELECT telegram_id FROM subscriptions WHERE channel_id = $1 AND is_active = TRUE AND expiry_date > NOW()",
-                        channel_id
-                    )
-                    active_subscriber_ids = {rec['telegram_id'] for rec in active_subs_records}
-                    # --- تعديل: تحديث مبكر لعدد المشتركين النشطين ---
-                    await conn.execute(
-                        "UPDATE channel_audits SET active_subscribers_db = $1 WHERE audit_uuid = $2 AND channel_id = $3",
-                        len(active_subscriber_ids), uuid.UUID(audit_uuid), channel_id
-                    )
-
-                    # 5. البحث عن المتسللين (Freeloaders) - هذه هي العملية الطويلة
-                    inactive_users_in_channel_ids = []
-                    users_to_check = all_db_user_ids - active_subscriber_ids
-
-                    for user_id in users_to_check:
-                        try:
-                            member = await self.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
-                            if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
-                                                 ChatMemberStatus.CREATOR]:
-                                inactive_users_in_channel_ids.append(user_id)
-                                self.logger.debug(
-                                    f"[{audit_uuid}] Found inactive user {user_id} in channel {channel_id}")
-                            await asyncio.sleep(0.1)
-                        except TelegramBadRequest as e:
-                            if "user not found" in str(e).lower() or "participant_id_invalid" in str(e).lower():
-                                pass
-                            else:
-                                self.logger.warning(
-                                    f"[{audit_uuid}] Telegram API bad request for user {user_id} in {channel_id}: {e}")
-                        except Exception as e:
-                            self.logger.error(
-                                f"[{audit_uuid}] Unexpected error checking member {user_id} in {channel_id}: {e}")
-
-                    # 6. حساب الإحصائيات النهائية
-                    # لاحظ أننا لم نعد بحاجة لجلب total_members_api أو active_count مرة أخرى هنا
-                    active_count = len(active_subscriber_ids)
-                    inactive_found_count = len(inactive_users_in_channel_ids)
-                    # total_members_api تم جلبها مسبقاً
-                    unidentified_count = total_members_api - active_count - inactive_found_count
-
-                    # 7. تحديث سجل الفحص بالنتائج النهائية (بدون تكرار البيانات المحدثة مسبقًا)
-                    # --- تعديل: التحديث النهائي للبيانات المتبقية فقط ---
-                    await conn.execute(
-                        """
-                        UPDATE channel_audits
-                        SET status = 'COMPLETED',
-                            inactive_in_channel_db = $1,
-                            unidentified_members = $2,
-                            users_to_remove = $3,
-                            completed_at = NOW()
-                        WHERE audit_uuid = $4 AND channel_id = $5
-                        """,
-                        inactive_found_count,
-                        max(0, unidentified_count),  # تجنب الأرقام السالبة
-                        json.dumps({"ids": inactive_users_in_channel_ids}),
-                        uuid.UUID(audit_uuid),
-                        channel_id
-                    )
-                    self.logger.info(f"[{audit_uuid}] Finished auditing channel: {channel_name}. Results saved.")
-
-        except Exception as e:
-            self.logger.error(f"[{audit_uuid}] A critical error occurred during the audit process: {e}", exc_info=True)
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE channel_audits SET status = 'FAILED' WHERE audit_uuid = $1 AND status = 'RUNNING'",
-                    uuid.UUID(audit_uuid))
-
+    # --- دالة start_channel_cleanup_batch تحتاج تعديلاً طفيفاً ---
     async def start_channel_cleanup_batch(self, audit_uuid: str, channel_id: int) -> str:
         """
         يبدأ مهمة خلفية لإزالة المستخدمين الذين تم رصدهم في فحص معين.
         """
-        self.logger.info(f"Starting cleanup batch for audit {audit_uuid}, channel {channel_id}")
+        self.logger.info(f"Preparing cleanup batch for audit {audit_uuid}, channel {channel_id}")
+
         async with self.db_pool.acquire() as conn:
             audit_record = await conn.fetchrow(
                 "SELECT users_to_remove FROM channel_audits WHERE audit_uuid = $1 AND channel_id = $2 AND status = 'COMPLETED'",
                 uuid.UUID(audit_uuid), channel_id
             )
 
-        if not audit_record or not audit_record['users_to_remove'] or not audit_record['users_to_remove'].get('ids'):
+        if not audit_record or not audit_record.get('users_to_remove') or not audit_record['users_to_remove'].get(
+                'ids'):
             raise ValueError("لم يتم العثور على فحص مكتمل لهذه القناة أو لا يوجد مستخدمين لإزالتهم.")
 
         user_ids_to_remove = audit_record['users_to_remove']['ids']
 
-        # تحويل قائمة الـ IDs إلى قائمة قواميس كما يتوقعها معالج المهام
-        target_users = [{"telegram_id": user_id} for user_id in user_ids_to_remove]
+        if not user_ids_to_remove:
+            raise ValueError("قائمة المستخدمين للإزالة فارغة.")
+
+        # جلب تفاصيل المستخدمين (اختياري ولكنه مفيد للتسجيل)
+        async with self.db_pool.acquire() as conn:
+            users_records = await conn.fetch(
+                "SELECT telegram_id, full_name, username FROM users WHERE telegram_id = ANY($1::bigint[])",
+                user_ids_to_remove
+            )
+
+        target_users = [dict(rec) for rec in users_records]
+        # إضافة أي مستخدم لم يتم العثور عليه في جدول users (حالة نادرة ولكن ممكنة)
+        found_ids = {u['telegram_id'] for u in target_users}
+        for user_id in user_ids_to_remove:
+            if user_id not in found_ids:
+                target_users.append({"telegram_id": user_id})
 
         context_data = {"channel_id": channel_id, "audit_uuid": audit_uuid}
 

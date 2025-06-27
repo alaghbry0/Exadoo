@@ -18,6 +18,7 @@ from services.background_tasks.broadcast_handler import BroadcastTaskHandler
 from services.background_tasks.invite_handler import InviteTaskHandler
 from services.background_tasks.removal_scheduler_handler import RemovalSchedulerTaskHandler
 from services.background_tasks.channel_cleanup_handler import ChannelCleanupHandler
+from services.background_tasks.channel_audit_handler import ChannelAuditHandler
 
 
 class TaskProcessor:
@@ -37,6 +38,8 @@ class TaskProcessor:
             BatchType.BROADCAST: BroadcastTaskHandler(db_pool, telegram_bot),
             BatchType.INVITE: InviteTaskHandler(db_pool, telegram_bot),
             BatchType.SCHEDULE_REMOVAL: RemovalSchedulerTaskHandler(db_pool, telegram_bot),
+            # --- الإضافات الجديدة ---
+            BatchType.CHANNEL_AUDIT: ChannelAuditHandler(db_pool, telegram_bot),
             BatchType.CHANNEL_CLEANUP: ChannelCleanupHandler(db_pool, telegram_bot),
         }
 
@@ -77,16 +80,26 @@ class TaskProcessor:
         current_batch_successful = 0
         current_batch_failed = 0
 
-        for idx, user_data in enumerate(users):
-            telegram_id = user_data.get('telegram_id')
+        for idx, item_data in enumerate(users):  # اسم المتغير تم تغييره للوضوح
+
+            # يمكننا الاحتفاظ بهذا للوضوح، ولكنه ليس ضرورياً إذا كان الشرط صحيحاً
+            telegram_id = item_data.get('telegram_id')
 
             try:
-                if not telegram_id and batch_type != BatchType.SCHEDULE_REMOVAL:
-                    # جدولة الإزالة قد لا تحتاج لإرسال رسالة لكن تحتاج ID
-                    if not telegram_id:
-                        raise ValueError("missing telegram_id")
+                # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+                #               التعديل هنا
+                # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+                # الأنواع التي لا تتطلب telegram_id لكل عنصر
+                types_without_user_id = [
+                    BatchType.SCHEDULE_REMOVAL,
+                    BatchType.CHANNEL_AUDIT
+                ]
 
-                await handler.process_item(user_data, full_context, prepared_data)
+                if not telegram_id and batch_type not in types_without_user_id:
+                    raise ValueError("missing telegram_id for a user-based task")
+                # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+                await handler.process_item(item_data, full_context, prepared_data)
 
                 # المهام التي لا ترسل رسائل (مثل الجدولة) لا تحتاج لعدادات الدفعات
                 if batch_type in [BatchType.BROADCAST, BatchType.INVITE]:

@@ -4275,36 +4275,40 @@ async def get_messaging_batches():
 
 
 @admin_routes.route("/channels/audit/start", methods=["POST"])
-@permission_required("broadcast.read")  # صلاحية جديدة مقترحة
+@permission_required("broadcast.read")  # أو صلاحية جديدة مثل "channel.audit"
 async def start_new_channel_audit():
     """
-    يبدأ مهمة فحص جديدة في الخلفية لجميع القنوات.
+    يبدأ مهمة فحص شاملة في الخلفية لجميع القنوات.
     """
     try:
         service = current_app.background_task_service
+        # هذه الدالة الآن تستخدم نظام المهام الموحد
         audit_uuid = await service.start_channel_audit()
         return jsonify({
-            "message": "Channel audit process has been started.",
+            "message": "Channel audit task has been started. You can monitor its progress using the status endpoint.",
             "audit_uuid": audit_uuid
         }), 202
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         logging.error(f"Failed to start channel audit: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
+# 2. نقطة جلب حالة الفحص (مع الإحصائيات التي طلبتها)
 @admin_routes.route("/channels/audit/status/<audit_uuid>", methods=["GET"])
 @permission_required("broadcast.read")
 async def get_channel_audit_status(audit_uuid):
     """
-    يجلب حالة ونتائج عملية فحص معينة.
+    يجلب حالة ونتائج عملية فحص معينة، مع إحصائيات مفصلة لكل قناة.
     """
     try:
-        # التحقق من صحة الـ UUID
         val_uuid = uuid.UUID(audit_uuid, version=4)
     except ValueError:
         return jsonify({"error": "Invalid audit UUID format."}), 400
 
     async with current_app.db_pool.acquire() as conn:
+        # هذا الاستعلام يجلب كل النتائج التي تريدها مباشرة!
         records = await conn.fetch(
             "SELECT * FROM channel_audits WHERE audit_uuid = $1 ORDER BY channel_name",
             val_uuid
@@ -4314,34 +4318,46 @@ async def get_channel_audit_status(audit_uuid):
         return jsonify({"error": "Audit not found or not yet started."}), 404
 
     results = [dict(rec) for rec in records]
-    # معرفة ما إذا كانت أي قناة لا تزال قيد التشغيل
+
+    # تحديد ما إذا كانت أي قناة لا تزال قيد التشغيل
     is_running = any(res['status'] == 'RUNNING' or res['status'] == 'PENDING' for res in results)
+
+    # حساب الإحصائيات الإجمالية
+    total_stats = {
+        "total_members": sum(r.get('total_members_api', 0) or 0 for r in results),
+        "total_active_subs": sum(r.get('active_subscribers_db', 0) or 0 for r in results),
+        "total_removable_users": sum(r.get('inactive_in_channel_db', 0) or 0 for r in results),
+        "total_unidentified": sum(r.get('unidentified_members', 0) or 0 for r in results)
+    }
 
     return jsonify({
         "audit_uuid": audit_uuid,
         "is_running": is_running,
-        "results": results
+        "overall_stats": total_stats,
+        "channel_results": results  # النتائج التفصيلية لكل قناة
     })
 
 
+# 3. نقطة بداية الإزالة
 @admin_routes.route("/channels/cleanup/start", methods=["POST"])
-@permission_required("broadcast.read")  # صلاحية جديدة مقترحة
+@permission_required("broadcast.read")  # أو صلاحية أعلى مثل "channel.cleanup"
 async def start_channel_cleanup():
     """
-    يبدأ مهمة إزالة للمستخدمين الذين تم تحديدهم في فحص معين.
+    يبدأ مهمة إزالة للمستخدمين الذين تم تحديدهم في فحص معين لقناة معينة.
     """
     data = await request.get_json()
     audit_uuid = data.get("audit_uuid")
-    channel_id = data.get("channel_id")
+    channel_id_str = data.get("channel_id")
 
-    if not audit_uuid or not channel_id:
+    if not audit_uuid or not channel_id_str:
         return jsonify({"error": "audit_uuid and channel_id are required"}), 400
 
     try:
+        channel_id = int(channel_id_str)
         service = current_app.background_task_service
         batch_id = await service.start_channel_cleanup_batch(audit_uuid, channel_id)
         return jsonify({
-            "message": "Channel cleanup batch started.",
+            "message": "Channel cleanup batch started. You can monitor it using the standard batch status endpoint.",
             "batch_id": batch_id
         }), 202
     except ValueError as e:
