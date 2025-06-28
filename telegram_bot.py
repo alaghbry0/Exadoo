@@ -511,56 +511,6 @@ async def handle_join_request(join_request: ChatJoinRequest):
             logging.error(f"❌ فشل رفض طلب الانضمام بعد حدوث خطأ عام: {decline_error_general}")
 
 
-# 🔹 وظيفة إدارة المستخدم (إضافة أو تحديث)
-async def manage_user(connection, telegram_id, username=None, full_name=None):
-    """
-    إضافة مستخدم جديد أو تحديث بيانات مستخدم موجود
-    """
-    try:
-        # البحث عن المستخدم الحالي
-        async with current_app.db_pool.acquire() as connection:
-            # البحث عن المستخدم الحالي
-            existing_user = await connection.fetchrow(
-                "SELECT id, username, full_name FROM users WHERE telegram_id = $1",
-                telegram_id
-            )
-
-        if existing_user:
-            # تحديث البيانات إذا كانت مختلفة
-            update_needed = False
-            current_username = existing_user['username']
-            current_full_name = existing_user['full_name']
-
-            if username and username != current_username:
-                update_needed = True
-            if full_name and full_name != current_full_name:
-                update_needed = True
-
-            if update_needed:
-                await connection.execute("""
-                    UPDATE users 
-                    SET username = COALESCE($2, username),
-                        full_name = COALESCE($3, full_name)
-                    WHERE telegram_id = $1
-                """, telegram_id, username, full_name)
-                logging.info(f"✅ تم تحديث بيانات المستخدم {telegram_id}")
-
-            return existing_user['id']
-        else:
-            # إضافة مستخدم جديد
-            user_id = await connection.fetchval("""
-                INSERT INTO users (telegram_id, username, full_name)
-                VALUES ($1, $2, $3)
-                RETURNING id
-            """, telegram_id, username, full_name)
-            logging.info(f"✅ تم إضافة مستخدم جديد {telegram_id} بـ ID: {user_id}")
-            return user_id
-
-    except Exception as e:
-        logging.error(f"❌ خطأ في إدارة المستخدم {telegram_id}: {e}")
-        return None
-
-
 # ==============================================================================
 # 🌟 الدالة الوسيطة الجديدة لمعالجة دفع النجوم 🌟
 # ==============================================================================

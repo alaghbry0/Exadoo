@@ -366,31 +366,16 @@ async def confirm_payment():
             return jsonify({"error": "Invalid telegramId", "details": "telegramId must be an integer."}), 400
 
         # إنشاء payment_token فريد (أرقام وحروف فقط)
-        payment_token = str(uuid4()).replace('-', '')  # <--- التعديل الأول هنا
+        payment_token = str(uuid4()).replace('-', '')
 
         amount = 0.0
         async with current_app.db_pool.acquire() as conn:
-            try:
-                user_op_successful = await add_user(
-                    connection=conn,
-                    telegram_id=telegram_id,
-                    username=telegram_username,
-                    full_name=full_name
 
-                )
-                if user_op_successful:
-                    logging.info(f"👤 المستخدم {telegram_id} تم إضافته/تحديثه بنجاح في جدول users.")
-                else:
-                    # دالة add_user أعادت False, مما يعني خطأ داخلي تم تسجيله هناك
-                    logging.warning(f"⚠️ فشلت عملية إضافة/تحديث المستخدم {telegram_id} (يرجى مراجعة سجلات add_user).")
-            except Exception as e_user_update:
-                logging.error(f"❌ خطأ حرج أثناء محاولة إضافة/تحديث المستخدم {telegram_id}: {str(e_user_update)}",
-                              exc_info=True)
+            # --- تم حذف كتلة كود تحديث/إضافة المستخدم من هنا ---
 
             try:
                 query = "SELECT price FROM subscription_plans WHERE id = $1"
-                record_price = await conn.fetchrow(query,
-                                                   subscription_plan_id)  # تم تغيير اسم المتغير لتجنب التضارب مع record_payment
+                record_price = await conn.fetchrow(query, subscription_plan_id)
                 if record_price and record_price.get("price") is not None:
                     amount = float(record_price["price"])
                     logging.info(f"✅ تم جلب السعر من جدول subscription_plans: {amount}")
@@ -412,14 +397,13 @@ async def confirm_payment():
                         conn=conn,
                         telegram_id=telegram_id,
                         subscription_plan_id=subscription_plan_id,
-                        amount=Decimal(amount),  # <-- تمرير المبلغ المحسوب كـ Decimal
+                        amount=Decimal(amount),
                         payment_token=payment_token,
                         username=telegram_username,
                         full_name=full_name,
                         user_wallet_address=user_wallet_address
                     )
-                    # إذا نجح الاستدعاء دون خطأ، اخرج من الحلقة
-                    break
+                    break  # إذا نجح الاستدعاء دون خطأ، اخرج من الحلقة
 
                 except UniqueViolationError:
                     logging.warning(f"⚠️ تكرار payment_token، المحاولة {attempt + 1}/{max_attempts})...")
@@ -431,13 +415,11 @@ async def confirm_payment():
                     logging.info(f"🔄 تم إنشاء payment_token جديد: {payment_token}")
 
             if result is None:
-                # هذه الحالة تحدث فقط إذا فشلت كل المحاولات
                 logging.error("❌ فشل تسجيل الدفعة المعلقة.")
                 return jsonify({"error": "Failed to record pending payment after all retries."}), 500
 
             logging.info(f"✅ تم تسجيل الدفعة المعلقة بنجاح. payment_token={result['payment_token']}")
 
-            # عرض السعر بنفس الطريقة
             formatted_amount = f"{amount:.2f}"
             return jsonify({
                 "success": True,
@@ -448,7 +430,6 @@ async def confirm_payment():
     except Exception as e:
         logging.error(f"❌ خطأ في /api/confirm_payment: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
 
 # تغيير قيمة timestamp إلى float لتفادي تحذيرات النوع
 _wallet_cache = {

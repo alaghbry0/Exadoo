@@ -9,6 +9,47 @@ user_bp = Blueprint("users", __name__)
 DEFAULT_PROFILE_PHOTO = "/static/default_profile.png"
 
 
+# 💡=============== إضافة جديدة: نقطة API لمزامنة بيانات المستخدم ===============💡
+@user_bp.route("/api/user/sync", methods=["POST"])
+async def sync_user_profile():
+    """
+    نقطة API لإضافة مستخدم جديد أو تحديث بياناته الحالية (UPSERT).
+    تُستدعى هذه النقطة في كل مرة يفتح فيها المستخدم التطبيق المصغر.
+    """
+    try:
+        data = await request.get_json()
+        telegram_id = data.get("telegramId")
+        username = data.get("telegramUsername")
+        full_name = data.get("fullName")
+
+        # التحقق من وجود البيانات الأساسية
+        if not telegram_id:
+            return jsonify({"error": "telegramId is required"}), 400
+
+        query = """
+            INSERT INTO users (telegram_id, username, full_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id) DO UPDATE 
+            SET
+                username = EXCLUDED.username,
+                full_name = EXCLUDED.full_name;
+        """
+        # ملاحظة: EXCLUDED.username تشير إلى القيمة الجديدة التي نحاول إدراجها.
+
+        async with current_app.db_pool.acquire() as connection:
+            await connection.execute(query, int(telegram_id), username, full_name)
+
+        logging.info(f"User synced successfully: telegram_id={telegram_id}")
+        return jsonify({"status": "success", "message": "User data synced"}), 200
+
+    except Exception as e:
+        logging.error(f"Error syncing user data: {str(e)}", exc_info=True)
+        return jsonify({
+            "error": "Internal Server Error",
+            "ar_message": "حدث خطأ أثناء مزامنة بيانات المستخدم"
+        }), 500
+
+
 def handle_date_timezone(dt: datetime, tz: pytz.BaseTzInfo) -> datetime:
     """معالجة التواريخ وإضافة المنطقة الزمنية إذا لم تكن موجودة"""
     if dt.tzinfo is None:
@@ -85,3 +126,5 @@ async def get_user_subscriptions_endpoint():
             "error": "Internal Server Error",
             "ar_message": "حدث خطأ تقني، الرجاء المحاولة لاحقاً"
         }), 500
+
+
