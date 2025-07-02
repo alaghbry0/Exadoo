@@ -13,6 +13,35 @@ async def create_db_pool():
     return await asyncpg.create_pool(**DATABASE_CONFIG)
 
 
+async def upsert_user(connection, telegram_id: int, username: str, full_name: str) -> bool:
+    """
+    إضافة مستخدم جديد أو تحديث بياناته الحالية (UPSERT) في جدول users.
+
+    Args:
+        connection: اتصال قاعدة البيانات.
+        telegram_id: معرف المستخدم في تليجرام.
+        username: اسم المستخدم في تليجرام.
+        full_name: الاسم الكامل للمستخدم.
+
+    Returns:
+        True إذا تمت العملية بنجاح, False في حالة حدوث خطأ.
+    """
+    try:
+        query = """
+            INSERT INTO users (telegram_id, username, full_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id) DO UPDATE 
+            SET
+                username = EXCLUDED.username,
+                full_name = EXCLUDED.full_name;
+        """
+        await connection.execute(query, telegram_id, username, full_name)
+        logging.info(f"✅ User {telegram_id} upserted successfully.")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Error upserting user {telegram_id}: {e}", exc_info=True)
+        return False
+
 # ----------------- 🔹 إدارة المستخدمين ----------------- #
 async def add_user(connection, telegram_id, username=None, full_name=None, wallet_app=None):
     """
@@ -162,35 +191,53 @@ async def add_subscription_for_legacy(
 # ----------------- 🔹 إدارة الاشتراكات ----------------- #
 
 async def add_subscription(
-    connection,
-    telegram_id: int,
-    channel_id: int,
-    subscription_type_id: int,
-    start_date: datetime,
-    expiry_date: datetime,
-    is_active: bool = True,
-    subscription_plan_id: int = None, # اجعلها تقبل None
-    payment_id: str = None,          # اجعلها تقبل None
-    source: str = "unknown",         # إضافة source
-    returning_id: bool = False
+        connection,
+        telegram_id: int,
+        channel_id: int,
+        subscription_type_id: int,
+        start_date: datetime,
+        expiry_date: datetime,
+        is_active: bool = True,
+        *,  # <--- إضافة الفاصل
+        subscription_plan_id: int | None = None,
+        payment_id: str | None = None,
+        source: str = "unknown",
+        payment_token: str | None = None,
+        returning_id: bool = False
 ):
+    """
+    إضافة سجل اشتراك جديد في قاعدة البيانات.
+    """
     try:
-        # تأكد من أن جدول subscriptions يسمح بقيم NULL لـ subscription_plan_id و payment_id
-        query = """
-            INSERT INTO subscriptions
-            (telegram_id, channel_id, subscription_type_id, subscription_plan_id,
-             start_date, expiry_date, is_active, payment_id,  source, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,  NOW(), NOW())
+        # بناء الاستعلام بشكل ديناميكي
+        columns = ["telegram_id", "channel_id", "subscription_type_id", "start_date", "expiry_date", "is_active",
+                   "source", "created_at", "updated_at"]
+        params = [telegram_id, channel_id, subscription_type_id, start_date, expiry_date, is_active, source]
+
+        if subscription_plan_id is not None:
+            columns.append("subscription_plan_id")
+            params.append(subscription_plan_id)
+        if payment_id is not None:
+            columns.append("payment_id")
+            params.append(payment_id)
+        if payment_token is not None:
+            columns.append("payment_token")
+            params.append(payment_token)
+
+        values_placeholders = [f"${i + 1}" for i in range(len(params))]
+
+        query = f"""
+            INSERT INTO subscriptions ({', '.join(columns)})
+            VALUES ({', '.join(values_placeholders)}, NOW(), NOW())
         """
-        params = [
-            telegram_id, channel_id, subscription_type_id, subscription_plan_id, # يمكن أن يكون None
-            start_date, expiry_date, is_active, payment_id,  source  # يمكن أن يكون None
-        ]
+
+        # ملاحظة: تم تعديل قيم NOW() لتكون خارج قائمة الـ placeholders
 
         if returning_id:
             query += " RETURNING id"
             new_subscription_id = await connection.fetchval(query, *params)
-            logging.info(f"✅ Subscription added with ID {new_subscription_id} for user {telegram_id} (Channel: {channel_id}, Source: {source})")
+            logging.info(
+                f"✅ Subscription added with ID {new_subscription_id} for user {telegram_id} (Channel: {channel_id}, Source: {source})")
             return new_subscription_id
         else:
             await connection.execute(query, *params)
@@ -199,12 +246,10 @@ async def add_subscription(
 
     except Exception as e:
         logging.error(f"❌ Error adding subscription for {telegram_id} (Channel: {channel_id}): {e}", exc_info=True)
-        if returning_id:
-            return None
-        return False
+        return None if returning_id else False
 
 
-# 1. تعديل دالة update_subscription (إزالة التعليقات الداخلية)
+# هذا هو الكود الصحيح الذي يجب أن يكون في ملفك
 async def update_subscription(
     connection,
     telegram_id: int,
@@ -213,36 +258,51 @@ async def update_subscription(
     new_expiry_date: datetime,
     start_date: datetime,
     is_active: bool = True,
+    *,  # هام: يفرض أن تكون الوسائط التالية keyword-only
     subscription_plan_id: int | None = None,
-    payment_id: str | None = None,
-    source: str | None = None
+    payment_id: str | None = None,       # <-- يقبل payment_id
+    source: str | None = None,           # <-- يقبل source
+    payment_token: str | None = None     # <-- يقبل payment_token
 ):
+    """
+    تحديث سجل اشتراك موجود.
+    """
     try:
-        # بناء جملة SET بشكل ديناميكي لتحديث source فقط إذا تم توفيره
         set_clauses = [
             "subscription_type_id = $1",
-            "subscription_plan_id = $2", # سيمرر None كـ NULL إذا كان subscription_plan_id هو None
+            "start_date = $2",
             "expiry_date = $3",
-            "start_date = $4",
-            "is_active = $5",
-            "payment_id = $6",          # سيمرر None كـ NULL إذا كان payment_id هو None
+            "is_active = $4",
             "updated_at = NOW()"
         ]
         params = [
-            subscription_type_id, subscription_plan_id, new_expiry_date,
-            start_date, is_active, payment_id
+            subscription_type_id,
+            start_date,
+            new_expiry_date,
+            is_active
         ]
 
-        if source: # فقط قم بتحديث source إذا تم توفيره، وإلا اتركه كما هو
-            set_clauses.append(f"source = ${len(params) + 1}")
+        # بناء الاستعلام بشكل ديناميكي لتجنب المشاكل مع NULL
+        if subscription_plan_id is not None:
+            params.append(subscription_plan_id)
+            set_clauses.append(f"subscription_plan_id = ${len(params)}")
+        if payment_id is not None:
+            params.append(payment_id)
+            set_clauses.append(f"payment_id = ${len(params)}")
+        if source is not None:
             params.append(source)
+            set_clauses.append(f"source = ${len(params)}")
+        if payment_token is not None:
+            params.append(payment_token)
+            set_clauses.append(f"payment_token = ${len(params)}")
 
+        # إضافة شروط WHERE في النهاية
+        params.extend([telegram_id, channel_id])
         query = f"""
             UPDATE subscriptions SET
                 {', '.join(set_clauses)}
-            WHERE telegram_id = ${len(params) + 1} AND channel_id = ${len(params) + 2}
+            WHERE telegram_id = ${len(params) - 1} AND channel_id = ${len(params)}
         """
-        params.extend([telegram_id, channel_id])
 
         await connection.execute(query, *params)
         logging.info(f"✅ Subscription updated for {telegram_id} (Channel: {channel_id})" + (f" Source: {source}" if source else ""))

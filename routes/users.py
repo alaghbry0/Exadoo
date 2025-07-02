@@ -2,7 +2,7 @@ from quart import Blueprint, request, jsonify, current_app
 import logging
 import pytz
 from datetime import datetime, timedelta, timezone
-from database.db_queries import get_user_subscriptions
+from database.db_queries import get_user_subscriptions, upsert_user
 from typing import Dict, Any
 
 user_bp = Blueprint("users", __name__)
@@ -26,27 +26,27 @@ async def sync_user_profile():
         if not telegram_id:
             return jsonify({"error": "telegramId is required"}), 400
 
-        query = """
-            INSERT INTO users (telegram_id, username, full_name)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (telegram_id) DO UPDATE 
-            SET
-                username = EXCLUDED.username,
-                full_name = EXCLUDED.full_name;
-        """
-        # ملاحظة: EXCLUDED.username تشير إلى القيمة الجديدة التي نحاول إدراجها.
-
         async with current_app.db_pool.acquire() as connection:
-            await connection.execute(query, int(telegram_id), username, full_name)
+            # 3. استدعاء الدالة المنفصلة وتمرير البيانات إليها
+            success = await upsert_user(connection, int(telegram_id), username, full_name)
 
-        logging.info(f"User synced successfully: telegram_id={telegram_id}")
-        return jsonify({"status": "success", "message": "User data synced"}), 200
+        # 4. التحقق من نتيجة العملية
+        if success:
+            logging.info(f"User sync API call successful for telegram_id={telegram_id}")
+            return jsonify({"status": "success", "message": "User data synced"}), 200
+        else:
+            return jsonify({
+                "error": "Internal Server Error",
+                "ar_message": "حدث خطأ أثناء مزامنة بيانات المستخدم"
+            }), 500
 
     except Exception as e:
-        logging.error(f"Error syncing user data: {str(e)}", exc_info=True)
+        # هذا الـ try/except لا يزال مفيدًا لالتقاط أخطاء أخرى مثل
+        # فشل قراءة JSON أو خطأ في تحويل telegram_id إلى int
+        logging.error(f"Error in sync_user_profile endpoint: {str(e)}", exc_info=True)
         return jsonify({
             "error": "Internal Server Error",
-            "ar_message": "حدث خطأ أثناء مزامنة بيانات المستخدم"
+            "ar_message": "حدث خطأ أثناء معالجة الطلب"
         }), 500
 
 

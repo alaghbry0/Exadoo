@@ -222,20 +222,41 @@ async def _execute_renewal_logic(
                 existing_sub = await connection.fetchrow(
                     "SELECT id FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2", telegram_id, channel_id)
                 if existing_sub:
-                    # تم حذف معامل invite_link من الاستدعاء
-                    await update_subscription(connection, telegram_id, channel_id,
-                                              subscription_plan["subscription_type_id"], calculated_new_expiry_date,
-                                              calculated_start_date, True, subscription_plan_id, tx_hash,
-                                              "Automatically")
+                    # =========================================================
+                    # ✨✨✨  الكود المُصحح لاستدعاء update_subscription ✨✨✨
+                    # =========================================================
+                    await update_subscription(
+                        connection=connection,
+                        telegram_id=telegram_id,
+                        channel_id=channel_id,
+                        subscription_type_id=subscription_plan["subscription_type_id"],
+                        new_expiry_date=calculated_new_expiry_date,
+                        start_date=calculated_start_date,
+                        is_active=True,
+                        # -- الوسائط المفتاحية الإلزامية --
+                        subscription_plan_id=subscription_plan_id,
+                        payment_id=tx_hash,
+                        source="Automatically"
+                    )
                     main_subscription_record_id = existing_sub['id']
                 else:
-                    # تم حذف معامل invite_link من الاستدعاء
-                    main_subscription_record_id = await add_subscription(connection, telegram_id, channel_id,
-                                                                         subscription_plan["subscription_type_id"],
-                                                                         calculated_start_date,
-                                                                         calculated_new_expiry_date, True,
-                                                                         subscription_plan_id, tx_hash,
-                                                                         "Automatically", returning_id=True)
+                    # =========================================================
+                    # ✨✨✨  الكود المُصحح لاستدعاء add_subscription ✨✨✨
+                    # =========================================================
+                    main_subscription_record_id = await add_subscription(
+                        connection=connection,
+                        telegram_id=telegram_id,
+                        channel_id=channel_id,
+                        subscription_type_id=subscription_plan["subscription_type_id"],
+                        start_date=calculated_start_date,
+                        expiry_date=calculated_new_expiry_date,
+                        is_active=True,
+                        # -- الوسائط المفتاحية الإلزامية --
+                        subscription_plan_id=subscription_plan_id,
+                        payment_id=tx_hash,
+                        source="Automatically",
+                        returning_id=True
+                    )
 
                 if not main_subscription_record_id:
                     return False, "فشل في إنشاء أو تحديث سجل الاشتراك الرئيسي."

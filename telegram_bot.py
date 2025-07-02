@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from dotenv import load_dotenv
 from quart import Blueprint, current_app, request, jsonify
-from database.db_queries import get_subscription, add_user, get_user_db_id_by_telegram_id, \
+from database.db_queries import get_subscription, upsert_user, get_user_db_id_by_telegram_id, \
     get_active_subscription_types, get_subscription_type_details_by_id, add_subscription_for_legacy, \
     add_pending_subscription,  record_telegram_stars_payment, record_payment
 from routes.subscriptions import process_subscription_renewal
@@ -291,107 +291,55 @@ async def handle_telegram_list_user(
 
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
+    """
+    يعالج أمر /start.
+    يقوم بتحديث بيانات المستخدم في قاعدة البيانات ويرسل رسالة ترحيب مع زر لتطبيق الويب.
+    """
     user = message.from_user
     telegram_id = user.id
-    username_raw = user.username
+    # تأكد من أن اسم المستخدم قد يكون None
+    username = user.username
+    # توفير قيمة افتراضية للاسم الكامل إذا كان فارغًا
     full_name = user.full_name or "مستخدم تيليجرام"
-    username_clean = username_raw.lower().replace('@', '').strip() if username_raw else ""
 
-    # bot_instance = bot # لم نعد بحاجة لهذا، سنستخدم `bot` مباشرة
-    db_pool = current_app.db_pool  # انتبه: هذا يعتمد على أن current_app.db_pool معرف بشكل صحيح في سياق Quart.
-    # إذا كان هذا الكود يعمل خارج سياق طلب Quart، ستحتاج لطريقة أخرى لتمرير db_pool.
-    # admin_id_for_notifications = ADMIN_ID # يمكن استخدام ADMIN_ID مباشرة
-    app_url_for_button = WEB_APP_URL
+    # الحصول على اتصال قاعدة البيانات
+    # ملاحظة: تأكد من أن `current_app.db_pool` متاح في هذا السياق.
+    try:
+        db_pool = current_app.db_pool
+    except (NameError, AttributeError):
+        logging.error("db_pool is not defined or accessible via current_app.")
+        await message.answer("حدث خطأ فني في البوت. يرجى المحاولة لاحقاً.")
+        return
 
+    # 1. تحديث بيانات المستخدم في قاعدة البيانات (UPSERT)
     async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            await add_user(conn, telegram_id, username=username_raw, full_name=full_name)
-            user_db_id = await get_user_db_id_by_telegram_id(conn, telegram_id)
+        success = await upsert_user(conn, telegram_id, username, full_name)
+        if not success:
+            # إذا فشلت عملية قاعدة البيانات، أبلغ المستخدم وتوقف
+            logging.error(f"Failed to upsert user with telegram_id {telegram_id}.")
+            await message.answer("حدث خطأ أثناء تسجيل بياناتك. يرجى المحاولة مرة أخرى.")
+            return
 
-            if not user_db_id:
-                logging.error(f"Failed to get/create user_db_id for telegram_id {telegram_id}.")
-                await message.answer("حدث خطأ أثناء معالجة طلبك. يرجى المحاولة لاحقًا أو التواصل مع الدعم.")
-                return
-
-            managed_channels = await get_active_subscription_types(conn)
-            legacy_already_fully_migrated = await check_if_legacy_migration_done(conn, user_db_id)
-
-            if username_clean and not legacy_already_fully_migrated:
-                logging.info(
-                    f"UserDBID {user_db_id} (TGID: {telegram_id}, User: {username_clean}) - Attempting legacy migration.")
-                processed_this_time = await handle_legacy_user(conn, telegram_id, user_db_id, username_clean)
-                if processed_this_time:
-                    logging.info(f"Legacy migration successful for user {user_db_id}.")
-                    legacy_already_fully_migrated = True
-
-            member_statuses = {}
-            is_member_any_managed_channel_actively = False
-
-            non_active_member_statuses_for_start = [
-                ChatMemberStatus.LEFT,
-                ChatMemberStatus.KICKED,
-                ChatMemberStatus.RESTRICTED
-            ]
-
-            if managed_channels:
-                for channel_info in managed_channels:
-                    try:
-                        member_status = await bot.get_chat_member(chat_id=channel_info['channel_id'],
-                                                                  user_id=telegram_id)  # استخدام `bot` العام
-                        member_statuses[channel_info['channel_id']] = member_status
-                        if member_status.status not in non_active_member_statuses_for_start:
-                            is_member_any_managed_channel_actively = True
-                    except TelegramAPIError as e:  # يجب استيراد TelegramAPIError
-                        if "user not found" in e.message.lower() or "chat not found" in e.message.lower() or "bot is not a member" in e.message.lower():
-                            logging.warning(
-                                f"Could not get chat member status for user {telegram_id} in channel {channel_info['channel_id']}: {e.message}")
-                        else:
-                            logging.error(
-                                f"Telegram API error getting chat member for user {telegram_id} in channel {channel_info['channel_id']}: {e}",
-                                exc_info=True)
-                        member_statuses[channel_info['channel_id']] = None
-                    except Exception as e_gen:
-                        logging.error(
-                            f"Generic error getting chat member for user {telegram_id} in channel {channel_info['channel_id']}: {e_gen}",
-                            exc_info=True)
-                        member_statuses[channel_info['channel_id']] = None
-
-            if is_member_any_managed_channel_actively and not legacy_already_fully_migrated:
-                any_legacy_record_exists_for_username = False
-                if username_clean:
-                    any_legacy_record_exists_for_username = await conn.fetchval(
-                        "SELECT 1 FROM legacy_subscriptions WHERE username = $1 LIMIT 1", username_clean
-                    )
-
-                if not any_legacy_record_exists_for_username:
-                    logging.info(
-                        f"UserDBID {user_db_id} (TGID: {telegram_id}) is an active member. No legacy record. Checking channels via handle_telegram_list_user.")
-                    await handle_telegram_list_user(
-                        conn, telegram_id, user_db_id, full_name, member_statuses,
-                        # bot_instance=bot, # لم نعد نمرره
-                        admin_tg_id=ADMIN_ID
-                    )
-                else:
-                    logging.info(
-                        f"UserDBID {user_db_id} (TGID: {telegram_id}) is member, but a legacy record exists. Skipping 'telegram_list'.")
-
-    bot_user_info = await bot.get_me()  # جلب معلومات البوت
-    bot_display_name = bot_user_info.username if bot_user_info and bot_user_info.username else "Exaado"
-
-    # رسالة ترحيب ثابتة
+    # 2. إرسال رسالة الرد
+    # يمكنك استخدام user.full_name مباشرة هنا أيضاً
     welcome_text = (
-        # f"{final_welcome_message_intro}" # تم الإزالة
-        f"👋 مرحبًا {full_name}!\n\n"  # استخدم full_name الذي تم تعيين قيمة افتراضية له
-        f"مرحبًا بك في **@Exaado**  \n"
-        "هنا يمكنك إدارة اشتراكاتك في قنواتنا بسهولة.\n\n"
+        f"👋 مرحبًا بك {hbold(full_name)}!\n\n"
+        "أهلاً بك في بوت **@Exaado**، حيث يمكنك إدارة اشتراكاتك في قنواتنا بسهولة.\n\n"
         "نتمنى لك تجربة رائعة! 🚀"
     )
 
+    # إنشاء زر تطبيق الويب
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔹 فتح التطبيق 🔹",
                               web_app=WebAppInfo(url=WEB_APP_URL))],
     ])
-    await message.answer(text=welcome_text, reply_markup=keyboard, parse_mode="Markdown")
+
+    # إرسال الرسالة مع الزر
+    await message.answer(
+        text=welcome_text,
+        reply_markup=keyboard,
+        parse_mode="HTML" # تم التغيير إلى HTML ليتوافق مع hbold
+    )
 
 
 # إضافة معالج لطلبات الانضمام

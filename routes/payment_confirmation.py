@@ -9,7 +9,7 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 import aiohttp
 from utils.payment_utils import OP_JETTON_TRANSFER, JETTON_DECIMALS, normalize_address, convert_amount, OP_JETTON_TRANSFER_NOTIFICATION
 from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_payment_token, \
-    record_incoming_transaction, add_user, update_payment_status_to_manual_check
+    record_incoming_transaction,  update_payment_status_to_manual_check
 from pytoniq import LiteBalancer, begin_cell, Address
 from pytoniq.liteclient.client import LiteServerError
 from typing import Optional  # لإضافة تلميحات النوع

@@ -62,22 +62,84 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # تسجيل الخدمات والـ Blueprints
 app.chat_manager = ChatManager(app)
 app.kb = knowledge_base
-app = cors(app, allow_origin="*")
+# ======================================================================
+# ========= 🟢 بداية التعديلات: الطريقة الصحيحة لتطبيق CORS على Blueprints =========
+# ======================================================================
 
-app.register_blueprint(notifications_bp, url_prefix="/api")
-app.register_blueprint(public_routes)
-app.register_blueprint(admin_routes)
-app.register_blueprint(permissions_routes)
+# 1. تعريف المصادر الموثوقة للواجهة الأمامية
+SECURE_FRONTEND_ORIGINS = [
+    "http://localhost:5001",
+    "https://exaado-panel.vercel.app"
+]
+
+# --- المجموعة الأولى: Blueprints الآمنة (تتطلب كوكيز وبيانات اعتماد) ---
+# قم بتطبيق سياسة CORS الصارمة على كل blueprint آمن على حدة
+# 💡 التعديل الرئيسي: إضافة allow_methods و allow_headers بشكل صريح
+cors(
+    auth_routes,
+    allow_origin=SECURE_FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["POST", "GET", "OPTIONS"],  # اسمح بالوسائل التي تستخدمها هذه المسارات
+    allow_headers=["Content-Type", "Authorization"] # اسمح بالهيدرات التي ترسلها الواجهة الأمامية
+)
 app.register_blueprint(auth_routes)
-app.register_blueprint(payment_status_bp)
-app.register_blueprint(payment_bp)
-app.register_blueprint(user_bp)
-app.register_blueprint(shop)
+
+cors(
+    admin_routes,
+    allow_origin=SECURE_FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], # كن أكثر كرماً هنا
+    allow_headers=["Content-Type", "Authorization"]
+)
+app.register_blueprint(admin_routes)
+
+cors(
+    permissions_routes,
+    allow_origin=SECURE_FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"]
+)
+app.register_blueprint(permissions_routes)
+
+cors(
+    admin_chatbot_bp,
+    allow_origin=SECURE_FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"]
+)
 app.register_blueprint(admin_chatbot_bp)
-app.register_blueprint(telegram_bot_bp)
+# أضف أي blueprint آخر يتطلب تسجيل دخول هنا بنفس الطريقة
+
+
+
+# --- المجموعة الثانية: Blueprints العامة (متاحة لأي مصدر) ---
+# قم بتطبيق سياسة CORS العامة على كل blueprint عام
+cors(notifications_bp, allow_origin="*")
+app.register_blueprint(notifications_bp, url_prefix="/api")
+
+cors(public_routes, allow_origin="*")
+app.register_blueprint(public_routes)
+
+cors(payment_status_bp, allow_origin="*")
+app.register_blueprint(payment_status_bp)
+
+cors(payment_bp, allow_origin="*")
+app.register_blueprint(payment_bp)
+
+cors(user_bp, allow_origin="*")
+app.register_blueprint(user_bp)
+
+cors(shop, allow_origin="*")
+app.register_blueprint(shop)
+
+cors(chatbot_bp, allow_origin="*")
 app.register_blueprint(chatbot_bp, url_prefix="/bot")
 
+cors(ws_bp, allow_origin="*")
 app.register_blueprint(ws_bp)
+app.register_blueprint(telegram_bot_bp)
 
 
 @app.after_request
