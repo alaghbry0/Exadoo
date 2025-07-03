@@ -137,6 +137,9 @@ app.register_blueprint(shop)
 cors(chatbot_bp, allow_origin="*")
 app.register_blueprint(chatbot_bp, url_prefix="/bot")
 
+cors(payment_confirmation_bp, allow_origin="*")
+app.register_blueprint(payment_confirmation_bp)
+
 cors(ws_bp, allow_origin="*")
 app.register_blueprint(ws_bp)
 app.register_blueprint(telegram_bot_bp)
@@ -213,7 +216,6 @@ async def initialize_app():
             app.bot_running = True
             asyncio.create_task(start_bot())
 
-        app.register_blueprint(payment_confirmation_bp)
         app.register_blueprint(payment_streaming_bp)
         logging.info("✅ Application initialization completed")
 
