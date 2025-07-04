@@ -198,7 +198,7 @@ async def add_subscription(
         start_date: datetime,
         expiry_date: datetime,
         is_active: bool = True,
-        *,  # <--- إضافة الفاصل
+        *,
         subscription_plan_id: int | None = None,
         payment_id: str | None = None,
         source: str = "unknown",
@@ -209,17 +209,33 @@ async def add_subscription(
     إضافة سجل اشتراك جديد في قاعدة البيانات.
     """
     try:
-        # بناء الاستعلام بشكل ديناميكي
-        columns = ["telegram_id", "channel_id", "subscription_type_id", "start_date", "expiry_date", "is_active",
-                   "source", "created_at", "updated_at"]
-        params = [telegram_id, channel_id, subscription_type_id, start_date, expiry_date, is_active, source]
+        # ✅ جلب user_id من جدول users
+        user_row = await connection.fetchrow(
+            "SELECT id FROM users WHERE telegram_id = $1", telegram_id
+        )
+        if not user_row:
+            raise Exception(f"❌ User with telegram_id {telegram_id} not found in 'users' table.")
+
+        user_id = user_row['id']
+
+        # ✅ بناء الاستعلام بشكل ديناميكي
+        columns = [
+            "user_id", "telegram_id", "channel_id", "subscription_type_id",
+            "start_date", "expiry_date", "is_active", "source", "created_at", "updated_at"
+        ]
+        params = [
+            user_id, telegram_id, channel_id, subscription_type_id,
+            start_date, expiry_date, is_active, source
+        ]
 
         if subscription_plan_id is not None:
             columns.append("subscription_plan_id")
             params.append(subscription_plan_id)
+
         if payment_id is not None:
             columns.append("payment_id")
             params.append(payment_id)
+
         if payment_token is not None:
             columns.append("payment_token")
             params.append(payment_token)
@@ -231,23 +247,23 @@ async def add_subscription(
             VALUES ({', '.join(values_placeholders)}, NOW(), NOW())
         """
 
-        # ملاحظة: تم تعديل قيم NOW() لتكون خارج قائمة الـ placeholders
-
         if returning_id:
             query += " RETURNING id"
             new_subscription_id = await connection.fetchval(query, *params)
             logging.info(
-                f"✅ Subscription added with ID {new_subscription_id} for user {telegram_id} (Channel: {channel_id}, Source: {source})")
+                f"✅ Subscription added with ID {new_subscription_id} for user {telegram_id} (Channel: {channel_id}, Source: {source})"
+            )
             return new_subscription_id
         else:
             await connection.execute(query, *params)
-            logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id}, Source: {source})")
+            logging.info(
+                f"✅ Subscription added for user {telegram_id} (Channel: {channel_id}, Source: {source})"
+            )
             return True
 
     except Exception as e:
         logging.error(f"❌ Error adding subscription for {telegram_id} (Channel: {channel_id}): {e}", exc_info=True)
         return None if returning_id else False
-
 
 # هذا هو الكود الصحيح الذي يجب أن يكون في ملفك
 async def update_subscription(
