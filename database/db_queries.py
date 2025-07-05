@@ -221,7 +221,7 @@ async def add_subscription(
         # ✅ بناء الاستعلام بشكل ديناميكي
         columns = [
             "user_id", "telegram_id", "channel_id", "subscription_type_id",
-            "start_date", "expiry_date", "is_active", "source", "created_at", "updated_at"
+            "start_date", "expiry_date", "is_active", "source"
         ]
         params = [
             user_id, telegram_id, channel_id, subscription_type_id,
@@ -240,11 +240,17 @@ async def add_subscription(
             columns.append("payment_token")
             params.append(payment_token)
 
+        # إضافة created_at و updated_at إلى الأعمدة والمعاملات
+        columns.extend(["created_at", "updated_at"])
+        # استخدم datetime.now(timezone.utc) لضمان أن التوقيت هو UTC
+        current_utc_time = datetime.now(timezone.utc)
+        params.extend([current_utc_time, current_utc_time])
+
         values_placeholders = [f"${i + 1}" for i in range(len(params))]
 
         query = f"""
             INSERT INTO subscriptions ({', '.join(columns)})
-            VALUES ({', '.join(values_placeholders)}, NOW(), NOW())
+            VALUES ({', '.join(values_placeholders)})
         """
 
         if returning_id:
@@ -264,6 +270,7 @@ async def add_subscription(
     except Exception as e:
         logging.error(f"❌ Error adding subscription for {telegram_id} (Channel: {channel_id}): {e}", exc_info=True)
         return None if returning_id else False
+
 
 # هذا هو الكود الصحيح الذي يجب أن يكون في ملفك
 async def update_subscription(
