@@ -20,6 +20,7 @@ from aiogram.enums import ChatMemberStatus
 from functools import partial
 from typing import Optional
 from datetime import datetime, timezone, timedelta
+from utils.system_notifications import send_system_notification
 
 # 🔹 تحميل متغيرات البيئة
 load_dotenv()
@@ -477,7 +478,6 @@ async def process_stars_payment_and_renew(bot: Bot, payment_details: dict):
 
             async with current_app.db_pool.acquire() as connection:
                 async with connection.transaction():
-                    # الخطوة 1: تسجيل الدفعة في جدول payments باستخدام دالة موحدة.
                     payment_record = await record_payment(
                         conn=connection,
                         telegram_id=telegram_id,
@@ -485,7 +485,7 @@ async def process_stars_payment_and_renew(bot: Bot, payment_details: dict):
                         amount=Decimal(payment_details['amount']),
                         payment_token=payment_token,
                         status='pending',
-                        payment_method='Telegram Stars', # <-- استخدام payment_method
+                        payment_method='Telegram Stars',
                         currency='Stars',
                         tx_hash=payment_details['payment_id'],
                         username=payment_details['username'],
@@ -495,14 +495,12 @@ async def process_stars_payment_and_renew(bot: Bot, payment_details: dict):
                     if not payment_record:
                         raise Exception("Failed to record initial pending payment for Telegram Stars.")
 
-                    # الخطوة 2: تجهيز البيانات لدالة التجديد (لا تغيير هنا)
                     payment_data_for_renewal = {
                         **payment_record,
                         "tx_hash": payment_record['tx_hash'],
                         "amount_received": payment_record['amount_received']
                     }
 
-                    # الخطوة 3: استدعاء محرك التجديد الموحد
                     await process_subscription_renewal(
                         connection=connection,
                         bot=bot,
@@ -513,29 +511,40 @@ async def process_stars_payment_and_renew(bot: Bot, payment_details: dict):
             return
 
         except Exception as e:
-            logging.error(f"❌ [Stars] Error in attempt {attempt}/{max_retries} for user={telegram_id}: {e}", exc_info=True)
+            logging.error(f"❌ [Stars] Error in attempt {attempt}/{max_retries} for user={telegram_id}: {e}",
+                          exc_info=True)
             if attempt < max_retries:
                 wait_time = 2 ** attempt
                 logging.info(f"⏳ [Stars] Retrying in {wait_time}s...")
                 await asyncio.sleep(wait_time)
 
     # --- فشلت كل المحاولات ---
-    logging.critical(f"🚨 [Stars] All attempts failed for user={telegram_id}, token={payment_token}. Manual check required.")
-    if ADMIN_ID:
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"🚨 فشل حرج في معالجة دفعة نجوم!\n\nUser ID: `{telegram_id}`\nToken: `{payment_token}`\n\nيرجى المراجعة اليدوية.",
-                parse_mode="Markdown"
-            )
-        except Exception as notify_err:
-            logging.error(f"Failed to send critical failure notification to admin: {notify_err}")
+    logging.critical(
+        f"🚨 [Stars] All attempts failed for user={telegram_id}, token={payment_token}. Manual check required.")
+
+    # ===> بداية التعديل: إرسال إشعار حرج للمطورين والإدارة
+    await send_system_notification(
+        db_pool=current_app.db_pool,
+        bot=bot,
+        level="CRITICAL",
+        audience="all",  # هذا خطأ يتطلب انتباه الجميع
+        title="فشل حرج في معالجة دفعة نجوم تليجرام",
+        details={
+            "المشكلة": "فشلت جميع المحاولات لمعالجة دفعة نجوم وتجديد الاشتراك.",
+            "معرف المستخدم": str(telegram_id),
+            "اسم المستخدم": payment_details.get('username', 'N/A'),
+            "رمز الدفعة (Token)": payment_token,
+            "معرف دفعة تليجرام": payment_details.get('payment_id', 'N/A'),
+            "الإجراء المطلوب": "مراجعة يدوية فورية لسجلات الدفع والاشتراكات."
+        }
+    )
+    # ===> نهاية التعديل
 
 
 # ==============================================================================
-# 📥 معالج الدفع الناجح (مع تحسين التحقق) 📥
+# 📥 معالج الدفع الناجح (مع تحسين التحقق والإشعارات) 📥
 # ==============================================================================
-@dp.message(lambda message: message.successful_payment is not None)
+# @dp.message(lambda message: message.successful_payment is not None) # تأكد من تسجيل هذا المعالج
 async def handle_successful_payment(message: types.Message, bot: Bot):
     """
     يعالج رسالة الدفع الناجح، يستخرج البيانات، ويسلمها للمعالج الجديد.
@@ -559,7 +568,22 @@ async def handle_successful_payment(message: types.Message, bot: Bot):
         required_keys = ["telegram_id", "plan_id", "payment_id", "payment_token", "amount"]
         if not all(payment_details.get(key) for key in required_keys):
             logging.error(f"❌ [Stars] Missing mandatory data in payment details: {payment_details}")
-            # يمكنك إرسال رسالة للمستخدم هنا إذا أردت
+
+            # ===> بداية التعديل: إرسال إشعار للمطور
+            await send_system_notification(
+                db_pool=current_app.db_pool,
+                bot=bot,
+                level="ERROR",
+                audience="developer",
+                title="بيانات ناقصة في دفعة نجوم تليجرام",
+                details={
+                    "المشكلة": "تم استلام دفعة نجوم ولكن بعض البيانات الأساسية مفقودة في الـ payload.",
+                    "البيانات المستلمة": str(payment_details),
+                    "الإجراء المطلوب": "التحقق من منطق إنشاء `invoice_payload` في البوت."
+                }
+            )
+            # ===> نهاية التعديل
+
             await message.reply("عذرًا، حدث خطأ في معالجة دفعتك بسبب بيانات ناقصة. يرجى التواصل مع الدعم.")
             return
 

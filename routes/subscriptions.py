@@ -21,6 +21,7 @@ from utils.db_utils import generate_channel_invite_link, send_message_to_user
 from asyncpg import Connection
 from aiogram import Bot
 from utils.notifications import create_notification
+from utils.system_notifications import send_system_notification
 
 # --- إعدادات وثوابت ---
 LOCAL_TZ = pytz.timezone("Asia/Riyadh")
@@ -58,7 +59,6 @@ async def calculate_subscription_dates(connection: Connection, telegram_id: int,
 # ==============================================================================
 # 🌟 الدالة الرئيسية الجديدة (Wrapper Function) 🌟
 # ==============================================================================
-
 async def process_subscription_renewal(
         connection: Connection,
         bot: Bot,
@@ -81,7 +81,6 @@ async def process_subscription_renewal(
             logging.info(
                 f"🔄 [Renewal Attempt {attempt}/{SUBSCRIPTION_RENEWAL_RETRIES}] for user={telegram_id}, token={payment_token}")
 
-            # استدعاء دالة المنطق الفعلي داخل transaction لضمان سلامة البيانات
             async with connection.transaction():
                 renewal_success, renewal_message = await _execute_renewal_logic(
                     connection=connection,
@@ -93,13 +92,12 @@ async def process_subscription_renewal(
                 success = True
                 message = renewal_message
                 logging.info(f"✅ [Renewal Success] Subscription activated for user={telegram_id} on attempt {attempt}.")
-                break  # اخرج من الحلقة عند النجاح
+                break
             else:
                 message = renewal_message
                 logging.warning(f"⚠️ [Renewal Attempt {attempt} Failed] for user={telegram_id}. Reason: {message}")
 
         except Exception as e:
-            # هذا يلتقط الأخطاء الفادحة التي قد تحدث خارج _execute_renewal_logic
             logging.error(f"❌ [Renewal Attempt {attempt} Critical Error] for user={telegram_id}: {e}", exc_info=True)
             message = f"خطأ فادح في نظام التجديد: {e}"
 
@@ -112,12 +110,28 @@ async def process_subscription_renewal(
         final_status = "completed" if success else "failed"
         final_error_message = None if success else f"Renewal Failed After Retries: {message}"
 
+        # ===> بداية التعديل: إرسال إشعار عند فشل التجديد النهائي
+        if not success:
+            await send_system_notification(
+                db_pool=current_app.db_pool,
+                bot=bot,
+                level="ERROR",
+                audience="admin",  # الإدارة مسؤولة عن متابعة فشل اشتراكات المستخدمين
+                title="فشل تجديد اشتراك مستخدم",
+                details={
+                    "معرف المستخدم": str(telegram_id),
+                    "رمز الدفعة (Token)": payment_token,
+                    "السبب": message
+                }
+            )
+        # ===> نهاية التعديل
+
         await update_payment_with_txhash(
             conn=connection,
             payment_token=payment_token,
             tx_hash=tx_hash,
             amount_received=payment_data['amount_received'],
-            status=final_status,  # <-- تحديث الحالة بناءً على النجاح أو الفشل
+            status=final_status,
             error_message=final_error_message
         )
         logging.info(f"✅ [Payment Finalized] Payment token={payment_token} status set to '{final_status}'.")
@@ -126,11 +140,27 @@ async def process_subscription_renewal(
         logging.critical(
             f"CRITICAL ❌ [Payment Finalization Failed] Could not update payment status for token={payment_token}: {e}",
             exc_info=True)
-        # هذه مشكلة خطيرة، يجب مراقبتها
+
+        # ===> بداية التعديل: إرسال إشعار حرج للمطور
+        await send_system_notification(
+            db_pool=current_app.db_pool,
+            bot=bot,
+            level="CRITICAL",
+            audience="developer",
+            title="فشل حرج في تحديث سجل الدفع",
+            details={
+                "المشكلة": "النظام لم يتمكن من تحديث حالة سجل الدفع بعد اكتمال أو فشل عملية التجديد. هذا قد يسبب عدم تطابق في البيانات.",
+                "معرف المستخدم": str(telegram_id),
+                "رمز الدفعة (Token)": payment_token,
+                "الحالة المفترضة": "completed" if success else "failed",
+                "رسالة الخطأ": str(e)
+            }
+        )
+        # ===> نهاية التعديل
+
         return False, "فشل حرج في تحديث سجل الدفع النهائي."
 
     return success, message
-
 
 async def _activate_or_renew_subscription_core(
         connection: Connection,

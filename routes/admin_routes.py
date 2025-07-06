@@ -20,7 +20,8 @@ import io
 import pandas as pd
 from routes.subscriptions import process_subscription_renewal, _activate_or_renew_subscription_core
 from utils.notifications import create_notification
-from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user, generate_shared_invite_link_for_channel, remove_user_from_channel
+from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user, \
+    generate_shared_invite_link_for_channel, remove_user_from_channel
 from database.db_queries import (
     add_user,
     add_subscription,
@@ -37,6 +38,7 @@ from utils.discount_utils import calculate_discounted_price
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
     return await asyncpg.create_pool(**DATABASE_CONFIG)
+
 
 load_dotenv()
 
@@ -103,44 +105,28 @@ def role_required(required_role):
     return decorator
 
 
-@admin_routes.route("/users_panel", methods=["GET"])
-@permission_required("panel_users.read")
-async def get_users_with_roles():
-    """جلب قائمة المستخدمين مع أدوارهم من جدول panel_users و roles"""
-    async with current_app.db_pool.acquire() as connection:
-        users_data = await connection.fetch("""
-            SELECT u.id, u.email, u.display_name, u.created_at, u.updated_at, r.name as role_name, r.id as role_id
-            FROM panel_users u
-            LEFT JOIN roles r ON u.role_id = r.id
-            ORDER BY u.created_at DESC
-        """)
-        users_list = []
-        for user_row in users_data:
-            users_list.append({
-                "id": user_row["id"],
-                "email": user_row["email"],
-                "display_name": user_row["display_name"],
-                "role_name": user_row["role_name"],
-                "role_id": user_row["role_id"],
-                "created_at": user_row["created_at"].isoformat() if user_row["created_at"] else None,
-                "updated_at": user_row["updated_at"].isoformat() if user_row["updated_at"] else None,
-            })
-    return jsonify({"users": users_list}), 200
-
-
 @admin_routes.route("/users_panel", methods=["POST"])
-@permission_required("panel_users.create")  # الصلاحية العامة لإنشاء المستخدمين
+@permission_required("panel_users.create")
 async def create_user_with_role():
-    """إضافة مستخدم جديد مع تحديد دوره"""
+    """إضافة مستخدم جديد مع تحديد دوره وتفاصيل الإشعارات"""
     data = await request.get_json()
     email = data.get("email")
     display_name = data.get("display_name", "")
-    role_id = data.get("role_id")  # الآن نستخدم role_id
+    role_id = data.get("role_id")
+    # --- التعديل: إضافة الحقول الجديدة ---
+    telegram_id = data.get("telegram_id")
+    receives_notifications = data.get("receives_notifications", False)
 
-    current_user_data = await get_current_user()  # لجلب معلومات المستخدم الحالي للتسجيل
+    current_user_data = await get_current_user()
 
     if not email or not role_id:
         return jsonify({"error": "Email and role_id are required"}), 400
+
+    # --- التعديل: تحويل telegram_id إلى رقم صحيح إذا كان موجوداً ---
+    try:
+        tg_id_val = int(telegram_id) if telegram_id and str(telegram_id).strip() else None
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid Telegram ID format. It must be a number."}), 400
 
     async with current_app.db_pool.acquire() as connection:
         async with connection.transaction():
@@ -148,16 +134,11 @@ async def create_user_with_role():
             if existing_user:
                 return jsonify({"error": "User already exists"}), 400
 
-            # التحقق من وجود الدور
             role_exists = await connection.fetchrow("SELECT id, name FROM roles WHERE id = $1", role_id)
             if not role_exists:
                 return jsonify({"error": "Role not found"}), 404
 
-            # إذا كان المستخدم يحاول إنشاء "owner" وهو ليس "owner", يجب منعه
-            # هذا يمكن معالجته أيضاً بواجهة المستخدم بعدم عرض "owner" كخيار إلا للـ owners
-            # أو بإضافة decorator خاص @owner_can_create_owner_required
             if role_exists['name'] == 'owner':
-                # تحقق إضافي: هل المستخدم الحالي هو owner؟
                 current_user_role = await connection.fetchval("""
                     SELECT r.name FROM panel_users u
                     JOIN roles r ON u.role_id = r.id
@@ -173,23 +154,96 @@ async def create_user_with_role():
                     )
                     return jsonify({"error": "Only owners can create other owners"}), 403
 
+            # --- التعديل: تحديث استعلام الإضافة ليشمل الحقول الجديدة ---
             new_user_id = await connection.fetchval(
-                """INSERT INTO panel_users (email, display_name, role_id)
-                   VALUES ($1, $2, $3) RETURNING id""",
-                email, display_name, role_id
+                """INSERT INTO panel_users (email, display_name, role_id, telegram_id, receives_notifications)
+                   VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+                email, display_name, role_id, tg_id_val, receives_notifications
             )
 
+            # --- التعديل: تحديث تفاصيل التسجيل ---
             await log_action(
-                current_user_data["email"],  # المستخدم الذي قام بالعملية
+                current_user_data["email"],
                 "CREATE_USER",
                 resource="user",
-                resource_id=str(new_user_id),  # أو email
-                details={"email": email, "display_name": display_name, "role_id": role_id,
-                         "role_name": role_exists['name']}
+                resource_id=str(new_user_id),
+                details={
+                    "email": email,
+                    "display_name": display_name,
+                    "role_id": role_id,
+                    "role_name": role_exists['name'],
+                    "telegram_id": tg_id_val,
+                    "receives_notifications": receives_notifications
+                }
             )
 
     return jsonify(
         {"message": f"User {email} added successfully with role {role_exists['name']}", "user_id": new_user_id}), 201
+
+
+# --- إضافة جديدة: نقطة نهاية لتحديث بيانات المستخدم ---
+@admin_routes.route("/users_panel/<int:user_id>", methods=["PUT"])
+@permission_required("panel_users.create")
+async def update_panel_user(user_id: int):
+    """تحديث بيانات مستخدم موجود"""
+    data = await request.get_json()
+    display_name = data.get("display_name")
+    role_id = data.get("role_id")
+    telegram_id = data.get("telegram_id")
+    receives_notifications = data.get("receives_notifications")
+    current_user_data = await get_current_user()
+
+    try:
+        tg_id_val = int(telegram_id) if telegram_id and str(telegram_id).strip() else None
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid Telegram ID format. It must be a number."}), 400
+
+    async with current_app.db_pool.acquire() as connection:
+        # يمكنك إضافة منطق تحقق أكثر تعقيدًا هنا (مثل عدم السماح بتغيير دور الـ owner)
+        await connection.execute(
+            """UPDATE panel_users SET
+               display_name = $1, role_id = $2, telegram_id = $3, receives_notifications = $4, updated_at = NOW()
+               WHERE id = $5""",
+            display_name, role_id, tg_id_val, receives_notifications, user_id
+        )
+        await log_action(current_user_data["email"], "UPDATE_USER", "user", str(user_id), data)
+
+    return jsonify({"message": "User updated successfully"}), 200
+
+
+@admin_routes.route("/users_panel", methods=["GET"])
+@permission_required("panel_users.read")
+async def get_users_with_roles():
+    """جلب قائمة المستخدمين مع أدوارهم وتفاصيل الإشعارات"""
+    async with current_app.db_pool.acquire() as connection:
+        # --- التعديل: إضافة الحقول الجديدة إلى استعلام الجلب ---
+        users_data = await connection.fetch("""
+            SELECT u.id, u.email, u.display_name, u.created_at, u.updated_at,
+                   u.telegram_id, u.receives_notifications,
+                   r.name as role_name, r.id as role_id
+            FROM panel_users u
+            LEFT JOIN roles r ON u.role_id = r.id
+            ORDER BY u.created_at DESC
+        """)
+
+        # الحفاظ على طريقة التنسيق الحالية وإضافة الحقول الجديدة
+        users_list = []
+        for user_row in users_data:
+            users_list.append({
+                "id": user_row["id"],
+                "email": user_row["email"],
+                "display_name": user_row["display_name"],
+                "role_name": user_row["role_name"],
+                "role_id": user_row["role_id"],
+                # --- التعديل: إضافة الحقول الجديدة للنتيجة ---
+                "telegram_id": user_row["telegram_id"],
+                "receives_notifications": user_row["receives_notifications"],
+                # الحفاظ على تنسيق التاريخ والوقت
+                "created_at": user_row["created_at"].isoformat() if user_row["created_at"] else None,
+                "updated_at": user_row["updated_at"].isoformat() if user_row["updated_at"] else None,
+            })
+
+    return jsonify({"users": users_list}), 200
 
 
 @admin_routes.route("/users/<int:user_id_to_delete>", methods=["DELETE"])  # استخدام user_id في المسار
@@ -364,7 +418,7 @@ async def get_user_details(telegram_id):
                 return jsonify({"error": "User not found"}), 404
 
             user_result = dict(user_data)
-            user_id = user_result['id'] # <-- استخلاص user_id للاستعلامات التالية
+            user_id = user_result['id']  # <-- استخلاص user_id للاستعلامات التالية
 
             # جلب الاشتراكات
             subscriptions_query = """
@@ -449,6 +503,7 @@ async def get_user_details(telegram_id):
 # --- دالة مساعدة لتهيئة عميل ImageKit ---
 _imagekit_client = None
 
+
 def get_imagekit_client():
     global _imagekit_client
     if _imagekit_client is None:
@@ -464,11 +519,13 @@ def get_imagekit_client():
             url_endpoint=os.getenv('IMAGEKIT_URL_ENDPOINT')
         )
     return _imagekit_client
+
+
 # ------------------------------------
 
 # --- نقطة نهاية جديدة لتوليد توقيع الرفع لـ ImageKit ---
 @admin_routes.route("/imagekit-signature", methods=["GET"])
-@permission_required("subscription_types.update") # أو "subscription_types.create" أو صلاحية عامة للرفع
+@permission_required("subscription_types.update")  # أو "subscription_types.create" أو صلاحية عامة للرفع
 async def get_imagekit_upload_signature():
     try:
         imagekit = get_imagekit_client()
@@ -477,12 +534,14 @@ async def get_imagekit_upload_signature():
         # token هو معرّف فريد للطلب (uuid)
         auth_params = imagekit.get_authentication_parameters()
         return jsonify(auth_params), 200
-    except ValueError as ve: # إذا لم تكن الإعدادات موجودة
+    except ValueError as ve:  # إذا لم تكن الإعدادات موجودة
         logging.error(f"ImageKit configuration error: {ve}", exc_info=True)
         return jsonify({"error": f"ImageKit configuration error: {str(ve)}"}), 500
     except Exception as e:
         logging.error(f"Error generating ImageKit signature: {e}", exc_info=True)
         return jsonify({"error": "Failed to generate upload signature"}), 500
+
+
 # ----------------------------------------------------
 
 
@@ -568,7 +627,7 @@ async def create_subscription_type():
                 created_type = await connection.fetchrow(
                     query_type, name, main_channel_id, group_id, sort_order,
                     description,
-                    image_url_from_client, image_file_id_from_client, # <--- استخدام القيم الجديدة
+                    image_url_from_client, image_file_id_from_client,  # <--- استخدام القيم الجديدة
                     json.dumps(features), usp,
                     is_active, is_recommended, json.dumps(terms_and_conditions)
                 )
@@ -628,7 +687,6 @@ async def create_subscription_type():
                 # تحديث استعلام جلب القنوات المرتبطة ليشمل الرابط
                 linked_channels_query = "SELECT channel_id, channel_name, is_main, invite_link FROM subscription_type_channels WHERE subscription_type_id = $1"
                 linked_channels_rows = await connection.fetch(linked_channels_query, new_type_id)
-
 
                 response_data = dict(created_type)
                 # التأكد من أن features و terms_and_conditions هي قائمة في الاستجابة
@@ -958,6 +1016,7 @@ async def update_subscription_type(type_id: int):
         logging.error(f"Error updating subscription type {type_id}: {e}", exc_info=True)
         return jsonify({"error": f"Internal server error while updating subscription type {type_id}"}), 500
 
+
 # --- حذف نوع اشتراك ---
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["DELETE"])
 @permission_required("subscription_types.delete")
@@ -1028,7 +1087,7 @@ def _format_subscription_type_data(row_data):
     # إزالة الحقول المؤقتة
     for key in ["group_name", "group_color", "group_icon"]:
         type_item.pop(key, None)
-        
+
     return type_item
 
 
@@ -1103,8 +1162,9 @@ async def get_all_subscription_data():
         for group_row in grouped_results:
             group_data = dict(group_row)
             # استخدام الدالة المساعدة لمعالجة كل نوع داخل المجموعة
-            types_list = [_format_subscription_type_data(t) for t in json.loads(group_data.get("subscription_types", "[]") or "[]")]
-            
+            types_list = [_format_subscription_type_data(t) for t in
+                          json.loads(group_data.get("subscription_types", "[]") or "[]")]
+
             response_data.append({
                 "id": group_data["group_id"],
                 "name": group_data["group_name"],
@@ -1133,7 +1193,6 @@ async def get_all_subscription_data():
     except Exception as e:
         logging.error("Error fetching all subscription data: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
 
 
 # --- جلب قائمة أنواع الاشتراكات ---
@@ -1185,6 +1244,7 @@ async def get_subscription_types():
         logging.error("Error fetching subscription types: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 # --- جلب تفاصيل نوع اشتراك معين (مُحسّن) ---
 # هذا لا يزال مفيداً لصفحة التعديل إذا لم نرد جلب كل شيء
 @admin_routes.route("/subscription-types/<int:type_id>", methods=["GET"])
@@ -1207,7 +1267,7 @@ async def get_subscription_type(type_id: int):
 
             if not type_details_row:
                 return jsonify({"error": "Subscription type not found"}), 404
-            
+
             # استخدم الدالة المساعدة لتوحيد المعالجة
             formatted_data = _format_subscription_type_data(type_details_row)
             return jsonify(formatted_data), 200
@@ -1215,6 +1275,7 @@ async def get_subscription_type(type_id: int):
     except Exception as e:
         logging.error("Error fetching subscription type %s: %s", type_id, e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
 
 # --- إنشاء مجموعة جديدة ---
 @admin_routes.route("/subscription-groups", methods=["POST"])
@@ -1229,7 +1290,7 @@ async def create_subscription_group():
         icon = data.get("icon", "category")
         is_active = data.get("is_active", True)
         sort_order = data.get("sort_order", 0)
-        display_as_single_card = data.get("display_as_single_card", False) # <--- الحقل الجديد
+        display_as_single_card = data.get("display_as_single_card", False)  # <--- الحقل الجديد
 
         if not name:
             return jsonify({"error": "Missing required field: name"}), 400
@@ -1449,6 +1510,7 @@ async def delete_subscription_group(group_id: int):
         logging.error("Error deleting subscription group %s: %s", group_id, e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 #######################################
 # نقاط API لإدارة خطط الاشتراك (subscription_plans)
 #######################################
@@ -1621,6 +1683,7 @@ async def get_subscription_plan(plan_id: int):
         logging.error("Error fetching subscription plan: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
 #######################################
 # نقاط API لإدارة الخصومات (Discounts)
 #######################################
@@ -1674,34 +1737,32 @@ async def create_discount():
         return jsonify({"error": "Internal server error"}), 500
 
 
-# 2. جلب كل الخصومات
-# 2. جلب كل الخصومات (النسخة المحدثة)
+# 2. جلب كل الخصومات (النسخة المصححة)
 @admin_routes.route("/discounts", methods=["GET"])
 @permission_required("discounts.read")
 async def get_discounts():
     try:
-        # استعلام يدمج الخصومات مع إحصائياتها (بمنطق محدث)
+        # استعلام يدمج الخصومات مع إحصائياتها (بمنطق محدث وموحد)
         query = """
             SELECT 
                 d.*,
-                -- 1. عدد المستخدمين الذين يملكون هذا الخصم حالياً (لا تغيير هنا)
-                (SELECT COUNT(*) 
+                -- ⭐⭐⭐ التصحيح هنا: عد المستخدمين الفريدين ⭐⭐⭐
+                (SELECT COUNT(DISTINCT ud.user_id) 
                  FROM user_discounts ud 
                  WHERE ud.discount_id = d.id AND ud.is_active = true) as active_holders_count,
 
-                -- 2. عدد المستخدمين المحتملين الذين سيطبق عليهم الخصم (إذا كان من نوع existing_subscribers)
-                -- ⭐⭐⭐ هنا التعديل الرئيسي ⭐⭐⭐
+                -- عدد المستخدمين المحتملين (هذا الجزء صحيح بالفعل ويستخدم DISTINCT)
                 (CASE
                     WHEN d.target_audience = 'existing_subscribers' THEN
                         (SELECT COUNT(DISTINCT s.user_id) 
                          FROM subscriptions s
                          WHERE s.is_active = true
-                           -- الشرط الأول: إذا كان الخصم يستهدف خطة معينة، نطابق الـ plan_id
-                           AND (d.applicable_to_subscription_plan_id IS NOT NULL AND s.subscription_plan_id = d.applicable_to_subscription_plan_id)
-                           -- الشرط الثاني: أو إذا كان الخصم يستهدف نوعاً (ولم يحدد خطة)، نطابق الـ type_id
-                           OR (d.applicable_to_subscription_plan_id IS NULL AND d.applicable_to_subscription_type_id IS NOT NULL AND s.subscription_type_id = d.applicable_to_subscription_type_id)
+                           AND (
+                               (d.applicable_to_subscription_plan_id IS NOT NULL AND s.subscription_plan_id = d.applicable_to_subscription_plan_id)
+                               OR 
+                               (d.applicable_to_subscription_plan_id IS NULL AND d.applicable_to_subscription_type_id IS NOT NULL AND s.subscription_type_id = d.applicable_to_subscription_type_id)
+                           )
                         )
-                    -- إذا لم يكن الخصم من نوع 'existing_subscribers'، فالعدد صفر
                     ELSE 0
                 END) as potential_recipients_count
             FROM 
@@ -1718,6 +1779,7 @@ async def get_discounts():
     except Exception as e:
         logging.error(f"Error fetching discounts with stats: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
 
 # 3. تعديل خصم
 @admin_routes.route("/discounts/<int:discount_id>", methods=["PUT"])
@@ -1776,74 +1838,95 @@ async def apply_discount_to_existing_users(discount_id: int):
     try:
         async with current_app.db_pool.acquire() as connection:
             async with connection.transaction():
-                # الخطوة 1: جلب تفاصيل الخصم
+                # --- الخطوة 1: جلب تفاصيل الخصم ---
                 discount = await connection.fetchrow("SELECT * FROM discounts WHERE id = $1", discount_id)
                 if not discount:
                     return jsonify({"error": "Discount not found"}), 404
 
-                # --- ⭐ تعديل المنطق هنا ⭐ ---
-                # يجب أن يكون الخصم مرتبطاً إما بنوع أو بخطة لتحديد الجمهور
-                if not discount['applicable_to_subscription_type_id'] and not discount[
-                    'applicable_to_subscription_plan_id']:
-                    return jsonify({
-                        "error": "Discount must be applicable to a specific subscription type or plan to use this feature."
-                    }), 400
+                if discount['target_audience'] != 'existing_subscribers':
+                    return jsonify(
+                        {"error": "This function is only for discounts targeting 'existing_subscribers'."}), 400
 
-                # الخطوة 2: جلب كل المستخدمين النشطين في الهدف (نوع أو خطة)
-                # تم تعديل الاستعلام ليكون أكثر مرونة
+                discount_type_id = discount.get('applicable_to_subscription_type_id')
+                discount_plan_id = discount.get('applicable_to_subscription_plan_id')
+
+                if not discount_type_id and not discount_plan_id:
+                    return jsonify({"error": "Discount must be applicable to a specific type or plan."}), 400
+
+                # --- الخطوة 2: جلب المستخدمين المستهدفين (فقط IDs الخاصة بهم) ---
+                # هؤلاء هم المستخدمون الذين لديهم اشتراك نشط في النطاق المستهدف
                 target_users_query = """
-                    SELECT s.user_id, sp.id as plan_id, sp.price as plan_price
+                    SELECT DISTINCT s.user_id
                     FROM subscriptions s
-                    JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
-                    WHERE s.is_active = true
-                      AND s.user_id IS NOT NULL
-                      -- إذا تم تحديد الخطة، فاستهدفها مباشرة
-                      AND ($1::int IS NULL OR sp.id = $1)
-                      -- إذا لم تحدد الخطة، فاستهدف النوع
-                      AND ($2::int IS NULL OR s.subscription_type_id = $2);
+                    WHERE s.is_active = true AND s.user_id IS NOT NULL
+                      AND (
+                        ($1::int IS NOT NULL AND s.subscription_plan_id = $1) OR
+                        ($1::int IS NULL AND $2::int IS NOT NULL AND s.subscription_type_id = $2)
+                      );
                 """
-                target_users = await connection.fetch(
-                    target_users_query,
-                    discount['applicable_to_subscription_plan_id'],
-                    discount['applicable_to_subscription_type_id']
-                )
+                target_user_records = await connection.fetch(target_users_query, discount_plan_id, discount_type_id)
 
-                if not target_users:
-                    return jsonify({"message": "No active subscribers found for the target subscription type.",
-                                    "applied_count": 0}), 200
+                target_user_ids = [record['user_id'] for record in target_user_records]
 
-                # الخطوة 3: حساب السعر الجديد وإضافته لكل مستخدم في user_discounts
-                applied_count = 0
-                for user_record in target_users:
-                    locked_price = calculate_discounted_price(
-                        user_record['plan_price'],
-                        discount['discount_type'],
-                        discount['discount_value']
-                    )
+                if not target_user_ids:
+                    return jsonify(
+                        {"message": "No active subscribers found for the target scope.", "applied_count": 0}), 200
 
-                    # إضافة أو تحديث الخصم للمستخدم. ON CONFLICT يضمن عدم حدوث أخطاء إذا كان للمستخدم خصم فعال بالفعل على نفس الخطة
-                    insert_query = """
-                        INSERT INTO user_discounts (user_id, discount_id, subscription_plan_id, locked_price, is_active)
-                        VALUES ($1, $2, $3, $4, true)
-                        ON CONFLICT (user_id, subscription_plan_id, is_active)
-                        DO UPDATE SET
-                            discount_id = EXCLUDED.discount_id,
-                            locked_price = EXCLUDED.locked_price,
-                            granted_at = NOW();
-                    """
-                    await connection.execute(
-                        insert_query,
-                        user_record['user_id'],
-                        discount_id,
-                        user_record['plan_id'],
-                        locked_price
-                    )
-                    applied_count += 1
+                # --- الخطوة 3: جلب كل الخطط التي يغطيها هذا الخصم ---
+                # هذا هو المنطق الجديد والمهم
+                applicable_plans_query = """
+                    SELECT id as plan_id, price as plan_price
+                    FROM subscription_plans
+                    WHERE is_active = true AND (
+                        ($1::int IS NOT NULL AND id = $1) OR
+                        ($1::int IS NULL AND $2::int IS NOT NULL AND subscription_type_id = $2)
+                    );
+                """
+                applicable_plans = await connection.fetch(applicable_plans_query, discount_plan_id, discount_type_id)
 
-                logging.info(f"Applied discount {discount_id} to {applied_count} existing users.")
+                if not applicable_plans:
+                    return jsonify({"error": "No active plans found that match the discount's scope."}), 404
+
+                # --- الخطوة 4: التكرار على كل مستهدف وكل خطة قابلة للتطبيق ---
+                total_applied_count = 0
+
+                # تجهيز استعلام الإضافة مرة واحدة خارج الحلقة لتحسين الأداء
+                insert_query = """
+                    INSERT INTO user_discounts (user_id, discount_id, subscription_plan_id, locked_price, is_active)
+                    VALUES ($1, $2, $3, $4, true)
+                    ON CONFLICT (user_id, subscription_plan_id, is_active) DO UPDATE SET
+                        discount_id = EXCLUDED.discount_id,
+                        locked_price = EXCLUDED.locked_price,
+                        granted_at = NOW();
+                """
+
+                # إنشاء قائمة من الصفوف التي سيتم إدراجها
+                records_to_insert = []
+                for user_id in target_user_ids:
+                    for plan in applicable_plans:
+                        # حساب السعر المخفض لكل خطة
+                        locked_price = calculate_discounted_price(
+                            plan['plan_price'],
+                            discount['discount_type'],
+                            discount['discount_value']
+                        )
+                        records_to_insert.append(
+                            (user_id, discount_id, plan['plan_id'], locked_price)
+                        )
+
+                # --- الخطوة 5: تنفيذ الإضافة دفعة واحدة باستخدام executemany ---
+                # هذا أكثر كفاءة من تنفيذ استعلامات متعددة داخل حلقة
+                if records_to_insert:
+                    await connection.executemany(insert_query, records_to_insert)
+                    total_applied_count = len(records_to_insert)
+
+                logging.info(
+                    f"Applied discount {discount_id} to {len(target_user_ids)} users across {len(applicable_plans)} plans. Total records created/updated: {total_applied_count}.")
+
                 return jsonify({
-                    "message": f"Successfully applied discount to {applied_count} users.",
-                    "applied_count": applied_count
+                    "message": f"Successfully applied discount to {len(target_user_ids)} users. A total of {total_applied_count} discount records were created or updated for all applicable plans.",
+                    "users_affected": len(target_user_ids),
+                    "discounts_created_or_updated": total_applied_count
                 }), 200
 
     except Exception as e:
@@ -1970,6 +2053,7 @@ async def get_subscriptions_meta_endpoint():
     except Exception as e:
         logging.error(f"Error fetching subscriptions metadata: {e}", exc_info=True)
         return jsonify({"error": "Failed to load filter data"}), 500
+
 
 @admin_routes.route("/subscriptions", methods=["GET"])
 @permission_required("user_subscriptions.read")
@@ -2156,6 +2240,8 @@ async def get_subscriptions_merged_endpoint():
     except Exception as e:
         logging.error(f"Unexpected error in /subscriptions endpoint: {str(e)}", exc_info=True)
         return jsonify({"error": "An internal server error occurred"}), 500
+
+
 # ==============================================================================
 # 📈 Subscription History Endpoint (Your simplified, efficient version)
 # ==============================================================================
@@ -2179,7 +2265,7 @@ async def get_subscription_history_endpoint():
 
         # 💡 --- التغيير الرئيسي هنا: بناء الشروط والمعاملات بالطريقة الصحيحة ---
         where_clauses = []
-        query_params = [] # استخدام قائمة بدلاً من قاموس
+        query_params = []  # استخدام قائمة بدلاً من قاموس
 
         if action_type_filter and action_type_filter.lower() != "all":
             query_params.append(action_type_filter.upper())
@@ -2266,7 +2352,7 @@ async def get_subscription_history_endpoint():
         # هذا سيلتقط الآن فقط أخطاء تحويل page/page_size إلى int
         logging.error(f"Value error in /subscription-history: {str(ve)}", exc_info=True)
         return jsonify({"error": "Invalid request parameters (e.g., page, page_size)", "details": str(ve)}), 400
-    except asyncpg.PostgresError as pe: # التقاط أخطاء قاعدة البيانات بشكل منفصل
+    except asyncpg.PostgresError as pe:  # التقاط أخطاء قاعدة البيانات بشكل منفصل
         logging.error(f"Database error in /subscription-history: {str(pe)}", exc_info=True)
         logging.debug(f"Failed Query: {query}")
         logging.debug(f"Failed Params: {query_params}")
@@ -2274,6 +2360,7 @@ async def get_subscription_history_endpoint():
     except Exception as e:
         logging.error(f"Unexpected error in /subscription-history: {str(e)}", exc_info=True)
         return jsonify({"error": "An internal server error occurred"}), 500
+
 
 # ==============================================================================
 # 📊 Separate Subscription Analytics Endpoint (Keep this great idea!)
@@ -2429,6 +2516,7 @@ async def get_subscription_analytics():
         logging.error(f"Error in /subscriptions/analytics: {e}", exc_info=True)
         return jsonify({"error": "Failed to fetch analytics"}), 500
 
+
 # واجهة API جديدة للحصول على قائمة مصادر الاشتراكات المتاحة
 @admin_routes.route("/subscription_sources", methods=["GET"])
 @permission_required("pending_subscriptions.read")
@@ -2450,7 +2538,6 @@ async def get_subscription_sources():
     except Exception as e:
         logging.error("Error fetching subscription sources: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
 
 
 # =====================================
@@ -2582,7 +2669,7 @@ async def get_payments_enhanced_endpoint():
                 (SELECT COUNT(*) FROM filtered_payments WHERE status = 'completed') AS completed_count,
                 (SELECT COUNT(*) FROM filtered_payments WHERE status = 'pending') AS pending_count,
                 (SELECT COUNT(*) FROM filtered_payments WHERE status = 'failed') AS failed_count,
-                
+
                 fp.*
             FROM filtered_payments fp
             {order_by_clause}
@@ -2723,6 +2810,7 @@ async def retry_failed_payment_renewal(payment_id: int):
                 payment_id
             )
             return jsonify({"error": "An internal error occurred while trying to start the retry process."}), 500
+
 
 @admin_routes.route("/incoming-transactions", methods=["GET"])
 @permission_required("payments.read_incoming_transactions")
@@ -3874,7 +3962,7 @@ async def get_batch_details(batch_id: str):
             return jsonify({"error": "Batch not found"}), 404
 
         # تحويل MessagingBatchResult إلى dict، مع تحويل Enums و datetimes
-        details_dict = asdict(details_obj) # asdict يتعامل مع dataclasses
+        details_dict = asdict(details_obj)  # asdict يتعامل مع dataclasses
 
         # asdict قد لا يحول Enums إلى قيمها تلقائيًا، لذا تأكد
         details_dict['status'] = details_obj.status.value
@@ -3887,8 +3975,7 @@ async def get_batch_details(batch_id: str):
                 details_dict[key] = value.isoformat()
             # تحويل FailedSendDetail إلى dicts إذا لم يتم ذلك بالفعل بواسطة asdict (إذا كانت error_details قائمة من الكائنات)
             elif key == 'error_details' and value and isinstance(value[0], FailedSendDetail):
-                 details_dict[key] = [asdict(err_detail) for err_detail in value]
-
+                details_dict[key] = [asdict(err_detail) for err_detail in value]
 
         return jsonify(details_dict), 200
     except Exception as e:
@@ -3911,7 +3998,6 @@ async def retry_failed_batch_sends(batch_id: str):
     except Exception as e:
         logging.error(f"Error retrying batch {batch_id}: {e}", exc_info=True)
         return jsonify({"error": "Internal server error during retry"}), 500
-
 
 
 @admin_routes.route("/messaging-batches/latest-for-type/<int:type_id>", methods=["GET"])
@@ -3937,14 +4023,16 @@ async def get_latest_batch_for_type(type_id: int):
             if 'status' in latest_batch_dict and latest_batch_dict['status'] is not None:
                 try:
                     latest_batch_dict['status'] = BatchStatus(latest_batch_dict['status']).value
-                except ValueError: # إذا كانت القيمة في DB غير صالحة لـ Enum
-                    logging.warning(f"Invalid status value '{latest_batch_dict['status']}' in DB for batch type {type_id}")
+                except ValueError:  # إذا كانت القيمة في DB غير صالحة لـ Enum
+                    logging.warning(
+                        f"Invalid status value '{latest_batch_dict['status']}' in DB for batch type {type_id}")
                     # يمكنك اختيار ترك القيمة كما هي أو تعيينها إلى قيمة افتراضية
             if 'batch_type' in latest_batch_dict and latest_batch_dict['batch_type'] is not None:
                 try:
                     latest_batch_dict['batch_type'] = BatchType(latest_batch_dict['batch_type']).value
                 except ValueError:
-                    logging.warning(f"Invalid batch_type value '{latest_batch_dict['batch_type']}' in DB for batch type {type_id}")
+                    logging.warning(
+                        f"Invalid batch_type value '{latest_batch_dict['batch_type']}' in DB for batch type {type_id}")
 
             # تحويل حقول JSON إذا كانت مخزنة كسلاسل نصية
             for field_name in ['message_content', 'context_data', 'error_details']:
@@ -3952,9 +4040,9 @@ async def get_latest_batch_for_type(type_id: int):
                     try:
                         latest_batch_dict[field_name] = json.loads(latest_batch_dict[field_name])
                     except json.JSONDecodeError:
-                        logging.warning(f"Could not parse JSON for field {field_name} in latest batch for type {type_id}")
-                        latest_batch_dict[field_name] = None # أو اتركه كسلسلة نصية أو أعد الخطأ
-
+                        logging.warning(
+                            f"Could not parse JSON for field {field_name} in latest batch for type {type_id}")
+                        latest_batch_dict[field_name] = None  # أو اتركه كسلسلة نصية أو أعد الخطأ
 
             return jsonify(latest_batch_dict), 200
     except Exception as e:
@@ -4181,7 +4269,6 @@ async def preview_target_users():
         return jsonify({"error": "Internal server error"}), 500
 
 
-
 @admin_routes.route("/messaging/available-variables", methods=["GET"])
 @permission_required("broadcast.read")
 async def get_available_variables():
@@ -4238,7 +4325,7 @@ async def get_available_variables():
 # تحديث دالة البث لتشمل معالجة المتغيرات
 @admin_routes.route("/messaging/broadcast", methods=["POST"])
 @permission_required("broadcast.send")
-async def send_broadcast_message(): # تم تغيير الاسم هنا ليكون هو الاسم الوحيد المستخدم
+async def send_broadcast_message():  # تم تغيير الاسم هنا ليكون هو الاسم الوحيد المستخدم
     """بدء مهمة إرسال رسالة عامة محسنة مع دعم المتغيرات."""
     data = await request.get_json()
     message_text = data.get("message_text")
@@ -4445,7 +4532,7 @@ async def start_channel_cleanup():
 
 
 @admin_routes.route("/channels/audits/history", methods=["GET"])
-@permission_required("channels.audit.read") # استخدم نفس الصلاحية أو صلاحية جديدة
+@permission_required("channels.audit.read")  # استخدم نفس الصلاحية أو صلاحية جديدة
 async def get_channel_audits_history():
     """
     يجلب قائمة بآخر 5 عمليات فحص شاملة.

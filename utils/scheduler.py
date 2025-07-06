@@ -15,7 +15,7 @@ from database.db_queries import (
     find_lapsable_user_discounts_for_type,
     deactivate_multiple_user_discounts
 )
-
+import json
 
 # إنشاء مثيل للجدولة
 scheduler = AsyncIOScheduler()
@@ -31,6 +31,9 @@ async def execute_scheduled_tasks(bot: Bot, connection):
         tasks = await get_pending_tasks(connection)
         logging.info(f"🔄 عدد المهام المعلقة: {len(tasks)}.")
 
+        # ⭐ قائمة بالمهام التي تتطلب وجود channel_id بشكل إلزامي
+        tasks_requiring_channel = ["remove_user", "first_reminder", "second_reminder"]
+
         current_time = datetime.now(timezone.utc)
 
         for task in tasks:
@@ -42,8 +45,15 @@ async def execute_scheduled_tasks(bot: Bot, connection):
 
             logging.info(f"🛠️ تنفيذ المهمة {task_id}: النوع {task_type}, المستخدم {telegram_id}, القناة {channel_id}")
 
-            if not telegram_id or not channel_id:
-                logging.warning(f"⚠️ تجاهل المهمة {task_id} بسبب بيانات غير صحيحة.")
+            # ⭐ التحقق الذكي الجديد ⭐
+            # تحقق دائمًا من وجود telegram_id
+            if not telegram_id:
+                logging.warning(f"⚠️ تجاهل المهمة {task_id} بسبب عدم وجود معرف تيليجرام.")
+                continue
+
+            # تحقق من وجود channel_id فقط إذا كان نوع المهمة يتطلبه
+            if task_type in tasks_requiring_channel and not channel_id:
+                logging.warning(f"⚠️ تجاهل المهمة {task_id} من نوع '{task_type}' لأنها تتطلب معرف قناة.")
                 continue
 
             try:
@@ -58,7 +68,6 @@ async def execute_scheduled_tasks(bot: Bot, connection):
                 if task_type == "remove_user":
                     await handle_remove_user_task(bot, connection, telegram_id, channel_id, task_id)
 
-                    # --- ⭐ إضافة معالجة نوع المهمة الجديد ⭐ ---
                 elif task_type == "deactivate_discount_grace_period":
                     await handle_deactivate_discount_task(bot, connection, task)
 
@@ -68,13 +77,15 @@ async def execute_scheduled_tasks(bot: Bot, connection):
                     logging.warning(f"⚠️ Unknown task type: {task_type}. Skipping.")
 
             except Exception as task_error:
-                logging.error(f"❌ خطأ أثناء تنفيذ المهمة {task_id}: {task_error}")
+                logging.error(f"❌ خطأ أثناء تنفيذ المهمة {task_id}: {task_error}", exc_info=True) # أضفت exc_info=True لتفاصيل أفضل
                 await update_task_status(connection, task_id, "failed")
 
         logging.info("✅ تم تنفيذ جميع المهام المجدولة بنجاح.")
 
     except Exception as e:
-        logging.error(f"❌ خطأ أثناء تنفيذ المهام المجدولة: {e}")
+        logging.error(f"❌ خطأ أثناء تنفيذ المهام المجدولة: {e}", exc_info=True) # أضفت exc_info=True
+
+
 
 
 # ----------------- 🔹 معالجة مهمة إزالة المستخدم ----------------- #
@@ -142,11 +153,19 @@ async def handle_remove_user_task(bot: Bot, connection, telegram_id, channel_id,
 async def handle_deactivate_discount_task(bot: Bot, connection, task: dict):
     task_id = task['id']
     telegram_id = task['telegram_id']
-    payload = task.get('payload')
+    payload_str = task.get('payload')
 
-    # التحقق من البيانات الجديدة في الـ payload
+    payload = None
+    try:
+        if payload_str:
+            payload = json.loads(payload_str)
+    except json.JSONDecodeError:
+        logging.error(f"Task {task_id} has invalid JSON in payload: {payload_str}")
+        await update_task_status(connection, task_id, "failed")
+        return
+
     if not payload or 'subscription_type_id' not in payload or 'user_discount_ids' not in payload:
-        logging.error(f"Task {task_id} (deactivate_discount) is missing required payload. Marking as failed.")
+        logging.error(f"Task {task_id} (deactivate_discount) is missing required data in payload. Marking as failed.")
         await update_task_status(connection, task_id, "failed")
         return
 
@@ -154,7 +173,6 @@ async def handle_deactivate_discount_task(bot: Bot, connection, task: dict):
     user_discount_ids = payload['user_discount_ids']
 
     try:
-        # ⭐ التحقق الذكي: هل جدد المستخدم اشتراكه في نفس النوع؟
         has_renewed = await has_active_subscription_for_type(connection, telegram_id, sub_type_id)
 
         if has_renewed:
@@ -164,12 +182,13 @@ async def handle_deactivate_discount_task(bot: Bot, connection, task: dict):
             logging.info(
                 f"User {telegram_id} did not renew for type {sub_type_id}. Deactivating {len(user_discount_ids)} discounts.")
             deactivated_count = await deactivate_multiple_user_discounts(connection, user_discount_ids)
+
+            # ⭐⭐⭐ التعديل الرئيسي هنا ⭐⭐⭐
             if deactivated_count > 0:
-                try:
-                    await send_message_to_user(bot, telegram_id,
-                                               "لقد فقدت خصوماتك الخاصة لعدم تجديد اشتراكك في الوقت المحدد.")
-                except Exception as msg_err:
-                    logging.error(f"Could not send final discount loss message to {telegram_id}: {msg_err}")
+                # تم تعطيل إرسال الرسالة للمستخدم
+                logging.info(
+                    f"Successfully deactivated {deactivated_count} discounts for user {telegram_id}. Notification was intentionally skipped.")
+                pass
 
         await update_task_status(connection, task_id, "completed")
     except Exception as e:

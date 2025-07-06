@@ -4,7 +4,7 @@ from config import DATABASE_CONFIG
 import pytz
 import logging
 from decimal import Decimal
-
+import json
 from typing import Optional, Union
 
 
@@ -467,21 +467,26 @@ async def add_scheduled_task(connection, task_type: str, telegram_id: int, execu
         else:
             execute_at = execute_at.astimezone(timezone.utc)
 
-        if clean_up and channel_id: # التنظيف لا يزال يعتمد على القناة
+        if clean_up and channel_id:
             await connection.execute("""
                 DELETE FROM scheduled_tasks
                 WHERE telegram_id = $1 AND channel_id = $2 AND task_type = $3
             """, telegram_id, channel_id, task_type)
 
+        # ⭐ التعديل الرئيسي هنا: تحويل القاموس إلى نص JSON ⭐
+        # نستخدم (if payload else None) للتعامل مع حالة عدم وجود payload
+        payload_json = json.dumps(payload) if payload else None
+
         await connection.execute("""
             INSERT INTO scheduled_tasks (task_type, telegram_id, channel_id, execute_at, status, payload)
             VALUES ($1, $2, $3, $4, 'pending', $5)
-        """, task_type, telegram_id, channel_id, execute_at, payload)
+        """, task_type, telegram_id, channel_id, execute_at, payload_json) # <-- استخدام المتغير الجديد
 
         logging.info(f"✅ Scheduled task '{task_type}' for user {telegram_id} at {execute_at} with payload {payload}.")
         return True
     except Exception as e:
-        logging.error(f"❌ Error adding scheduled task '{task_type}' for user {telegram_id}: {e}")
+        # هنا سنحصل على تفاصيل الخطأ بشكل أفضل إذا استخدمنا exc_info=True
+        logging.error(f"❌ Error adding scheduled task '{task_type}' for user {telegram_id}: {e}", exc_info=True)
         return False
 
 async def get_pending_tasks(connection, channel_id: int = None):
