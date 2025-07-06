@@ -1,7 +1,7 @@
 # app.py
 
-import asyncpg
 import logging
+import asyncpg
 import os
 import asyncio
 import hypercorn.config
@@ -57,7 +57,14 @@ app.bot = None
 app.bot_running = False
 app.lite_balancer = None
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# 1. قم بالتهيئة الأساسية لتطبيقك.
+logging.basicConfig(
+    level=logging.INFO, # أنت تريد رؤية سجلات INFO من تطبيقك
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logging.getLogger('LiteClient').setLevel(logging.ERROR)
+logging.getLogger('LiteBalancer').setLevel(logging.ERROR)
+logging.getLogger('pytoniq').setLevel(logging.ERROR)
 
 # تسجيل الخدمات والـ Blueprints
 app.chat_manager = ChatManager(app)
@@ -97,7 +104,7 @@ cors(
     permissions_routes,
     allow_origin=SECURE_FRONTEND_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"]
 )
 app.register_blueprint(permissions_routes)
@@ -106,7 +113,7 @@ cors(
     admin_chatbot_bp,
     allow_origin=SECURE_FRONTEND_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"]
 )
 app.register_blueprint(admin_chatbot_bp)
@@ -136,6 +143,9 @@ app.register_blueprint(shop)
 
 cors(chatbot_bp, allow_origin="*")
 app.register_blueprint(chatbot_bp, url_prefix="/bot")
+
+cors(payment_confirmation_bp, allow_origin="*")
+app.register_blueprint(payment_confirmation_bp)
 
 cors(ws_bp, allow_origin="*")
 app.register_blueprint(ws_bp)
@@ -172,16 +182,15 @@ async def initialize_app():
 
         await mark_stale_tasks_as_failed(app.db_pool)
 
-        logging.info("🔄 Initializing TON LiteBalancer...")
+        # logging.info("🔄 Initializing TON LiteBalancer...")  # <-- تم التعطيل
         config_url = 'https://ton.org/global-config.json'
 
-        logging.info(f"Downloading TON config from {config_url}...")
+        # logging.info(f"Downloading TON config from {config_url}...") # <-- تم التعطيل
         async with app.aiohttp_session.get(config_url) as response:
             response.raise_for_status()
             ton_config = await response.json()
-        logging.info("✅ TON config downloaded successfully.")
+        # logging.info("✅ TON config downloaded successfully.") # <-- تم التعطيل
 
-        # --- 🟢 تصحيح: إزالة 'await' من هنا لأن from_config دالة متزامنة ---
         app.lite_balancer = LiteBalancer.from_config(
             config=ton_config, trust_level=2
         )
@@ -213,7 +222,6 @@ async def initialize_app():
             app.bot_running = True
             asyncio.create_task(start_bot())
 
-        app.register_blueprint(payment_confirmation_bp)
         app.register_blueprint(payment_streaming_bp)
         logging.info("✅ Application initialization completed")
 

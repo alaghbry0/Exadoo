@@ -198,7 +198,7 @@ async def add_subscription(
         start_date: datetime,
         expiry_date: datetime,
         is_active: bool = True,
-        *,  # <--- إضافة الفاصل
+        *,
         subscription_plan_id: int | None = None,
         payment_id: str | None = None,
         source: str = "unknown",
@@ -209,39 +209,62 @@ async def add_subscription(
     إضافة سجل اشتراك جديد في قاعدة البيانات.
     """
     try:
-        # بناء الاستعلام بشكل ديناميكي
-        columns = ["telegram_id", "channel_id", "subscription_type_id", "start_date", "expiry_date", "is_active",
-                   "source", "created_at", "updated_at"]
-        params = [telegram_id, channel_id, subscription_type_id, start_date, expiry_date, is_active, source]
+        # ✅ جلب user_id من جدول users
+        user_row = await connection.fetchrow(
+            "SELECT id FROM users WHERE telegram_id = $1", telegram_id
+        )
+        if not user_row:
+            raise Exception(f"❌ User with telegram_id {telegram_id} not found in 'users' table.")
+
+        user_id = user_row['id']
+
+        # ✅ بناء الاستعلام بشكل ديناميكي
+        columns = [
+            "user_id", "telegram_id", "channel_id", "subscription_type_id",
+            "start_date", "expiry_date", "is_active", "source"
+        ]
+        params = [
+            user_id, telegram_id, channel_id, subscription_type_id,
+            start_date, expiry_date, is_active, source
+        ]
 
         if subscription_plan_id is not None:
             columns.append("subscription_plan_id")
             params.append(subscription_plan_id)
+
         if payment_id is not None:
             columns.append("payment_id")
             params.append(payment_id)
+
         if payment_token is not None:
             columns.append("payment_token")
             params.append(payment_token)
+
+        # إضافة created_at و updated_at إلى الأعمدة والمعاملات
+        columns.extend(["created_at", "updated_at"])
+        # استخدم datetime.now(timezone.utc) لضمان أن التوقيت هو UTC
+        current_utc_time = datetime.now(timezone.utc)
+        params.extend([current_utc_time, current_utc_time])
 
         values_placeholders = [f"${i + 1}" for i in range(len(params))]
 
         query = f"""
             INSERT INTO subscriptions ({', '.join(columns)})
-            VALUES ({', '.join(values_placeholders)}, NOW(), NOW())
+            VALUES ({', '.join(values_placeholders)})
         """
-
-        # ملاحظة: تم تعديل قيم NOW() لتكون خارج قائمة الـ placeholders
 
         if returning_id:
             query += " RETURNING id"
             new_subscription_id = await connection.fetchval(query, *params)
             logging.info(
-                f"✅ Subscription added with ID {new_subscription_id} for user {telegram_id} (Channel: {channel_id}, Source: {source})")
+                f"✅ Subscription added with ID {new_subscription_id} for user {telegram_id} (Channel: {channel_id}, Source: {source})"
+            )
             return new_subscription_id
         else:
             await connection.execute(query, *params)
-            logging.info(f"✅ Subscription added for user {telegram_id} (Channel: {channel_id}, Source: {source})")
+            logging.info(
+                f"✅ Subscription added for user {telegram_id} (Channel: {channel_id}, Source: {source})"
+            )
             return True
 
     except Exception as e:
@@ -315,36 +338,47 @@ async def update_subscription(
 
 async def get_subscription(connection, telegram_id: int, channel_id: int):
     """
-    🔹 جلب الاشتراك الحالي للمستخدم، مع التأكد من أن `expiry_date` هو `timezone-aware`.
+    🔹 جلب الاشتراك الحالي للمستخدم، وتحديد ما إذا كان للقناة الرئيسية، وتحديث حالته إذا لزم الأمر.
     """
     try:
-        subscription = await connection.fetchrow("""
-            SELECT * FROM subscriptions
-            WHERE telegram_id = $1 AND channel_id = $2
-        """, telegram_id, channel_id)
+        # ⭐ تعديل: أضفنا LEFT JOIN للتحقق مما إذا كانت القناة هي القناة الرئيسية
+        query = """
+            SELECT 
+                s.*, 
+                -- نتحقق مما إذا كان channel_id للاشتراك يطابق الـ channel_id الرئيسي لنوع الاشتراك
+                (st.channel_id = s.channel_id) AS is_main_channel_subscription
+            FROM subscriptions s
+            LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
+            WHERE s.telegram_id = $1 AND s.channel_id = $2
+        """
+        subscription = await connection.fetchrow(query, telegram_id, channel_id)
 
-        if subscription:
-            expiry_date = subscription['expiry_date']
+        if not subscription:
+            return None  # لا يوجد اشتراك
 
-            # ✅ التأكد من أن `expiry_date` يحتوي على timezone
-            if expiry_date.tzinfo is None:
-                expiry_date = expiry_date.replace(tzinfo=timezone.utc)
+        # --- لا نغير المنطق التالي ---
+        # لا يزال من الجيد تحديث الحالة هنا كإجراء وقائي
+        expiry_date = subscription['expiry_date']
+        is_active = subscription['is_active']
 
-            # ✅ مقارنة `expiry_date` مع الوقت الحالي الصحيح
-            now_utc = datetime.now(timezone.utc)
-            if expiry_date < now_utc:
-                await connection.execute("""
-                    UPDATE subscriptions
-                    SET is_active = FALSE
-                    WHERE id = $1
-                """, subscription['id'])
-                logging.info(f"⚠️ Subscription for user {telegram_id} in channel {channel_id} marked as inactive.")
+        if expiry_date.tzinfo is None:
+            expiry_date = expiry_date.replace(tzinfo=timezone.utc)
 
-                return {**subscription, 'expiry_date': expiry_date, 'is_active': False}
+        now_utc = datetime.now(timezone.utc)
 
-            return {**subscription, 'expiry_date': expiry_date}
+        # إذا كان الاشتراك لا يزال نشطاً في قاعدة البيانات ولكنه منتهي الصلاحية فعلياً
+        if is_active and expiry_date < now_utc:
+            await connection.execute(
+                "UPDATE subscriptions SET is_active = FALSE WHERE id = $1",
+                subscription['id']
+            )
+            logging.info(f"Proactively marked subscription for user {telegram_id} in channel {channel_id} as inactive.")
+            # نرجع نسخة محدثة من السجل
+            return {**subscription, 'expiry_date': expiry_date, 'is_active': False}
 
-        return None  # لا يوجد اشتراك
+        # نرجع السجل مع تاريخ محدث
+        return {**subscription, 'expiry_date': expiry_date}
+
     except Exception as e:
         logging.error(f"❌ Error retrieving subscription for user {telegram_id} in channel {channel_id}: {e}")
         return None
@@ -373,34 +407,81 @@ async def deactivate_subscription(connection, telegram_id: int, channel_id: int 
         logging.error(f"❌ Error deactivating subscription(s) for user {telegram_id}: {e}")
         return False
 
+# --- ⭐ 1. تعديل: دالة البحث عن الخصومات القابلة للإلغاء لنوع اشتراك كامل ---
+async def find_lapsable_user_discounts_for_type(connection, telegram_id: int, subscription_type_id: int) -> list[dict]:
+    """
+    Finds ALL active user discounts for a given subscription type that should be lost on lapse.
+    Returns a list of user_discount records.
+    """
+    user_id = await connection.fetchval("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
+    if not user_id:
+        return []
+
+    # هذا الاستعلام يربط user_discounts بالخطط، ثم بالأنواع، ثم بالخصومات الأصلية
+    query = """
+        SELECT ud.id
+        FROM user_discounts ud
+        JOIN subscription_plans sp ON ud.subscription_plan_id = sp.id
+        JOIN discounts d ON ud.discount_id = d.id
+        WHERE ud.user_id = $1
+          AND sp.subscription_type_id = $2
+          AND ud.is_active = true
+          AND d.lose_on_lapse = true;
+    """
+    return await connection.fetch(query, user_id, subscription_type_id)
+
+# --- ⭐ 2. تعديل: دالة إلغاء مجموعة من الخصومات ---
+async def deactivate_multiple_user_discounts(connection, user_discount_ids: list[int]) -> int:
+    """
+    Deactivates a list of user discounts by their IDs.
+    Returns the number of deactivated discounts.
+    """
+    if not user_discount_ids:
+        return 0
+    try:
+        # استخدام ANY($1) للعمل مع قائمة من الـ IDs
+        result = await connection.execute(
+            "UPDATE user_discounts SET is_active = false WHERE id = ANY($1) AND is_active = true",
+            user_discount_ids
+        )
+        # استخراج عدد الصفوف المحدثة من نتيجة التنفيذ
+        count_str = result.split(" ")[1]
+        deactivated_count = int(count_str)
+        logging.info(f"✅ Successfully deactivated {deactivated_count} user discounts.")
+        return deactivated_count
+    except Exception as e:
+        logging.error(f"❌ Error deactivating user discounts for IDs {user_discount_ids}: {e}", exc_info=True)
+        return 0
+
+
+
 
 # ----------------- 🔹 إدارة المهام المجدولة ----------------- #
 
-async def add_scheduled_task(connection, task_type: str, telegram_id: int, channel_id: int, execute_at: datetime,
+async def add_scheduled_task(connection, task_type: str, telegram_id: int, execute_at: datetime,
+                             channel_id: Optional[int] = None, payload: Optional[dict[str, any]] = None,
                              clean_up: bool = True):
     try:
-        # تحويل execute_at إلى توقيت UTC إذا كان naive
         if execute_at.tzinfo is None:
             execute_at = execute_at.replace(tzinfo=timezone.utc)
         else:
             execute_at = execute_at.astimezone(timezone.utc)
 
-        if clean_up:
+        if clean_up and channel_id: # التنظيف لا يزال يعتمد على القناة
             await connection.execute("""
                 DELETE FROM scheduled_tasks
                 WHERE telegram_id = $1 AND channel_id = $2 AND task_type = $3
             """, telegram_id, channel_id, task_type)
 
         await connection.execute("""
-            INSERT INTO scheduled_tasks (task_type, telegram_id, channel_id, execute_at, status)
-            VALUES ($1, $2, $3, $4, 'pending')
-        """, task_type, telegram_id, channel_id, execute_at)
+            INSERT INTO scheduled_tasks (task_type, telegram_id, channel_id, execute_at, status, payload)
+            VALUES ($1, $2, $3, $4, 'pending', $5)
+        """, task_type, telegram_id, channel_id, execute_at, payload)
 
-        logging.info(f"✅ Scheduled task '{task_type}' for user {telegram_id} and channel {channel_id} at {execute_at}.")
+        logging.info(f"✅ Scheduled task '{task_type}' for user {telegram_id} at {execute_at} with payload {payload}.")
         return True
     except Exception as e:
-        logging.error(
-            f"❌ Error adding scheduled task '{task_type}' for user {telegram_id} and channel {channel_id}: {e}")
+        logging.error(f"❌ Error adding scheduled task '{task_type}' for user {telegram_id}: {e}")
         return False
 
 async def get_pending_tasks(connection, channel_id: int = None):
@@ -516,6 +597,19 @@ async def delete_scheduled_tasks_for_subscription(
         logging.error(f"❌ Error deleting scheduled tasks for user {telegram_id}, channels {channel_ids}: {e}",
                       exc_info=True)
         return False
+
+async def get_failed_payment_for_retry(connection, payment_id: int):
+    """
+    Fetches a failed payment record with all necessary data for a renewal retry.
+    """
+    query = """
+        SELECT 
+            id, user_id, subscription_plan_id, amount, status, tx_hash, 
+            telegram_id, payment_token, amount_received
+        FROM payments
+        WHERE id = $1 AND status = 'failed'
+    """
+    return await connection.fetchrow(query, payment_id)
 
 
 async def update_task_status(connection, task_id: int, status: str):

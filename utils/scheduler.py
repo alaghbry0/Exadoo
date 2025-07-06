@@ -10,7 +10,10 @@ from database.db_queries import (
     get_pending_tasks,
     update_task_status,
     get_subscription,
-    deactivate_subscription
+    deactivate_subscription,
+    add_scheduled_task,
+    find_lapsable_user_discounts_for_type,
+    deactivate_multiple_user_discounts
 )
 
 
@@ -53,14 +56,16 @@ async def execute_scheduled_tasks(bot: Bot, connection):
 
                 # ✅ الآن استخدام `bot` الذي تم تمريره للدالة آمن وصحيح
                 if task_type == "remove_user":
-                    # أنت لم تضع دالة handle_remove_user_task، لكني أفترض أنها تحتاج bot
-                    # تأكد من أن تعريفها يقبل bot أيضاً
                     await handle_remove_user_task(bot, connection, telegram_id, channel_id, task_id)
+
+                    # --- ⭐ إضافة معالجة نوع المهمة الجديد ⭐ ---
+                elif task_type == "deactivate_discount_grace_period":
+                    await handle_deactivate_discount_task(bot, connection, task)
+
                 elif task_type in ["first_reminder", "second_reminder"]:
-                    # نفس الملاحظة هنا
                     await handle_reminder_task(bot, connection, telegram_id, task_type, task_id, channel_id)
                 else:
-                    logging.warning(f"⚠️ نوع المهمة غير معروف: {task_type}. تجاهل المهمة.")
+                    logging.warning(f"⚠️ Unknown task type: {task_type}. Skipping.")
 
             except Exception as task_error:
                 logging.error(f"❌ خطأ أثناء تنفيذ المهمة {task_id}: {task_error}")
@@ -74,32 +79,114 @@ async def execute_scheduled_tasks(bot: Bot, connection):
 
 # ----------------- 🔹 معالجة مهمة إزالة المستخدم ----------------- #
 
-async def handle_remove_user_task(bot: Bot, connection, telegram_id, channel_id, task_id):
-    """
-    إزالة المستخدم من القناة بعد انتهاء الاشتراك.
-    """
-    try:
-        logging.info(f"🛠️ محاولة إزالة المستخدم {telegram_id} من القناة {channel_id}.")
 
-        # تعطيل الاشتراك في قاعدة البيانات
-        deactivated = await deactivate_subscription(connection, telegram_id, channel_id)
-        if not deactivated:
-            logging.warning(f"⚠️ فشل تعطيل اشتراك المستخدم {telegram_id}.")
-            await update_task_status(connection, task_id, "failed")
+# --- ⭐ تعديل دالة إزالة المستخدم ---
+async def handle_remove_user_task(bot: Bot, connection, telegram_id, channel_id, task_id):
+    try:
+        current_sub = await get_subscription(connection, telegram_id, channel_id)
+        if not current_sub or current_sub['is_active']:
+            status_reason = "active subscription" if current_sub else "no subscription record"
+            logging.info(f"✅ Skipping removal task {task_id} for user {telegram_id}. Reason: {status_reason}.")
+            await update_task_status(connection, task_id, "completed")
             return
 
-        # إزالة المستخدم من القناة
+        logging.info(f"🛠️ Proceeding with removal for user {telegram_id}. Subscription is confirmed inactive.")
+
+        # --- ⭐⭐⭐ المنطق الجديد للتعامل مع الخصومات على مستوى النوع ⭐⭐⭐ ---
+        if current_sub.get('is_main_channel_subscription'):
+            sub_type_id = current_sub.get('subscription_type_id')
+            if sub_type_id:
+                # 1. ابحث عن كل الخصومات القابلة للإلغاء لهذا النوع
+                lapsable_discounts = await find_lapsable_user_discounts_for_type(connection, telegram_id, sub_type_id)
+
+                if lapsable_discounts:
+                    discount_ids = [d['id'] for d in lapsable_discounts]
+                    logging.info(
+                        f"User {telegram_id} has {len(discount_ids)} lapsable discounts. Scheduling deactivation.")
+
+                    # 2. أرسل رسالة تحذيرية واحدة
+                    try:
+                        await send_message_to_user(
+                            bot,
+                            telegram_id,
+                            "🔔 تنبيه هام!\n\n"
+                            "لقد انتهى اشتراكك. لديك خصومات خاصة مرتبطة بهذا النوع من الاشتراك. "
+                            "إذا لم تقم بالتجديد خلال 48 ساعة، ستفقد هذه الخصومات بشكل دائم."
+                        )
+                    except Exception as msg_err:
+                        logging.error(f"Could not send discount warning message to {telegram_id}: {msg_err}")
+
+                    # 3. قم بجدولة مهمة الإلغاء مع قائمة الـ IDs ونوع الاشتراك
+                    deactivation_time = datetime.now(timezone.utc) + timedelta(hours=48)
+                    await add_scheduled_task(
+                        connection=connection,
+                        task_type="deactivate_discount_grace_period",
+                        telegram_id=telegram_id,
+                        execute_at=deactivation_time,
+                        payload={'subscription_type_id': sub_type_id, 'user_discount_ids': discount_ids},
+                        clean_up=False
+                    )
+        # --- نهاية المنطق الجديد ---
+
         removal_success = await remove_user_from_channel(bot, connection, telegram_id, channel_id)
         if removal_success:
-            logging.info(f"✅ تمت إزالة المستخدم {telegram_id} بنجاح.")
-        else:
-            logging.warning(f"⚠️ فشل إزالة المستخدم {telegram_id} من القناة {channel_id}.")
+            logging.info(f"✅ Successfully removed user {telegram_id} from channel {channel_id}.")
 
-        # تحديث حالة المهمة
         await update_task_status(connection, task_id, "completed")
-
     except Exception as e:
-        logging.error(f"❌ خطأ أثناء إزالة المستخدم {telegram_id}: {e}")
+        logging.error(f"❌ Error during remove user task for {telegram_id}: {e}", exc_info=True)
+        await update_task_status(connection, task_id, "failed")
+
+
+# --- ⭐ تعديل دالة معالجة مهمة إلغاء الخصم ---
+async def handle_deactivate_discount_task(bot: Bot, connection, task: dict):
+    task_id = task['id']
+    telegram_id = task['telegram_id']
+    payload = task.get('payload')
+
+    # التحقق من البيانات الجديدة في الـ payload
+    if not payload or 'subscription_type_id' not in payload or 'user_discount_ids' not in payload:
+        logging.error(f"Task {task_id} (deactivate_discount) is missing required payload. Marking as failed.")
+        await update_task_status(connection, task_id, "failed")
+        return
+
+    sub_type_id = payload['subscription_type_id']
+    user_discount_ids = payload['user_discount_ids']
+
+    try:
+        # ⭐ التحقق الذكي: هل جدد المستخدم اشتراكه في نفس النوع؟
+        has_renewed = await has_active_subscription_for_type(connection, telegram_id, sub_type_id)
+
+        if has_renewed:
+            logging.info(
+                f"User {telegram_id} has renewed subscription for type {sub_type_id}. Skipping deactivation of discounts.")
+        else:
+            logging.info(
+                f"User {telegram_id} did not renew for type {sub_type_id}. Deactivating {len(user_discount_ids)} discounts.")
+            deactivated_count = await deactivate_multiple_user_discounts(connection, user_discount_ids)
+            if deactivated_count > 0:
+                try:
+                    await send_message_to_user(bot, telegram_id,
+                                               "لقد فقدت خصوماتك الخاصة لعدم تجديد اشتراكك في الوقت المحدد.")
+                except Exception as msg_err:
+                    logging.error(f"Could not send final discount loss message to {telegram_id}: {msg_err}")
+
+        await update_task_status(connection, task_id, "completed")
+    except Exception as e:
+        logging.error(f"❌ Error during deactivate discount task {task_id} for user {telegram_id}: {e}", exc_info=True)
+        await update_task_status(connection, task_id, "failed")
+
+
+# --- ⭐ 3. تعديل: دالة التحقق من التجديد لنوع اشتراك كامل ---
+async def has_active_subscription_for_type(connection, telegram_id: int, subscription_type_id: int) -> bool:
+    """
+    Checks if a user has ANY active subscription for a specific subscription type.
+    """
+    return await connection.fetchval("""
+        SELECT 1 FROM subscriptions 
+        WHERE telegram_id = $1 AND subscription_type_id = $2 AND is_active = true
+        LIMIT 1;
+    """, telegram_id, subscription_type_id) is not None
 
 
 # ----------------- 🔹 معالجة مهمة التذكير ----------------- #

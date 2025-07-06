@@ -8,6 +8,7 @@ from config import DATABASE_CONFIG, SECRET_KEY
 from auth import get_current_user
 from datetime import datetime, timezone, timedelta
 import pytz
+from decimal import Decimal
 from dataclasses import asdict
 from functools import wraps
 import jwt
@@ -15,19 +16,23 @@ from imagekitio import ImageKit
 from utils.permissions import permission_required, owner_required, log_action
 import asyncpg
 import asyncio
-from utils.notifications import create_notification
-from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user, generate_shared_invite_link_for_channel, remove_user_from_channel
 import io
 import pandas as pd
+from routes.subscriptions import process_subscription_renewal, _activate_or_renew_subscription_core
+from utils.notifications import create_notification
+from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user, generate_shared_invite_link_for_channel, remove_user_from_channel
 from database.db_queries import (
     add_user,
     add_subscription,
     add_scheduled_task,
     cancel_subscription_db,
-    delete_scheduled_tasks_for_subscription
+    delete_scheduled_tasks_for_subscription,
+    get_failed_payment_for_retry
 )
 from database.db_queries import update_subscription as update_subscription_db
 from utils.messaging_batch import FailedSendDetail
+from utils.discount_utils import calculate_discounted_price
+
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
@@ -359,6 +364,7 @@ async def get_user_details(telegram_id):
                 return jsonify({"error": "User not found"}), 404
 
             user_result = dict(user_data)
+            user_id = user_result['id'] # <-- استخلاص user_id للاستعلامات التالية
 
             # جلب الاشتراكات
             subscriptions_query = """
@@ -403,6 +409,28 @@ async def get_user_details(telegram_id):
             """
             recent_payments = await conn.fetch(recent_payments_query, telegram_id)
             user_result["recent_payments"] = [dict(row) for row in recent_payments]
+
+            # --- ⭐ بداية الإضافة المطلوبة: جلب الخصومات النشطة للمستخدم ⭐ ---
+            discounts_query = """
+                SELECT 
+                    ud.id,
+                    ud.locked_price,
+                    ud.granted_at,
+                    ud.is_active,
+                    d.name as discount_name,
+                    d.discount_type,
+                    d.discount_value,
+                    sp.name as plan_name,
+                    sp.price as original_plan_price
+                FROM user_discounts ud
+                JOIN discounts d ON ud.discount_id = d.id
+                JOIN subscription_plans sp ON ud.subscription_plan_id = sp.id
+                WHERE ud.user_id = $1 AND ud.is_active = true
+                ORDER BY ud.granted_at DESC;
+            """
+            user_discounts = await conn.fetch(discounts_query, user_id)
+            user_result["active_discounts"] = [dict(row) for row in user_discounts]
+            # --- ⭐ نهاية الإضافة المطلوبة ⭐ ---
 
             return jsonify(user_result)
 
@@ -1593,6 +1621,294 @@ async def get_subscription_plan(plan_id: int):
         logging.error("Error fetching subscription plan: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+#######################################
+# نقاط API لإدارة الخصومات (Discounts)
+#######################################
+
+# 1. إنشاء خصم جديد
+@admin_routes.route("/discounts", methods=["POST"])
+@permission_required("discounts.create")
+async def create_discount():
+    try:
+        data = await request.get_json()
+
+        # التحقق من البيانات الإلزامية
+        required_fields = ["name", "discount_type", "discount_value", "target_audience"]
+        if not all(field in data for field in required_fields):
+            return jsonify({"error": "Missing required fields"}), 400
+
+        # --- ⭐ التصحيح هنا ⭐ ---
+        # تحويل التواريخ من نص إلى كائنات تاريخ إذا كانت موجودة
+        start_date = datetime.fromisoformat(data["start_date"]) if data.get("start_date") else None
+        end_date = datetime.fromisoformat(data["end_date"]) if data.get("end_date") else None
+
+        query = """
+            INSERT INTO discounts (
+                name, description, discount_type, discount_value, 
+                applicable_to_subscription_type_id, applicable_to_subscription_plan_id,
+                start_date, end_date, is_active, lock_in_price, lose_on_lapse, target_audience
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING *;
+        """
+        async with current_app.db_pool.acquire() as connection:
+            new_discount = await connection.fetchrow(
+                query,
+                data["name"],
+                data.get("description"),
+                data["discount_type"],
+                Decimal(data["discount_value"]),
+                data.get("applicable_to_subscription_type_id"),
+                data.get("applicable_to_subscription_plan_id"),
+                start_date,
+                end_date,
+                data.get("is_active", True),
+                data.get("lock_in_price", False),
+                data.get("lose_on_lapse", False),
+                data["target_audience"]
+            )
+
+        return jsonify(dict(new_discount)), 201
+
+    except Exception as e:
+        logging.error(f"Error creating discount: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# 2. جلب كل الخصومات
+# 2. جلب كل الخصومات (النسخة المحدثة)
+@admin_routes.route("/discounts", methods=["GET"])
+@permission_required("discounts.read")
+async def get_discounts():
+    try:
+        # استعلام يدمج الخصومات مع إحصائياتها (بمنطق محدث)
+        query = """
+            SELECT 
+                d.*,
+                -- 1. عدد المستخدمين الذين يملكون هذا الخصم حالياً (لا تغيير هنا)
+                (SELECT COUNT(*) 
+                 FROM user_discounts ud 
+                 WHERE ud.discount_id = d.id AND ud.is_active = true) as active_holders_count,
+
+                -- 2. عدد المستخدمين المحتملين الذين سيطبق عليهم الخصم (إذا كان من نوع existing_subscribers)
+                -- ⭐⭐⭐ هنا التعديل الرئيسي ⭐⭐⭐
+                (CASE
+                    WHEN d.target_audience = 'existing_subscribers' THEN
+                        (SELECT COUNT(DISTINCT s.user_id) 
+                         FROM subscriptions s
+                         WHERE s.is_active = true
+                           -- الشرط الأول: إذا كان الخصم يستهدف خطة معينة، نطابق الـ plan_id
+                           AND (d.applicable_to_subscription_plan_id IS NOT NULL AND s.subscription_plan_id = d.applicable_to_subscription_plan_id)
+                           -- الشرط الثاني: أو إذا كان الخصم يستهدف نوعاً (ولم يحدد خطة)، نطابق الـ type_id
+                           OR (d.applicable_to_subscription_plan_id IS NULL AND d.applicable_to_subscription_type_id IS NOT NULL AND s.subscription_type_id = d.applicable_to_subscription_type_id)
+                        )
+                    -- إذا لم يكن الخصم من نوع 'existing_subscribers'، فالعدد صفر
+                    ELSE 0
+                END) as potential_recipients_count
+            FROM 
+                discounts d
+            ORDER BY 
+                d.created_at DESC;
+        """
+        async with current_app.db_pool.acquire() as connection:
+            results = await connection.fetch(query)
+
+        discounts = [dict(r) for r in results]
+        return jsonify(discounts), 200
+
+    except Exception as e:
+        logging.error(f"Error fetching discounts with stats: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+# 3. تعديل خصم
+@admin_routes.route("/discounts/<int:discount_id>", methods=["PUT"])
+@permission_required("discounts.update")
+async def update_discount(discount_id: int):
+    try:
+        data = await request.get_json()
+
+        # --- ⭐ التصحيح هنا ⭐ ---
+        start_date = datetime.fromisoformat(data["start_date"]) if data.get("start_date") else None
+        end_date = datetime.fromisoformat(data["end_date"]) if data.get("end_date") else None
+
+        query = """
+            UPDATE discounts SET
+                name = COALESCE($1, name),
+                description = COALESCE($2, description),
+                discount_type = COALESCE($3, discount_type),
+                discount_value = COALESCE($4, discount_value),
+                applicable_to_subscription_type_id = COALESCE($5, applicable_to_subscription_type_id),
+                applicable_to_subscription_plan_id = COALESCE($6, applicable_to_subscription_plan_id),
+                start_date = COALESCE($7, start_date),
+                end_date = COALESCE($8, end_date),
+                is_active = COALESCE($9, is_active),
+                lock_in_price = COALESCE($10, lock_in_price),
+                lose_on_lapse = COALESCE($11, lose_on_lapse),
+                target_audience = COALESCE($12, target_audience)
+            WHERE id = $13
+            RETURNING *;
+        """
+        async with current_app.db_pool.acquire() as connection:
+            updated_discount = await connection.fetchrow(
+                query,
+                data.get("name"), data.get("description"), data.get("discount_type"),
+                Decimal(data["discount_value"]) if "discount_value" in data else None,
+                data.get("applicable_to_subscription_type_id"),
+                data.get("applicable_to_subscription_plan_id"),
+                start_date, end_date, data.get("is_active"),
+                data.get("lock_in_price"), data.get("lose_on_lapse"), data.get("target_audience"),
+                discount_id
+            )
+
+        if updated_discount:
+            return jsonify(dict(updated_discount)), 200
+        else:
+            return jsonify({"error": "Discount not found"}), 404
+
+    except Exception as e:
+        logging.error(f"Error updating discount {discount_id}: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+# 4. تطبيق خصم على المشتركين الحاليين (النقطة المهمة)
+@admin_routes.route("/discounts/<int:discount_id>/apply-to-existing", methods=["POST"])
+@permission_required("discounts.apply")
+async def apply_discount_to_existing_users(discount_id: int):
+    try:
+        async with current_app.db_pool.acquire() as connection:
+            async with connection.transaction():
+                # الخطوة 1: جلب تفاصيل الخصم
+                discount = await connection.fetchrow("SELECT * FROM discounts WHERE id = $1", discount_id)
+                if not discount:
+                    return jsonify({"error": "Discount not found"}), 404
+
+                # --- ⭐ تعديل المنطق هنا ⭐ ---
+                # يجب أن يكون الخصم مرتبطاً إما بنوع أو بخطة لتحديد الجمهور
+                if not discount['applicable_to_subscription_type_id'] and not discount[
+                    'applicable_to_subscription_plan_id']:
+                    return jsonify({
+                        "error": "Discount must be applicable to a specific subscription type or plan to use this feature."
+                    }), 400
+
+                # الخطوة 2: جلب كل المستخدمين النشطين في الهدف (نوع أو خطة)
+                # تم تعديل الاستعلام ليكون أكثر مرونة
+                target_users_query = """
+                    SELECT s.user_id, sp.id as plan_id, sp.price as plan_price
+                    FROM subscriptions s
+                    JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
+                    WHERE s.is_active = true
+                      AND s.user_id IS NOT NULL
+                      -- إذا تم تحديد الخطة، فاستهدفها مباشرة
+                      AND ($1::int IS NULL OR sp.id = $1)
+                      -- إذا لم تحدد الخطة، فاستهدف النوع
+                      AND ($2::int IS NULL OR s.subscription_type_id = $2);
+                """
+                target_users = await connection.fetch(
+                    target_users_query,
+                    discount['applicable_to_subscription_plan_id'],
+                    discount['applicable_to_subscription_type_id']
+                )
+
+                if not target_users:
+                    return jsonify({"message": "No active subscribers found for the target subscription type.",
+                                    "applied_count": 0}), 200
+
+                # الخطوة 3: حساب السعر الجديد وإضافته لكل مستخدم في user_discounts
+                applied_count = 0
+                for user_record in target_users:
+                    locked_price = calculate_discounted_price(
+                        user_record['plan_price'],
+                        discount['discount_type'],
+                        discount['discount_value']
+                    )
+
+                    # إضافة أو تحديث الخصم للمستخدم. ON CONFLICT يضمن عدم حدوث أخطاء إذا كان للمستخدم خصم فعال بالفعل على نفس الخطة
+                    insert_query = """
+                        INSERT INTO user_discounts (user_id, discount_id, subscription_plan_id, locked_price, is_active)
+                        VALUES ($1, $2, $3, $4, true)
+                        ON CONFLICT (user_id, subscription_plan_id, is_active)
+                        DO UPDATE SET
+                            discount_id = EXCLUDED.discount_id,
+                            locked_price = EXCLUDED.locked_price,
+                            granted_at = NOW();
+                    """
+                    await connection.execute(
+                        insert_query,
+                        user_record['user_id'],
+                        discount_id,
+                        user_record['plan_id'],
+                        locked_price
+                    )
+                    applied_count += 1
+
+                logging.info(f"Applied discount {discount_id} to {applied_count} existing users.")
+                return jsonify({
+                    "message": f"Successfully applied discount to {applied_count} users.",
+                    "applied_count": applied_count
+                }), 200
+
+    except Exception as e:
+        logging.error(f"Error applying discount {discount_id} to existing users: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+
+@admin_routes.route("/users/<int:telegram_id>/discounts", methods=["POST"])
+@permission_required("discounts.apply")  # استخدم صلاحية مناسبة
+async def add_discount_to_user(telegram_id):
+    try:
+        data = await request.get_json()
+        discount_id = data.get("discount_id")
+        plan_id = data.get("plan_id")
+
+        if not discount_id or not plan_id:
+            return jsonify({"error": "discount_id and plan_id are required"}), 400
+
+        async with current_app.db_pool.acquire() as conn:
+            async with conn.transaction():
+                # جلب بيانات المستخدم، الخصم، والخطة
+                user = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
+                if not user:
+                    return jsonify({"error": "User not found"}), 404
+
+                discount = await conn.fetchrow("SELECT * FROM discounts WHERE id = $1", discount_id)
+                if not discount:
+                    return jsonify({"error": "Discount not found"}), 404
+
+                plan = await conn.fetchrow("SELECT price FROM subscription_plans WHERE id = $1", plan_id)
+                if not plan:
+                    return jsonify({"error": "Plan not found"}), 404
+
+                # حساب السعر الجديد
+                locked_price = calculate_discounted_price(
+                    plan['price'],
+                    discount['discount_type'],
+                    discount['discount_value']
+                )
+
+                # إضافة أو تحديث الخصم للمستخدم
+                insert_query = """
+                    INSERT INTO user_discounts (user_id, discount_id, subscription_plan_id, locked_price, is_active)
+                    VALUES ($1, $2, $3, $4, true)
+                    ON CONFLICT (user_id, subscription_plan_id, is_active) DO UPDATE 
+                    SET 
+                        discount_id = EXCLUDED.discount_id,
+                        locked_price = EXCLUDED.locked_price,
+                        granted_at = NOW()
+                    RETURNING *;
+                """
+                new_user_discount = await conn.fetchrow(
+                    insert_query,
+                    user['id'],
+                    discount_id,
+                    plan_id,
+                    locked_price
+                )
+
+        return jsonify(dict(new_user_discount)), 201
+
+    except Exception as e:
+        logging.error(f"Error adding discount to user {telegram_id}: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
 
 # routes/admin_routes.py
 
@@ -2348,6 +2664,66 @@ async def get_payments_meta():
         logging.error(f"Error fetching payments metadata: {e}", exc_info=True)
         return jsonify({"error": "Failed to fetch filter metadata"}), 500
 
+
+@admin_routes.route("/payments/<int:payment_id>/retry-renewal", methods=["POST"])
+@permission_required("payments.read_all")  # أو صلاحية مناسبة أخرى
+async def retry_failed_payment_renewal(payment_id: int):
+    """
+    Attempts to re-process a failed subscription renewal.
+    """
+    async with current_app.db_pool.acquire() as connection:
+        try:
+            # الخطوة 1: جلب بيانات الدفعة الفاشلة
+            payment_data_to_retry = await get_failed_payment_for_retry(connection, payment_id)
+
+            if not payment_data_to_retry:
+                return jsonify({
+                    "error": "Payment not found or is not in a 'failed' state."
+                }), 404
+
+            logging.info(f"Manual retry initiated for failed payment ID: {payment_id}")
+
+            # الخطوة 2: التأكد من وجود كائن البوت
+            bot = current_app.bot
+            if not bot:
+                logging.error(f"Cannot retry payment {payment_id}: Bot object not available.")
+                return jsonify({"error": "Bot service is not available on the server."}), 503
+
+            # الخطوة 3: إعادة تعيين الحالة إلى "قيد الانتظار" قبل البدء
+            # هذا يمنع المحاولات المتزامنة ويعطي مؤشرًا بصريًا في الواجهة
+            await connection.execute(
+                "UPDATE payments SET status = 'pending', error_message = $1 WHERE id = $2",
+                f"Manual retry initiated at {datetime.now(timezone.utc).isoformat()}",
+                payment_id
+            )
+
+            # الخطوة 4: استدعاء دالة التجديد الحالية (هي بالفعل تقوم بالعمل الشاق)
+            # نحن نمرر البيانات التي جلبناها من قاعدة البيانات
+            # نستخدم asyncio.create_task لتشغيلها في الخلفية حتى لا ينتظر المشرف
+            async def run_renewal():
+                async with current_app.db_pool.acquire() as conn_for_task:
+                    await process_subscription_renewal(
+                        connection=conn_for_task,
+                        bot=bot,
+                        payment_data=dict(payment_data_to_retry)  # تحويل السجل إلى قاموس
+                    )
+
+            asyncio.create_task(run_renewal())
+
+            return jsonify({
+                "message": f"Renewal process for payment {payment_id} has been re-initiated. Please refresh the page in a moment to see the new status."
+            }), 202  # 202 Accepted تعني أن الطلب قُبل للمعالجة
+
+        except Exception as e:
+            logging.error(f"Error initiating retry for payment {payment_id}: {e}", exc_info=True)
+            # إذا فشلت العملية، أرجع الحالة إلى "فاشلة" مع رسالة خطأ جديدة
+            await connection.execute(
+                "UPDATE payments SET status = 'failed', error_message = $1 WHERE id = $2",
+                f"Failed to initiate retry: {str(e)}",
+                payment_id
+            )
+            return jsonify({"error": "An internal error occurred while trying to start the retry process."}), 500
+
 @admin_routes.route("/incoming-transactions", methods=["GET"])
 @permission_required("payments.read_incoming_transactions")
 async def get_incoming_transactions():
@@ -2575,7 +2951,6 @@ async def add_subscription_admin():
         subscription_type_id_str = data.get("subscription_type_id")
         full_name = data.get("full_name")
         username = data.get("username")
-        # [تعديل 1]: استقبال payment_token الاختياري
         payment_token = data.get("payment_token")
 
         if not all([telegram_id_str, subscription_type_id_str, days_to_add_str]):
@@ -2585,167 +2960,94 @@ async def add_subscription_admin():
             telegram_id = int(telegram_id_str)
             days_to_add = int(days_to_add_str)
             subscription_type_id = int(subscription_type_id_str)
-            if days_to_add <= 0:
-                raise ValueError("days_to_add must be a positive integer")
         except (ValueError, TypeError):
-            return jsonify({"error": "Invalid data type or value for required fields"}), 400
+            return jsonify({"error": "Invalid data type for required fields"}), 400
 
         db_pool = getattr(current_app, "db_pool", None)
-        telegram_bot = getattr(current_app, "bot", None)
-        if not db_pool or not telegram_bot:
-            logging.critical("❌ App context is missing db_pool or bot!")
+        bot = getattr(current_app, "bot", None)
+        if not db_pool or not bot:
             return jsonify({"error": "Internal Server Error - App not configured"}), 500
 
         async with db_pool.acquire() as connection:
-            # [تعديل 2]: التعامل مع transaction لضمان سلامة البيانات
             async with connection.transaction():
-                payment_id_from_record = None
-                # [تعديل 3]: البحث عن الدفعة وتحديثها إذا تم توفير payment_token
+                # --- منطق خاص بالإضافة الإدارية ---
+                tx_hash = None
+                subscription_plan_id = None
+                amount_received = None
+                plan_name = "اشتراك إداري"  # اسم افتراضي
+                source = "admin_manual"
+
                 if payment_token:
-                    # [تعديل هنا]: تم حذف "payment_id" من استعلام SELECT
+                    # ⭐ طلبك: استخراج البيانات من جدول المدفوعات
                     payment_record = await connection.fetchrow(
-                        "SELECT id, status FROM payments WHERE payment_token = $1",
+                        "SELECT id, status, tx_hash, subscription_plan_id, amount_received FROM payments WHERE payment_token = $1",
                         payment_token
                     )
                     if not payment_record:
-                        return jsonify({"error": f"Payment with token '{payment_token}' not found."}), 404
-
+                        raise ValueError(f"Payment with token '{payment_token}' not found.")
                     if payment_record['status'] == 'completed':
-                        return jsonify({
-                                           "error": f"Payment with token '{payment_token}' has already been processed and is completed."}), 409
+                        raise ValueError(f"Payment with token '{payment_token}' is already completed.")
 
+                    # تحديث حالة الدفعة
                     await connection.execute(
                         "UPDATE payments SET status = 'completed', updated_at = NOW() WHERE payment_token = $1",
                         payment_token
                     )
+                    logging.info(f"ADMIN: Marked payment_token {payment_token} as 'completed'.")
 
-                    logging.info(f"ADMIN: Marked payment_token {payment_token} as 'completed' for manual subscription.")
+                    # تعيين المتغيرات من الدفعة
+                    tx_hash = payment_record['tx_hash']
+                    subscription_plan_id = payment_record['subscription_plan_id']
+                    amount_received = payment_record['amount_received']
+                    source = "admin_manual_payment"
 
-                # جلب بيانات المستخدم ونوع الاشتراك والقنوات
-                await add_user(connection, telegram_id, username=username, full_name=full_name)
-                user_info = await connection.fetchrow("SELECT username, full_name FROM users WHERE telegram_id = $1", telegram_id)
-                greeting_name = user_info.get('full_name') or user_info.get('username') or str(telegram_id)
+                    # جلب اسم الخطة
+                    plan_name_record = await connection.fetchval("SELECT name FROM subscription_plans WHERE id = $1",
+                                                                 subscription_plan_id)
+                    if plan_name_record:
+                        plan_name = plan_name_record
 
-                type_info = await connection.fetchrow("SELECT name FROM subscription_types WHERE id = $1", subscription_type_id)
-                if not type_info:
-                    return jsonify({"error": "Invalid subscription_type_id"}), 404
-                subscription_type_name = type_info['name']
-
-                all_channels = await connection.fetch("SELECT channel_id, channel_name, is_main, invite_link FROM subscription_type_channels WHERE subscription_type_id = $1 ORDER BY is_main DESC", subscription_type_id)
-                if not all_channels:
-                    return jsonify({"error": "This subscription type has no channels configured."}), 400
-                main_channel_data = next((ch for ch in all_channels if ch['is_main']), None)
-                if not main_channel_data or not main_channel_data.get('invite_link'):
-                    return jsonify({"error": "Main channel or its invite link is not configured for this subscription type."}), 500
-                main_channel_id = main_channel_data['channel_id']
-                main_invite_link = main_channel_data['invite_link']
-
-                # [تعديل 4]: تغيير مصدر الاشتراك بناءً على وجود payment_token
-                source = "admin_manual_payment" if payment_token else "admin_manual"
-
-                current_time_utc = datetime.now(timezone.utc)
-                start_date, expiry_date = await _calculate_admin_subscription_dates(connection, telegram_id, main_channel_id, days_to_add, current_time_utc)
-
-                existing_sub = await connection.fetchrow("SELECT id FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2", telegram_id, main_channel_id)
-                action_type = 'ADMIN_RENEWAL' if existing_sub else 'ADMIN_NEW'
-                main_subscription_id = None
-
-                if existing_sub:
-                    await update_subscription_db(connection, telegram_id, main_channel_id, subscription_type_id,
-                                                 expiry_date, start_date, True,
-                                                 payment_id=payment_id_from_record, source=source, payment_token=payment_token)
-                    main_subscription_id = existing_sub['id']
-                else:
-                    main_subscription_id = await add_subscription(
-                        connection, telegram_id, main_channel_id, subscription_type_id,
-                        start_date, expiry_date, True,
-                        payment_id=payment_id_from_record, source=source, payment_token=payment_token, returning_id=True
-                    )
-
-                if not main_subscription_id:
-                    raise Exception("Failed to create or update main subscription record.") # سيتم التراجع عن الـ transaction
-
-                logging.info(f"ADMIN: Main subscription {action_type} for user {telegram_id}, expiry {expiry_date}")
-
-                # معالجة القنوات الفرعية وجمع البيانات للتاريخ
-                secondary_channels_data = []
-                secondary_links_to_send = []
-                for channel in all_channels:
-                    if not channel['is_main']:
-                        if channel.get('invite_link'):
-                            secondary_links_to_send.append(f"▫️ قناة <a href='{channel['invite_link']}'>{channel['channel_name']}</a>")
-                            secondary_channels_data.append({"name": channel['channel_name'], "id": channel['channel_id']})
-                            await add_scheduled_task(connection, "remove_user", telegram_id, channel['channel_id'], expiry_date, clean_up=True)
-                        else:
-                            logging.warning(f"ADMIN: Skipping secondary channel {channel['channel_id']} for user {telegram_id} due to missing invite link.")
-
-                # [تعديل 5]: تسجيل البيانات الصحيحة في `subscription_history`
-                extra_data_payload = {"added_by_admin": True, "days_added": days_to_add}
-                if payment_token:
-                    extra_data_payload["linked_payment_token"] = payment_token
-                extra_data = json.dumps(extra_data_payload)
-                secondary_channels_json = json.dumps(secondary_channels_data)
-
-                history_record = await connection.fetchrow(
-                    """INSERT INTO subscription_history
-                       (subscription_id, action_type, subscription_type_name, subscription_plan_name,
-                        renewal_date, expiry_date, telegram_id, extra_data, source, invite_link,
-                        secondary_channels, payment_id, payment_token)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id""",
-                    main_subscription_id, action_type, subscription_type_name, "اشتراك إداري",
-                    start_date, expiry_date, telegram_id, extra_data, source, main_invite_link,
-                    secondary_channels_json, payment_id_from_record, payment_token
+                # استدعاء الدالة الجوهرية
+                success, message, result_data = await _activate_or_renew_subscription_core(
+                    connection=connection,
+                    bot=bot,
+                    telegram_id=telegram_id,
+                    subscription_type_id=subscription_type_id,
+                    duration_days=days_to_add,
+                    source=source,
+                    subscription_plan_id=subscription_plan_id,
+                    plan_name=plan_name,
+                    payment_token=payment_token,
+                    tx_hash=tx_hash,
+                    user_full_name=full_name,
+                    user_username=username,
+                    amount_received=amount_received
                 )
-                history_id = history_record['id'] if history_record else None
 
-            # [تعديل 6]: تخصيص رسالة الاستجابة والاشعار
-            final_expiry_local = expiry_date.astimezone(LOCAL_TZ)
-            action_verb = 'تجديد' if action_type == 'ADMIN_RENEWAL' else 'تفعيل'
-            payment_link_message = f". وتم ربطه بالدفعة (token: {payment_token})" if payment_token else ""
+                if not success:
+                    # إذا فشلت الدالة الجوهرية، أثر خطأ للتراجع عن الـ transaction
+                    raise RuntimeError(message)
 
-            notification_message = (
-                f"🎉 مرحبًا {greeting_name},\n\n"
-                f"تم {action_verb.lower()} اشتراكك في \"{subscription_type_name}\" بواسطة الإدارة{payment_link_message}.\n"
-                f"صالح حتى: {final_expiry_local.strftime('%Y-%m-%d %H:%M %Z')}.\n\n"
-                f"🔗 **للانضمام للقناة الرئيسية، استخدم هذا الرابط:**\n<a href='{main_invite_link}'>{subscription_type_name}</a>"
-            )
-
-            await create_notification(
-                connection=connection, notification_type="admin_subscription_update",
-                title=f"{action_verb} اشتراك (إدارة): {subscription_type_name}",
-                message=notification_message,
-                extra_data={"history_id": history_id, "main_invite_link": main_invite_link},
-                is_public=False, telegram_ids=[telegram_id]
-            )
-
-            if secondary_links_to_send:
-                secondary_msg = (
-                        f"📬 بالإضافة إلى اشتراكك الرئيسي، يمكنك الانضمام للقنوات الفرعية التالية:\n\n" +
-                        "\n".join(secondary_links_to_send) +
-                        "\n\n💡 اضغط على الرابط لتقديم طلب انضمام، وسيتم قبولك تلقائياً."
+                # --- بناء الاستجابة النهائية ---
+                payment_link_message = f". وتم ربطه بالدفعة (token: {payment_token})" if payment_token else ""
+                response_msg = (
+                    f"✅ تم {result_data['action_verb'].lower()} اشتراك \"{result_data['subscription_type_name']}\" بنجاح للمستخدم {telegram_id}.\n"
+                    f"ينتهي في: {result_data['new_expiry_date'].strftime('%Y-%m-%d %H:%M:%S %Z')}{payment_link_message}"
                 )
-                await send_message_to_user(telegram_bot, telegram_id, secondary_msg)
 
-            # [تعديل 7]: إرجاع استجابة ناجحة ومفصلة للأدمن
-            response_msg = (
-                f"✅ تم {action_verb.lower()} اشتراك \"{subscription_type_name}\" بنجاح للمستخدم {telegram_id}.\n"
-                f"ينتهي في: {final_expiry_local.strftime('%Y-%m-%d %H:%M:%S %Z')}{payment_link_message}"
-            )
-            return jsonify({
-                "message": response_msg,
-                "telegram_id": telegram_id,
-                "new_expiry_date": final_expiry_local.isoformat(),
-                "payment_linked": bool(payment_token)
-            }), 200
+                return jsonify({
+                    "message": response_msg,
+                    "telegram_id": telegram_id,
+                    "new_expiry_date": result_data['new_expiry_date'].isoformat(),
+                    "payment_linked": bool(payment_token)
+                }), 200
 
+    except (ValueError, RuntimeError) as e:
+        # التقاط الأخطاء التي أثرناها عمدًا (مثل not found) وإرجاعها كـ bad request
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
-        # سيتم الوصول إلى هنا إذا حدث خطأ داخل الـ transaction أو خارجه
-        logging.error(f"ADMIN: Critical error in /subscriptions (admin) endpoint: {str(e)}", exc_info=True)
-        # لا نكشف عن تفاصيل الخطأ للمستخدم النهائي
-        # إذا كان الخطأ من نوع jsonify (مثل 404 أو 409)، سيتم إرجاعه مباشرة
-        if isinstance(e, tuple) and hasattr(e[0], 'is_json'):
-             return e
-        return jsonify({"error": "An internal server error occurred. The transaction may have been rolled back."}), 500
+        logging.error(f"ADMIN: Critical error in /subscriptions (admin) endpoint: {e}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred."}), 500
 
 
 @admin_routes.route("/subscriptions/cancel", methods=["POST"])
@@ -4050,7 +4352,7 @@ async def get_messaging_batches():
 
 
 @admin_routes.route("/channels/audit/start", methods=["POST"])
-@permission_required("broadcast.read")  # أو صلاحية جديدة مثل "channel.audit"
+@permission_required("channels.audit.start")  # أو صلاحية جديدة مثل "channel.audit"
 async def start_new_channel_audit():
     """
     يبدأ مهمة فحص شاملة في الخلفية لجميع القنوات.
@@ -4072,7 +4374,7 @@ async def start_new_channel_audit():
 
 # 2. نقطة جلب حالة الفحص (مع الإحصائيات التي طلبتها)
 @admin_routes.route("/channels/audit/status/<audit_uuid>", methods=["GET"])
-@permission_required("broadcast.read")
+@permission_required("channels.audit.read")
 async def get_channel_audit_status(audit_uuid):
     """
     يجلب حالة ونتائج عملية فحص معينة، مع إحصائيات مفصلة لكل قناة.
@@ -4115,7 +4417,7 @@ async def get_channel_audit_status(audit_uuid):
 
 # 3. نقطة بداية الإزالة
 @admin_routes.route("/channels/cleanup/start", methods=["POST"])
-@permission_required("broadcast.read")  # أو صلاحية أعلى مثل "channel.cleanup"
+@permission_required("channels.cleanup.start")  # أو صلاحية أعلى مثل "channel.cleanup"
 async def start_channel_cleanup():
     """
     يبدأ مهمة إزالة للمستخدمين الذين تم تحديدهم في فحص معين لقناة معينة.
@@ -4143,7 +4445,7 @@ async def start_channel_cleanup():
 
 
 @admin_routes.route("/channels/audits/history", methods=["GET"])
-@permission_required("broadcast.read") # استخدم نفس الصلاحية أو صلاحية جديدة
+@permission_required("channels.audit.read") # استخدم نفس الصلاحية أو صلاحية جديدة
 async def get_channel_audits_history():
     """
     يجلب قائمة بآخر 5 عمليات فحص شاملة.
@@ -4186,7 +4488,7 @@ async def get_channel_audits_history():
 # في نفس ملف admin_routes.py
 
 @admin_routes.route("/channels/audit/removable_users/<audit_uuid>/<channel_id>", methods=["GET"])
-@permission_required("broadcast.read")
+@permission_required("channels.audit.read")
 async def get_removable_users_for_audit(audit_uuid, channel_id):
     """
     يجلب تفاصيل المستخدمين المرشحين للإزالة من فحص معين.

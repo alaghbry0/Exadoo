@@ -1,3 +1,5 @@
+# =============== utils/audit_logger.py
+
 import logging
 import json
 import uuid
@@ -5,6 +7,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List
 from quart import request, current_app
 from enum import Enum
+
 
 class AuditSeverity(Enum):
     INFO = "INFO"

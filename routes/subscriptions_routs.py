@@ -5,7 +5,8 @@ from config import DATABASE_CONFIG
 import asyncpg
 from asyncpg.exceptions import DataError
 from datetime import datetime
-
+from decimal import Decimal
+from utils.discount_utils import calculate_discounted_price
 
 # وظيفة لإنشاء اتصال بقاعدة البيانات
 async def create_db_pool():
@@ -113,34 +114,86 @@ async def get_public_subscription_types():
         return jsonify({"error": "Internal server error"}), 500
 
 
-# نقطة API لجلب قائمة بخطط الاشتراك العامة (تبقى كما هي)
 @public_routes.route("/subscription-plans", methods=["GET"])
 async def get_public_subscription_plans():
     try:
-        subscription_type_id = request.args.get("subscription_type_id")
-        async with current_app.db_pool.acquire() as connection:
-            if subscription_type_id:
-                query = """
-                    SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
-                    FROM subscription_plans
-                    WHERE subscription_type_id = $1 AND is_active = true
-                    ORDER BY price ASC, created_at DESC -- ترتيب الخطط حسب السعر مهم
-                """
-                results = await connection.fetch(query, int(subscription_type_id))
-            else:
-                query = """
-                    SELECT id, subscription_type_id, name, price, original_price, telegram_stars_price, duration_days, is_active, created_at
-                    FROM subscription_plans
-                    WHERE is_active = true
-                    ORDER BY price ASC, created_at DESC -- ترتيب الخطط حسب السعر مهم
-                """
-                results = await connection.fetch(query)
+        subscription_type_id = request.args.get("subscription_type_id", type=int)
+        telegram_id = request.args.get("telegram_id", type=int)
 
-        plans = [dict(r) for r in results]
-        return jsonify(plans), 200, {
-            "Cache-Control": "public, max-age=300",
-            "Content-Type": "application/json; charset=utf-8"
-        }
+        if not subscription_type_id:
+            return jsonify({"error": "subscription_type_id is required"}), 400
+
+        async with current_app.db_pool.acquire() as connection:
+            base_query = """
+                SELECT *
+                FROM subscription_plans
+                WHERE subscription_type_id = $1 AND is_active = true
+                ORDER BY price ASC;
+            """
+            base_plans_records = await connection.fetch(base_query, subscription_type_id)
+
+            # قائمة لتخزين القواميس النهائية بعد المعالجة
+            processed_plans = []
+
+            for plan_record in base_plans_records:
+                # <<< تعديل 1: تحويل صريح للقيم التي سنستخدمها في الحسابات إلى Decimal
+                # هذا يحل تحذير "Expected type 'Decimal', got 'str' instead"
+                current_price = Decimal(plan_record['price'])
+                original_price = None  # نبدأ بـ None
+
+                if telegram_id:
+                    # أ. تحقق من وجود سعر مُثبّت (Locked Price)
+                    locked_price_query = """
+                        SELECT locked_price FROM user_discounts ud
+                        JOIN users u ON u.id = ud.user_id
+                        WHERE u.telegram_id = $1 AND ud.subscription_plan_id = $2 AND ud.is_active = true
+                    """
+                    locked_record = await connection.fetchrow(locked_price_query, telegram_id, plan_record['id'])
+
+                    if locked_record:
+                        original_price = current_price
+                        current_price = Decimal(locked_record['locked_price'])
+                    else:
+                        # ب. تحقق من وجود عروض عامة
+                        public_offer_query = """
+                            SELECT discount_type, discount_value FROM discounts
+                            WHERE 
+                                (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
+                                AND is_active = true AND target_audience = 'all_new'
+                                AND (start_date IS NULL OR start_date <= NOW())
+                                AND (end_date IS NULL OR end_date >= NOW())
+                            ORDER BY 
+                                CASE WHEN applicable_to_subscription_plan_id IS NOT NULL THEN 0 ELSE 1 END,
+                                created_at DESC 
+                            LIMIT 1;
+                        """
+                        offer_record = await connection.fetchrow(public_offer_query, plan_record['id'],
+                                                                 plan_record['subscription_type_id'])
+
+                        if offer_record:
+                            # تحويل صريح لقيمة الخصم لضمان النوع الصحيح
+                            discount_value = Decimal(offer_record['discount_value'])
+
+                            discounted_price = calculate_discounted_price(
+                                current_price,
+                                offer_record['discount_type'],
+                                discount_value
+                            )
+                            if discounted_price < current_price:
+                                original_price = current_price
+                                current_price = discounted_price
+
+                # <<< تعديل 2: بناء القاموس النهائي هنا
+                # هذا يحل تحذيرات "got 'Decimal'/'None' instead of 'str'"
+                # لأننا نبني قاموسا نظيفا في النهاية بدلا من تعديل القاموس الأصلي
+                final_plan_data = dict(plan_record)  # نسخ كل البيانات الأصلية
+                final_plan_data['price'] = f"{current_price:.2f}"
+                final_plan_data['original_price'] = f"{original_price:.2f}" if original_price is not None else None
+
+                processed_plans.append(final_plan_data)
+
+        return jsonify(processed_plans), 200
+
     except Exception as e:
         logging.error("Error fetching public subscription plans: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500

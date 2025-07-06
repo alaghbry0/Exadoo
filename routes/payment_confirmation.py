@@ -18,6 +18,8 @@ from asyncpg.exceptions import UniqueViolationError
 from config import DATABASE_CONFIG
 from datetime import datetime
 from routes.ws_routes import broadcast_notification
+from utils.discount_utils import calculate_discounted_price
+
 
 # نفترض أنك قد أنشأت وحدة خاصة بالإشعارات تحتوي على الدالة create_notification
 from utils.notifications import create_notification
@@ -33,6 +35,8 @@ payment_confirmation_bp = Blueprint("payment_confirmation", __name__)
 # ضبط دقة الأرقام العشرية للتعامل المالي
 getcontext().prec = 30
 
+
+
 # ضبط مستوى التسجيل (logging) ليكون أكثر تفصيلاً أثناء التطوير
 #logging.basicConfig(
     #level=logging.WARNING,
@@ -41,12 +45,60 @@ getcontext().prec = 30
 
 
 # --- دوال مساعدة ---
+async def get_price_for_user(conn, telegram_id: int, plan_id: int) -> Decimal:
+    # 1. تحقق من وجود سعر مُثبّت للمستخدم (أعلى أولوية دائماً)
+    locked_price_query = """
+        SELECT ud.locked_price 
+        FROM user_discounts ud
+        JOIN users u ON u.id = ud.user_id
+        WHERE u.telegram_id = $1 AND ud.subscription_plan_id = $2 AND ud.is_active = true
+    """
+    locked_record = await conn.fetchrow(locked_price_query, telegram_id, plan_id)
+    if locked_record and locked_record['locked_price'] is not None:
+        logging.info(f"User {telegram_id} has a locked price for plan {plan_id}: {locked_record['locked_price']}")
+        return Decimal(locked_record['locked_price'])
 
-async def get_subscription_price(conn, subscription_plan_id: int) -> Decimal:
-    query = "SELECT price FROM subscription_plans WHERE id = $1"
-    row = await conn.fetchrow(query, subscription_plan_id)
-    return Decimal(row['price']) if row and row['price'] is not None else Decimal('0.0')
+    # 2. إذا لا يوجد سعر مثبت، تحقق من وجود عرض عام حالي
+    plan_info_query = "SELECT subscription_type_id, price FROM subscription_plans WHERE id = $1"
+    plan_info = await conn.fetchrow(plan_info_query, plan_id)
+    if not plan_info:
+        # لا ينبغي أن يحدث هذا إذا كانت البيانات متسقة
+        return Decimal('0.0')
 
+    base_price = Decimal(plan_info['price'])
+    subscription_type_id = plan_info['subscription_type_id']
+
+    # --- ⭐ الاستعلام الجديد مع منطق الأولوية ⭐ ---
+    public_offer_query = """
+        SELECT discount_type, discount_value, id as discount_id, lock_in_price
+        FROM discounts
+        WHERE 
+            -- الشرط الرئيسي: يجب أن ينطبق الخصم إما على الخطة المحددة أو على نوع الاشتراك
+            (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
+            AND is_active = true
+            AND target_audience = 'all_new'
+            AND (start_date IS NULL OR start_date <= NOW())
+            AND (end_date IS NULL OR end_date >= NOW())
+        ORDER BY 
+            -- الأولوية للخصم المحدد على مستوى الخطة (0)، ثم على مستوى النوع (1)
+            CASE WHEN applicable_to_subscription_plan_id IS NOT NULL THEN 0 ELSE 1 END,
+            -- إذا تساوت الأولوية، نأخذ الأحدث
+            created_at DESC 
+        LIMIT 1;
+    """
+    offer_record = await conn.fetchrow(public_offer_query, plan_id, subscription_type_id)
+
+    if offer_record:
+        discounted_price = calculate_discounted_price(base_price, offer_record['discount_type'],
+                                                      offer_record['discount_value'])
+        logging.info(
+            f"Applying public offer {offer_record['discount_id']} to user {telegram_id} for plan {plan_id}. New price: {discounted_price}")
+        return discounted_price
+
+    # 3. إذا لا يوجد أي خصومات، أرجع السعر الأساسي
+    logging.info(
+        f"No specific or public discounts for user {telegram_id} on plan {plan_id}. Using base price: {base_price}")
+    return base_price
 
 # ==============================================================================
 # 🌟 الدالة الرئيسية الجديدة لمعالجة المدفوعات 🌟
@@ -102,7 +154,7 @@ async def process_single_transaction(transaction_data: dict[str, any]):
             subscription_plan_id = pending_payment['subscription_plan_id']
 
             # الخطوة 3: التحقق من المبلغ المدفوع
-            expected_price = await get_subscription_price(conn, subscription_plan_id)
+            expected_price = await get_price_for_user(conn, telegram_id, subscription_plan_id)
             difference = expected_price - jetton_amount
 
             logging.info(
@@ -371,17 +423,11 @@ async def confirm_payment():
         amount = 0.0
         async with current_app.db_pool.acquire() as conn:
 
-            # --- تم حذف كتلة كود تحديث/إضافة المستخدم من هنا ---
-
             try:
-                query = "SELECT price FROM subscription_plans WHERE id = $1"
-                record_price = await conn.fetchrow(query, subscription_plan_id)
-                if record_price and record_price.get("price") is not None:
-                    amount = float(record_price["price"])
-                    logging.info(f"✅ تم جلب السعر من جدول subscription_plans: {amount}")
-                else:
-                    logging.warning(
-                        f"⚠️ لم يتم العثور على خطة بالمعرف {subscription_plan_id}. سيتم تعيين المبلغ إلى 0.0")
+                amount_decimal = await get_price_for_user(conn, telegram_id, subscription_plan_id)
+                amount = float(amount_decimal)
+
+                logging.info(f"✅ السعر المحدد للمستخدم {telegram_id} هو: {amount}")
             except Exception as e:
                 logging.error(f"❌ خطأ أثناء جلب السعر من قاعدة البيانات: {str(e)}")
                 return jsonify({"error": "Internal server error"}), 500
