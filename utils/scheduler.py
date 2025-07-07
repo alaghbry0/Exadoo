@@ -226,7 +226,7 @@ async def handle_deactivate_discount_task(bot: Bot, connection, task: dict):
                 if deactivated_count > 0:
                     logging.info(f"Successfully deactivated {deactivated_count} discounts for user {telegram_id}.")
                     # يمكنك إرسال رسالة هنا إذا أردت، لكن حسب الطلب الحالي، لا نرسل
-                    await send_message_to_user(bot, telegram_id, "لقد تم إلغاء الخصم الخاص بك لعدم تجديد الاشتراك.")
+                    # await send_message_to_user(bot, telegram_id, "لقد تم إلغاء الخصم الخاص بك لعدم تجديد الاشتراك.")
 
         await update_task_status(connection, task_id, "completed")
     except Exception as e:
