@@ -13,7 +13,8 @@ from database.db_queries import (
     deactivate_subscription,
     add_scheduled_task,
     find_lapsable_user_discounts_for_type,
-    deactivate_multiple_user_discounts
+    deactivate_multiple_user_discounts,
+    find_active_user_discounts_by_original_discount
 )
 import json
 
@@ -92,7 +93,7 @@ async def execute_scheduled_tasks(bot: Bot, connection):
 
 
 # --- ⭐ تعديل دالة إزالة المستخدم ---
-async def handle_remove_user_task(bot: Bot, connection, telegram_id, channel_id, task_id):
+async def handle_remove_user_task(bot: Bot, connection, telegram_id: int, channel_id: int, task_id: int):
     try:
         current_sub = await get_subscription(connection, telegram_id, channel_id)
         if not current_sub or current_sub['is_active']:
@@ -103,40 +104,46 @@ async def handle_remove_user_task(bot: Bot, connection, telegram_id, channel_id,
 
         logging.info(f"🛠️ Proceeding with removal for user {telegram_id}. Subscription is confirmed inactive.")
 
-        # --- ⭐⭐⭐ المنطق الجديد للتعامل مع الخصومات على مستوى النوع ⭐⭐⭐ ---
+        # --- ⭐⭐⭐ المنطق الجديد والموحد للتعامل مع الخصومات ⭐⭐⭐ ---
         if current_sub.get('is_main_channel_subscription'):
             sub_type_id = current_sub.get('subscription_type_id')
-            if sub_type_id:
-                # 1. ابحث عن كل الخصومات القابلة للإلغاء لهذا النوع
-                lapsable_discounts = await find_lapsable_user_discounts_for_type(connection, telegram_id, sub_type_id)
+            user_id = await connection.fetchval("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
 
-                if lapsable_discounts:
-                    discount_ids = [d['id'] for d in lapsable_discounts]
+            if sub_type_id and user_id:
+                # 1. ابحث عن كل الخصومات القابلة للإلغاء (مجمعة حسب الخصم الأصلي)
+                lapsable_discount_groups = await find_lapsable_user_discounts_for_type(connection, telegram_id, sub_type_id)
+
+                if lapsable_discount_groups:
                     logging.info(
-                        f"User {telegram_id} has {len(discount_ids)} lapsable discounts. Scheduling deactivation.")
+                        f"User {telegram_id} has {len(lapsable_discount_groups)} groups of lapsable discounts. Scheduling deactivation tasks.")
 
-                    # 2. أرسل رسالة تحذيرية واحدة
+                    # 2. أرسل رسالة تحذيرية واحدة فقط للمستخدم
                     try:
                         await send_message_to_user(
                             bot,
                             telegram_id,
                             "🔔 تنبيه هام!\n\n"
                             "لقد انتهى اشتراكك. لديك خصومات خاصة مرتبطة بهذا النوع من الاشتراك. "
-                            "إذا لم تقم بالتجديد خلال 48 ساعة، ستفقد هذه الخصومات بشكل دائم."
+                            "إذا لم تقم بالتجديد خلال 7 أيام، ستفقد هذه الخصومات بشكل دائم."
                         )
                     except Exception as msg_err:
                         logging.error(f"Could not send discount warning message to {telegram_id}: {msg_err}")
 
-                    # 3. قم بجدولة مهمة الإلغاء مع قائمة الـ IDs ونوع الاشتراك
-                    deactivation_time = datetime.now(timezone.utc) + timedelta(hours=48)
-                    await add_scheduled_task(
-                        connection=connection,
-                        task_type="deactivate_discount_grace_period",
-                        telegram_id=telegram_id,
-                        execute_at=deactivation_time,
-                        payload={'subscription_type_id': sub_type_id, 'user_discount_ids': discount_ids},
-                        clean_up=False
-                    )
+                    # 3. قم بجدولة مهمة إلغاء منفصلة لكل مجموعة من الخصومات
+                    deactivation_time = datetime.now(timezone.utc) + timedelta(hours=1)
+                    for lapsable_group in lapsable_discount_groups:
+                        await add_scheduled_task(
+                            connection=connection,
+                            task_type="deactivate_discount_grace_period",
+                            telegram_id=telegram_id,
+                            execute_at=deactivation_time,
+                            # ⭐ استخدام الـ PAYLOAD الجديد والموحد
+                            payload={
+                                'user_id': user_id,
+                                'discount_id': lapsable_group['original_discount_id']
+                            },
+                            clean_up=False
+                        )
         # --- نهاية المنطق الجديد ---
 
         removal_success = await remove_user_from_channel(bot, connection, telegram_id, channel_id)
@@ -149,46 +156,77 @@ async def handle_remove_user_task(bot: Bot, connection, telegram_id, channel_id,
         await update_task_status(connection, task_id, "failed")
 
 
-# --- ⭐ تعديل دالة معالجة مهمة إلغاء الخصم ---
+
+# --- ⭐ تعديل كامل لدالة معالجة مهمة إلغاء الخصم ---
 async def handle_deactivate_discount_task(bot: Bot, connection, task: dict):
     task_id = task['id']
     telegram_id = task['telegram_id']
     payload_str = task.get('payload')
 
-    payload = None
     try:
-        if payload_str:
-            payload = json.loads(payload_str)
+        payload = json.loads(payload_str) if payload_str else {}
     except json.JSONDecodeError:
         logging.error(f"Task {task_id} has invalid JSON in payload: {payload_str}")
         await update_task_status(connection, task_id, "failed")
         return
 
-    if not payload or 'subscription_type_id' not in payload or 'user_discount_ids' not in payload:
-        logging.error(f"Task {task_id} (deactivate_discount) is missing required data in payload. Marking as failed.")
+    # ⭐ التحقق من الـ payload الجديد
+    user_id = payload.get('user_id')
+    original_discount_id = payload.get('discount_id')
+
+    if not user_id or not original_discount_id:
+        logging.error(
+            f"Task {task_id} (deactivate_discount) is missing 'user_id' or 'discount_id' in payload. Marking as failed.")
         await update_task_status(connection, task_id, "failed")
         return
 
-    sub_type_id = payload['subscription_type_id']
-    user_discount_ids = payload['user_discount_ids']
-
     try:
+        # 1. جلب تفاصيل الخصم الأصلي لمعرفة نطاقه (subscription_type_id)
+        original_discount = await connection.fetchrow("SELECT * FROM discounts WHERE id = $1", original_discount_id)
+        if not original_discount:
+            logging.error(f"Original discount {original_discount_id} not found for task {task_id}. Cannot proceed.")
+            await update_task_status(connection, task_id, "failed")
+            return
+
+        # يجب أن يكون الخصم مرتبطًا بنوع اشتراك للتحقق من التجديد
+        sub_type_id = original_discount.get('applicable_to_subscription_type_id')
+        if not sub_type_id:
+            # إذا كان الخصم على خطة فقط، نحتاج لجلب النوع من الخطة
+            plan_id = original_discount.get('applicable_to_subscription_plan_id')
+            if plan_id:
+                sub_type_id = await connection.fetchval(
+                    "SELECT subscription_type_id FROM subscription_plans WHERE id = $1", plan_id)
+            if not sub_type_id:
+                logging.error(
+                    f"Could not determine subscription type for discount {original_discount_id} in task {task_id}.")
+                await update_task_status(connection, task_id, "failed")
+                return
+
+        # 2. التحقق مما إذا كان المستخدم قد جدد اشتراكه في هذا النوع
         has_renewed = await has_active_subscription_for_type(connection, telegram_id, sub_type_id)
 
         if has_renewed:
             logging.info(
-                f"User {telegram_id} has renewed subscription for type {sub_type_id}. Skipping deactivation of discounts.")
+                f"User {telegram_id} has renewed subscription for type {sub_type_id}. Skipping deactivation of discounts from original discount {original_discount_id}.")
         else:
-            logging.info(
-                f"User {telegram_id} did not renew for type {sub_type_id}. Deactivating {len(user_discount_ids)} discounts.")
-            deactivated_count = await deactivate_multiple_user_discounts(connection, user_discount_ids)
+            # 3. إذا لم يجدد، ابحث عن كل الخصومات الممنوحة له من هذا الخصم الأصلي
+            user_discount_ids_to_deactivate = await find_active_user_discounts_by_original_discount(connection, user_id,
+                                                                                                    original_discount_id)
 
-            # ⭐⭐⭐ التعديل الرئيسي هنا ⭐⭐⭐
-            if deactivated_count > 0:
-                # تم تعطيل إرسال الرسالة للمستخدم
+            if not user_discount_ids_to_deactivate:
                 logging.info(
-                    f"Successfully deactivated {deactivated_count} discounts for user {telegram_id}. Notification was intentionally skipped.")
-                pass
+                    f"User {telegram_id} had no active discounts to deactivate for original discount {original_discount_id}.")
+            else:
+                logging.info(
+                    f"User {telegram_id} did not renew. Deactivating {len(user_discount_ids_to_deactivate)} discounts from original discount {original_discount_id}.")
+                # 4. قم بإلغاء تفعيلها
+                deactivated_count = await deactivate_multiple_user_discounts(connection,
+                                                                             user_discount_ids_to_deactivate)
+
+                if deactivated_count > 0:
+                    logging.info(f"Successfully deactivated {deactivated_count} discounts for user {telegram_id}.")
+                    # يمكنك إرسال رسالة هنا إذا أردت، لكن حسب الطلب الحالي، لا نرسل
+                    await send_message_to_user(bot, telegram_id, "لقد تم إلغاء الخصم الخاص بك لعدم تجديد الاشتراك.")
 
         await update_task_status(connection, task_id, "completed")
     except Exception as e:

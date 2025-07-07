@@ -407,52 +407,98 @@ async def deactivate_subscription(connection, telegram_id: int, channel_id: int 
         logging.error(f"❌ Error deactivating subscription(s) for user {telegram_id}: {e}")
         return False
 
-# --- ⭐ 1. تعديل: دالة البحث عن الخصومات القابلة للإلغاء لنوع اشتراك كامل ---
+# --- ⭐ تعديل جوهري: تجميع الخصومات القابلة للإلغاء حسب الخصم الأصلي ---
 async def find_lapsable_user_discounts_for_type(connection, telegram_id: int, subscription_type_id: int) -> list[dict]:
     """
-    Finds ALL active user discounts for a given subscription type that should be lost on lapse.
-    Returns a list of user_discount records.
+    Finds all active user discounts for a given subscription type that should be lost on lapse.
+    It groups them by the original discount ID.
+    Returns a list of records, where each record contains the original discount_id
+    and a list of user_discount_ids associated with it.
+    Example: [{'original_discount_id': 5, 'user_discount_ids': [101, 102]}]
     """
     user_id = await connection.fetchval("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
     if not user_id:
         return []
 
     # هذا الاستعلام يربط user_discounts بالخطط، ثم بالأنواع، ثم بالخصومات الأصلية
+    # ويقوم بتجميع النتائج حسب الخصم الأصلي
     query = """
-        SELECT ud.id
+        SELECT
+            d.id as original_discount_id,
+            array_agg(ud.id) as user_discount_ids
         FROM user_discounts ud
         JOIN subscription_plans sp ON ud.subscription_plan_id = sp.id
         JOIN discounts d ON ud.discount_id = d.id
         WHERE ud.user_id = $1
           AND sp.subscription_type_id = $2
           AND ud.is_active = true
-          AND d.lose_on_lapse = true;
+          AND d.lose_on_lapse = true
+        GROUP BY d.id;
     """
     return await connection.fetch(query, user_id, subscription_type_id)
 
+# --- ⭐ دالة جديدة: للعثور على خصومات المستخدم بناءً على الخصم الأصلي (لا تغيير) ---
+async def find_active_user_discounts_by_original_discount(connection, user_id: int, original_discount_id: int) -> list[int]:
+    """
+    Finds all active user_discounts IDs for a user that were created from a specific original discount.
+    """
+    query = """
+        SELECT id FROM user_discounts
+        WHERE user_id = $1 AND discount_id = $2 AND is_active = true;
+    """
+    results = await connection.fetch(query, user_id, original_discount_id)
+    return [record['id'] for record in results] # نرجع قائمة من الأرقام مباشرة
 # --- ⭐ 2. تعديل: دالة إلغاء مجموعة من الخصومات ---
 async def deactivate_multiple_user_discounts(connection, user_discount_ids: list[int]) -> int:
     """
     Deactivates a list of user discounts by their IDs.
-    Returns the number of deactivated discounts.
+    This is now safer against unique constraint violations.
     """
     if not user_discount_ids:
         return 0
     try:
-        # استخدام ANY($1) للعمل مع قائمة من الـ IDs
-        result = await connection.execute(
-            "UPDATE user_discounts SET is_active = false WHERE id = ANY($1) AND is_active = true",
-            user_discount_ids
-        )
-        # استخراج عدد الصفوف المحدثة من نتيجة التنفيذ
-        count_str = result.split(" ")[1]
-        deactivated_count = int(count_str)
-        logging.info(f"✅ Successfully deactivated {deactivated_count} user discounts.")
-        return deactivated_count
-    except Exception as e:
-        logging.error(f"❌ Error deactivating user discounts for IDs {user_discount_ids}: {e}", exc_info=True)
-        return 0
+        # نبدأ معاملة لضمان تنفيذ العمليتين معًا
+        async with connection.transaction():
+            # الخطوة 1: ابحث عن المستخدمين والخطط للسجلات التي سيتم تحديثها
+            user_plan_tuples = await connection.fetch("""
+                SELECT user_id, subscription_plan_id FROM user_discounts
+                WHERE id = ANY($1) AND is_active = true
+            """, user_discount_ids)
 
+            if not user_plan_tuples:
+                logging.warning(f"No active user discounts found for IDs {user_discount_ids} to deactivate.")
+                return 0
+
+            # الخطوة 2: احذف أي سجلات غير نشطة موجودة مسبقًا وتتطابق مع نفس المستخدمين والخطط
+            # هذا يمنع حدوث التعارض في الخطوة التالية
+            await connection.executemany("""
+                DELETE FROM user_discounts
+                WHERE user_id = $1 AND subscription_plan_id = $2 AND is_active = false
+            """, [(r['user_id'], r['subscription_plan_id']) for r in user_plan_tuples])
+
+            # الخطوة 3: الآن قم بتحديث السجلات النشطة بأمان
+            result = await connection.execute(
+                "UPDATE user_discounts SET is_active = false WHERE id = ANY($1) AND is_active = true",
+                user_discount_ids
+            )
+
+            # استخراج عدد الصفوف المحدثة
+            count_str = result.split(" ")[1]
+            deactivated_count = int(count_str)
+
+            logging.info(f"✅ Successfully deactivated {deactivated_count} user discounts.")
+            return deactivated_count
+
+    except Exception as e:
+        # تحقق مما إذا كان الخطأ هو UniqueViolationError. إذا كان كذلك، فقد يعني أن هناك حالة سباق (race condition)
+        # لم يتم التعامل معها. تسجيل الخطأ لا يزال مهمًا.
+        if isinstance(e, asyncpg.exceptions.UniqueViolationError):
+            logging.error(
+                f"❌ A unique violation error occurred even after pre-deleting inactive records for IDs {user_discount_ids}: {e}",
+                exc_info=True)
+        else:
+            logging.error(f"❌ Error deactivating user discounts for IDs {user_discount_ids}: {e}", exc_info=True)
+        return 0
 
 
 

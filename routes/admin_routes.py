@@ -1742,32 +1742,34 @@ async def create_discount():
 @permission_required("discounts.read")
 async def get_discounts():
     try:
-        # استعلام يدمج الخصومات مع إحصائياتها (بمنطق محدث وموحد)
+        # استعلام يدمج الخصومات مع إحصائياتها بمنطق محدث ومتوافق مع التعديلات الأخيرة
         query = """
-            SELECT 
+            SELECT
                 d.*,
-                -- ⭐⭐⭐ التصحيح هنا: عد المستخدمين الفريدين ⭐⭐⭐
-                (SELECT COUNT(DISTINCT ud.user_id) 
-                 FROM user_discounts ud 
+                -- عدد الحاصلين على الخصم حاليًا (لا تغيير هنا، هذا صحيح)
+                (SELECT COUNT(DISTINCT ud.user_id)
+                 FROM user_discounts ud
                  WHERE ud.discount_id = d.id AND ud.is_active = true) as active_holders_count,
 
-                -- عدد المستخدمين المحتملين (هذا الجزء صحيح بالفعل ويستخدم DISTINCT)
+                -- عدد المستخدمين المحتملين (المستهدفين)
                 (CASE
                     WHEN d.target_audience = 'existing_subscribers' THEN
-                        (SELECT COUNT(DISTINCT s.user_id) 
+                        (SELECT COUNT(DISTINCT s.user_id)
                          FROM subscriptions s
-                         WHERE s.is_active = true
-                           AND (
+                         -- --- ⭐ التعديل الرئيسي هنا ---
+                         -- تمت إزالة شرط "s.is_active = true" ليشمل جميع المشتركين (النشطين والمنتهيين)
+                         -- وهذا ليعكس منطق دالة تطبيق الخصم الجديدة.
+                         WHERE (
                                (d.applicable_to_subscription_plan_id IS NOT NULL AND s.subscription_plan_id = d.applicable_to_subscription_plan_id)
-                               OR 
+                               OR
                                (d.applicable_to_subscription_plan_id IS NULL AND d.applicable_to_subscription_type_id IS NOT NULL AND s.subscription_type_id = d.applicable_to_subscription_type_id)
                            )
                         )
                     ELSE 0
                 END) as potential_recipients_count
-            FROM 
+            FROM
                 discounts d
-            ORDER BY 
+            ORDER BY
                 d.created_at DESC;
         """
         async with current_app.db_pool.acquire() as connection:
@@ -1831,49 +1833,54 @@ async def update_discount(discount_id: int):
         return jsonify({"error": "Internal server error"}), 500
 
 
-# 4. تطبيق خصم على المشتركين الحاليين (النقطة المهمة)
+# 4. تطبيق خصم على المشتركين الحاليين (النسخة المعدلة بالكامل)
 @admin_routes.route("/discounts/<int:discount_id>/apply-to-existing", methods=["POST"])
 @permission_required("discounts.apply")
 async def apply_discount_to_existing_users(discount_id: int):
+    """
+    تطبيق خصم على المستخدمين الذين لديهم اشتراكات حالية (نشطة أو منتهية).
+    - يمنح الخصم لجميع الخطط المتاحة ضمن نطاق الخصم.
+    - إذا كان اشتراك المستخدم منتهيًا والخصم من النوع 'lose_on_lapse',
+      سيتم جدولة مهمة لإلغاء الخصم بعد 48 ساعة (بدون إرسال تنبيه).
+    """
     try:
+        # لم نعد نحتاج كائن البوت في هذه الدالة
+        # bot = current_app.bot
+
         async with current_app.db_pool.acquire() as connection:
             async with connection.transaction():
-                # --- الخطوة 1: جلب تفاصيل الخصم ---
+                # --- الخطوة 1: جلب تفاصيل الخصم (لا تغيير) ---
                 discount = await connection.fetchrow("SELECT * FROM discounts WHERE id = $1", discount_id)
                 if not discount:
                     return jsonify({"error": "Discount not found"}), 404
-
                 if discount['target_audience'] != 'existing_subscribers':
                     return jsonify(
                         {"error": "This function is only for discounts targeting 'existing_subscribers'."}), 400
 
                 discount_type_id = discount.get('applicable_to_subscription_type_id')
                 discount_plan_id = discount.get('applicable_to_subscription_plan_id')
-
                 if not discount_type_id and not discount_plan_id:
                     return jsonify({"error": "Discount must be applicable to a specific type or plan."}), 400
 
-                # --- الخطوة 2: جلب المستخدمين المستهدفين (فقط IDs الخاصة بهم) ---
-                # هؤلاء هم المستخدمون الذين لديهم اشتراك نشط في النطاق المستهدف
+                # --- الخطوة 2: جلب المستخدمين المستهدفين (لا تغيير) ---
                 target_users_query = """
-                    SELECT DISTINCT s.user_id
+                    SELECT DISTINCT ON (s.user_id)
+                        s.user_id, u.telegram_id, s.is_active
                     FROM subscriptions s
-                    WHERE s.is_active = true AND s.user_id IS NOT NULL
-                      AND (
+                    JOIN users u ON s.user_id = u.id
+                    WHERE u.telegram_id IS NOT NULL AND (
                         ($1::int IS NOT NULL AND s.subscription_plan_id = $1) OR
                         ($1::int IS NULL AND $2::int IS NOT NULL AND s.subscription_type_id = $2)
-                      );
+                    )
+                    ORDER BY s.user_id, s.expiry_date DESC;
                 """
                 target_user_records = await connection.fetch(target_users_query, discount_plan_id, discount_type_id)
 
-                target_user_ids = [record['user_id'] for record in target_user_records]
+                if not target_user_records:
+                    return jsonify({"message": "No users (active or expired) found for the target scope.",
+                                    "applied_count": 0}), 200
 
-                if not target_user_ids:
-                    return jsonify(
-                        {"message": "No active subscribers found for the target scope.", "applied_count": 0}), 200
-
-                # --- الخطوة 3: جلب كل الخطط التي يغطيها هذا الخصم ---
-                # هذا هو المنطق الجديد والمهم
+                # --- الخطوة 3: جلب الخطط المتاحة (لا تغيير) ---
                 applicable_plans_query = """
                     SELECT id as plan_id, price as plan_price
                     FROM subscription_plans
@@ -1883,50 +1890,70 @@ async def apply_discount_to_existing_users(discount_id: int):
                     );
                 """
                 applicable_plans = await connection.fetch(applicable_plans_query, discount_plan_id, discount_type_id)
-
                 if not applicable_plans:
                     return jsonify({"error": "No active plans found that match the discount's scope."}), 404
 
-                # --- الخطوة 4: التكرار على كل مستهدف وكل خطة قابلة للتطبيق ---
-                total_applied_count = 0
-
-                # تجهيز استعلام الإضافة مرة واحدة خارج الحلقة لتحسين الأداء
-                insert_query = """
-                    INSERT INTO user_discounts (user_id, discount_id, subscription_plan_id, locked_price, is_active)
-                    VALUES ($1, $2, $3, $4, true)
-                    ON CONFLICT (user_id, subscription_plan_id, is_active) DO UPDATE SET
-                        discount_id = EXCLUDED.discount_id,
-                        locked_price = EXCLUDED.locked_price,
-                        granted_at = NOW();
-                """
-
-                # إنشاء قائمة من الصفوف التي سيتم إدراجها
+                # --- الخطوة 4: تجهيز البيانات وإدارة المهام (لا تغيير) ---
                 records_to_insert = []
-                for user_id in target_user_ids:
+                tasks_to_schedule = []
+
+                for user_record in target_user_records:
+                    user_id = user_record['user_id']
                     for plan in applicable_plans:
-                        # حساب السعر المخفض لكل خطة
                         locked_price = calculate_discounted_price(
-                            plan['plan_price'],
-                            discount['discount_type'],
-                            discount['discount_value']
+                            plan['plan_price'], discount['discount_type'], discount['discount_value']
                         )
                         records_to_insert.append(
                             (user_id, discount_id, plan['plan_id'], locked_price)
                         )
 
-                # --- الخطوة 5: تنفيذ الإضافة دفعة واحدة باستخدام executemany ---
-                # هذا أكثر كفاءة من تنفيذ استعلامات متعددة داخل حلقة
+                    is_user_active = user_record['is_active']
+                    if not is_user_active and discount['lose_on_lapse']:
+                        tasks_to_schedule.append({
+                            'telegram_id': user_record['telegram_id'],
+                            'user_id': user_id,
+                        })
+
+                # --- الخطوة 5: تنفيذ الإضافة دفعة واحدة (لا تغيير) ---
+                insert_query = """
+                    INSERT INTO user_discounts (user_id, discount_id, subscription_plan_id, locked_price, is_active)
+                    VALUES ($1, $2, $3, $4, true)
+                    ON CONFLICT (user_id, subscription_plan_id, is_active) DO UPDATE SET
+                        discount_id = EXCLUDED.discount_id, locked_price = EXCLUDED.locked_price, granted_at = NOW();
+                """
                 if records_to_insert:
                     await connection.executemany(insert_query, records_to_insert)
-                    total_applied_count = len(records_to_insert)
+
+                # --- ⭐ الخطوة 6: جدولة مهام الإلغاء فقط (بدون إرسال رسائل) ---
+                for task_info in tasks_to_schedule:
+                    # 1. تم حذف جزء إرسال الرسالة
+
+                    # 2. جدولة مهمة الإلغاء
+                    deactivation_time = datetime.now(timezone.utc) + timedelta(hours=168)
+                    await add_scheduled_task(
+                        connection=connection,
+                        task_type="deactivate_discount_grace_period",
+                        telegram_id=task_info['telegram_id'],
+                        execute_at=deactivation_time,
+                        payload={'user_id': task_info['user_id'], 'discount_id': discount_id},
+                        clean_up=False
+                    )
+
+                total_applied_count = len(records_to_insert)
+                users_affected = len(target_user_records)
+                tasks_scheduled_count = len(tasks_to_schedule)
 
                 logging.info(
-                    f"Applied discount {discount_id} to {len(target_user_ids)} users across {len(applicable_plans)} plans. Total records created/updated: {total_applied_count}.")
+                    f"Applied discount {discount_id} to {users_affected} users. "
+                    f"Total records created/updated: {total_applied_count}. "
+                    f"Scheduled {tasks_scheduled_count} deactivation tasks for lapsed users (without sending notifications)."
+                )
 
                 return jsonify({
-                    "message": f"Successfully applied discount to {len(target_user_ids)} users. A total of {total_applied_count} discount records were created or updated for all applicable plans.",
-                    "users_affected": len(target_user_ids),
-                    "discounts_created_or_updated": total_applied_count
+                    "message": f"Successfully processed discount for {users_affected} users. A total of {total_applied_count} discount records were created/updated.",
+                    "users_affected": users_affected,
+                    "discounts_created_or_updated": total_applied_count,
+                    "deactivation_tasks_scheduled": tasks_scheduled_count
                 }), 200
 
     except Exception as e:
