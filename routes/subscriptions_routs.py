@@ -117,32 +117,49 @@ async def get_public_subscription_types():
 @public_routes.route("/subscription-plans", methods=["GET"])
 async def get_public_subscription_plans():
     try:
+        # قراءة المعاملات كما هي، لكن لن نُرجع خطأ الآن
         subscription_type_id = request.args.get("subscription_type_id", type=int)
         telegram_id = request.args.get("telegram_id", type=int)
 
-        if not subscription_type_id:
-            return jsonify({"error": "subscription_type_id is required"}), 400
+        # <<< التغيير الرئيسي هنا: إزالة التحقق الإلزامي >>>
+        # if not subscription_type_id:
+        #     return jsonify({"error": "subscription_type_id is required"}), 400
 
         async with current_app.db_pool.acquire() as connection:
-            base_query = """
+            
+            # <<< بناء الاستعلام بشكل ديناميكي >>>
+            params = []
+            where_clauses = ["is_active = true"] # الفلتر الأساسي
+
+            # إذا تم توفير subscription_type_id، أضفه إلى شروط البحث
+            if subscription_type_id:
+                params.append(subscription_type_id)
+                where_clauses.append(f"subscription_type_id = ${len(params)}")
+            
+            # تجميع شروط WHERE
+            where_sql = " AND ".join(where_clauses)
+            
+            base_query = f"""
                 SELECT *
                 FROM subscription_plans
-                WHERE subscription_type_id = $1 AND is_active = true
-                ORDER BY price ASC;
+                WHERE {where_sql}
+                ORDER BY subscription_type_id, price ASC;
             """
-            base_plans_records = await connection.fetch(base_query, subscription_type_id)
+            
+            # تنفيذ الاستعلام مع المعاملات الديناميكية
+            base_plans_records = await connection.fetch(base_query, *params)
+            # <<< نهاية التغيير الرئيسي >>>
 
             # قائمة لتخزين القواميس النهائية بعد المعالجة
             processed_plans = []
 
             for plan_record in base_plans_records:
-                # <<< تعديل 1: تحويل صريح للقيم التي سنستخدمها في الحسابات إلى Decimal
-                # هذا يحل تحذير "Expected type 'Decimal', got 'str' instead"
+                # <<< لا تغييرات هنا، بقية الكود سيعمل كما هو >>>
                 current_price = Decimal(plan_record['price'])
-                original_price = None  # نبدأ بـ None
+                original_price = None
 
                 if telegram_id:
-                    # أ. تحقق من وجود سعر مُثبّت (Locked Price)
+                    # ... (بقية منطق الخصومات يبقى كما هو)
                     locked_price_query = """
                         SELECT locked_price FROM user_discounts ud
                         JOIN users u ON u.id = ud.user_id
@@ -154,7 +171,6 @@ async def get_public_subscription_plans():
                         original_price = current_price
                         current_price = Decimal(locked_record['locked_price'])
                     else:
-                        # ب. تحقق من وجود عروض عامة
                         public_offer_query = """
                             SELECT discount_type, discount_value FROM discounts
                             WHERE 
@@ -171,9 +187,7 @@ async def get_public_subscription_plans():
                                                                  plan_record['subscription_type_id'])
 
                         if offer_record:
-                            # تحويل صريح لقيمة الخصم لضمان النوع الصحيح
                             discount_value = Decimal(offer_record['discount_value'])
-
                             discounted_price = calculate_discounted_price(
                                 current_price,
                                 offer_record['discount_type'],
@@ -183,10 +197,7 @@ async def get_public_subscription_plans():
                                 original_price = current_price
                                 current_price = discounted_price
 
-                # <<< تعديل 2: بناء القاموس النهائي هنا
-                # هذا يحل تحذيرات "got 'Decimal'/'None' instead of 'str'"
-                # لأننا نبني قاموسا نظيفا في النهاية بدلا من تعديل القاموس الأصلي
-                final_plan_data = dict(plan_record)  # نسخ كل البيانات الأصلية
+                final_plan_data = dict(plan_record)
                 final_plan_data['price'] = f"{current_price:.2f}"
                 final_plan_data['original_price'] = f"{original_price:.2f}" if original_price is not None else None
 
