@@ -544,7 +544,8 @@ async def process_stars_payment_and_renew(bot: Bot, payment_details: dict):
 # ==============================================================================
 # 📥 معالج الدفع الناجح (مع تحسين التحقق والإشعارات) 📥
 # ==============================================================================
-# @dp.message(lambda message: message.successful_payment is not None) # تأكد من تسجيل هذا المعالج
+
+@dp.message(lambda message: message.successful_payment is not None)
 async def handle_successful_payment(message: types.Message, bot: Bot):
     """
     يعالج رسالة الدفع الناجح، يستخرج البيانات، ويسلمها للمعالج الجديد.
