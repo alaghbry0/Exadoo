@@ -4115,16 +4115,13 @@ async def get_target_groups():
             # المشتركون المنتهيو الصلاحية (هنا لا نحتاج لفلترة المستخدمين، فقط الاشتراكات)
             # ✅ --- تعديل: إزالة شرط u.is_active ---
             expired_subscribers = await conn.fetchval("""
-                SELECT COUNT(DISTINCT u.telegram_id) 
-                FROM users u 
-                JOIN subscriptions s ON u.telegram_id = s.telegram_id 
-                WHERE u.telegram_id IN (
-                    SELECT telegram_id FROM subscriptions WHERE expiry_date <= NOW()
-                ) AND u.telegram_id NOT IN (
-                    SELECT telegram_id FROM subscriptions WHERE is_active = true AND expiry_date > NOW()
-                )
-            """)
+    -- ببساطة نعدّ كل مستخدم فريد لديه اشتراك منتهٍ واحد على الأقل
+    SELECT COUNT(DISTINCT telegram_id)
+    FROM subscriptions
+    WHERE expiry_date <= NOW()
+""")
             stats['expired_subscribers'] = expired_subscribers
+
 
             # إحصائيات حسب نوع الاشتراك
             # ✅ --- تعديل: إزالة شرط st.is_active إذا كان لا يوجد في جدول subscription_types ---
