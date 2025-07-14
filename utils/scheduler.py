@@ -130,7 +130,7 @@ async def handle_remove_user_task(bot: Bot, connection, telegram_id: int, channe
                         logging.error(f"Could not send discount warning message to {telegram_id}: {msg_err}")
 
                     # 3. قم بجدولة مهمة إلغاء منفصلة لكل مجموعة من الخصومات
-                    deactivation_time = datetime.now(timezone.utc) + timedelta(hours=1)
+                    deactivation_time = datetime.now(timezone.utc) + timedelta(hours=168)
                     for lapsable_group in lapsable_discount_groups:
                         await add_scheduled_task(
                             connection=connection,
