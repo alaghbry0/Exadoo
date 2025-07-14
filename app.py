@@ -13,7 +13,6 @@ from quart_cors import cors
 from chatbot.ai_service import DeepSeekService
 from config import DATABASE_CONFIG
 from routes.users import user_bp
-from routes.shop import shop
 from routes.admin_routes import admin_routes
 from routes.permissions_routes import permissions_routes
 from routes.notifications_routes import notifications_bp
@@ -75,6 +74,7 @@ app.kb = knowledge_base
 
 # 1. تعريف المصادر الموثوقة للواجهة الأمامية
 SECURE_FRONTEND_ORIGINS = [
+    "http://localhost:5000",
     "http://localhost:5001",
     "https://exaado-panel.vercel.app"
 ]
@@ -138,8 +138,6 @@ app.register_blueprint(payment_bp)
 cors(user_bp, allow_origin="*")
 app.register_blueprint(user_bp)
 
-cors(shop, allow_origin="*")
-app.register_blueprint(shop)
 
 cors(chatbot_bp, allow_origin="*")
 app.register_blueprint(chatbot_bp, url_prefix="/bot")

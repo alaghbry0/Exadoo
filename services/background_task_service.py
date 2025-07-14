@@ -371,22 +371,19 @@ class BackgroundTaskService:
         elif target_group == 'expired_subscribers':
             # هذا الاستعلام يحدد المستخدمين الذين انتهى آخر اشتراك لهم وليس لديهم أي اشتراك نشط حالي
             query = """
-                        SELECT DISTINCT ON (u.telegram_id) u.telegram_id, u.full_name, u.username,
-                               st.name as subscription_name, s.expiry_date
-                        FROM users u
-                        JOIN (
-                            SELECT telegram_id, MAX(expiry_date) as last_expiry
-                            FROM subscriptions
-                            GROUP BY telegram_id
-                        ) last_sub ON u.telegram_id = last_sub.telegram_id
-                        JOIN subscriptions s ON u.telegram_id = s.telegram_id AND s.expiry_date = last_sub.last_expiry
-                        JOIN subscription_types st ON s.subscription_type_id = st.id
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM subscriptions s2
-                            WHERE s2.telegram_id = u.telegram_id AND s2.is_active = true AND s2.expiry_date > NOW()
-                        )
-                        ORDER BY u.telegram_id, s.expiry_date DESC
-                    """
+        -- اختر مستخدماً واحداً (مميزاً)
+        SELECT DISTINCT ON (u.telegram_id)
+               u.telegram_id, u.full_name, u.username,
+               st.name as subscription_name, s.expiry_date
+        FROM users u
+        -- انضم إلى الاشتراكات لجلب التفاصيل
+        JOIN subscriptions s ON u.telegram_id = s.telegram_id
+        JOIN subscription_types st ON s.subscription_type_id = st.id
+        -- الشرط الوحيد: أن يكون الاشتراك منتهياً
+        WHERE s.expiry_date <= NOW()
+        -- الترتيب مهم: لكل مستخدم، اختر اشتراكه المنتهي الأحدث
+        ORDER BY u.telegram_id, s.expiry_date DESC
+    """
         elif target_group == 'subscription_type_active' and subscription_type_id:
             query = """
                         SELECT u.telegram_id, u.full_name, u.username,
