@@ -4115,11 +4115,15 @@ async def get_target_groups():
             # المشتركون المنتهيو الصلاحية (هنا لا نحتاج لفلترة المستخدمين، فقط الاشتراكات)
             # ✅ --- تعديل: إزالة شرط u.is_active ---
             expired_subscribers = await conn.fetchval("""
-    -- ببساطة نعدّ كل مستخدم فريد لديه اشتراك منتهٍ واحد على الأقل
-    SELECT COUNT(DISTINCT telegram_id)
-    FROM subscriptions
-    WHERE expiry_date <= NOW()
-""")
+                SELECT COUNT(DISTINCT u.telegram_id) 
+                FROM users u 
+                JOIN subscriptions s ON u.telegram_id = s.telegram_id 
+                WHERE u.telegram_id IN (
+                    SELECT telegram_id FROM subscriptions WHERE expiry_date <= NOW()
+                ) AND u.telegram_id NOT IN (
+                    SELECT telegram_id FROM subscriptions WHERE is_active = true AND expiry_date > NOW()
+                )
+            """)
             stats['expired_subscribers'] = expired_subscribers
 
             # إحصائيات حسب نوع الاشتراك
@@ -4212,21 +4216,18 @@ async def preview_target_users():
                 SELECT DISTINCT ON (u.telegram_id) u.id, u.telegram_id, u.full_name, u.username,
                        st.name as subscription_name, s.expiry_date
                 FROM users u
-                LEFT JOIN subscriptions s ON u.telegram_id = s.telegram_id
-                LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
-                WHERE u.telegram_id IN (
-                    SELECT telegram_id FROM subscriptions WHERE expiry_date <= NOW()
-                ) AND u.telegram_id NOT IN (
-                    SELECT telegram_id FROM subscriptions WHERE is_active = true AND expiry_date > NOW()
-                )
+                JOIN subscriptions s ON u.telegram_id = s.telegram_id
+                JOIN subscription_types st ON s.subscription_type_id = st.id
+                WHERE s.expiry_date <= NOW()
             """
+            # count_query: ببساطة يعد كل مستخدم فريد لديه اشتراك منتهٍ.
             count_query = """
-                SELECT COUNT(DISTINCT u.telegram_id) FROM users u
-                WHERE u.telegram_id IN (SELECT telegram_id FROM subscriptions WHERE expiry_date <= NOW()) 
-                AND u.telegram_id NOT IN (SELECT telegram_id FROM subscriptions WHERE is_active = true AND expiry_date > NOW())
+                SELECT COUNT(DISTINCT telegram_id)
+                FROM subscriptions
+                WHERE expiry_date <= NOW()
             """
-            # الترتيب هنا ضروري لـ DISTINCT ON
-            final_query = f"{base_query} ORDER BY u.telegram_id, u.id DESC LIMIT ${len(query_params) + 1}"
+            # الترتيب هنا يضمن أننا نأخذ أحدث اشتراك منتهٍ لكل مستخدم
+            final_query = f"{base_query} ORDER BY u.telegram_id, s.expiry_date DESC LIMIT ${len(query_params) + 1}"
 
         elif target_group == 'subscription_type_active' and subscription_type_id:
             base_query = """
