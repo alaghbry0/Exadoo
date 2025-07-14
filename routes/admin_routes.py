@@ -1929,7 +1929,7 @@ async def apply_discount_to_existing_users(discount_id: int):
                     # 1. تم حذف جزء إرسال الرسالة
 
                     # 2. جدولة مهمة الإلغاء
-                    deactivation_time = datetime.now(timezone.utc) + timedelta(hours=39)
+                    deactivation_time = datetime.now(timezone.utc) + timedelta(hours=168)
                     await add_scheduled_task(
                         connection=connection,
                         task_type="deactivate_discount_grace_period",
