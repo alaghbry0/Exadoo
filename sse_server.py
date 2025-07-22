@@ -87,10 +87,26 @@ async def internal_publish_handler(request: web.Request):
 
     return web.json_response({"status": "published"}, status=200)
 
+# ====================================================================
+# ✅ تعديل 1: إضافة معالج لفحص الحالة الصحية (Health Check)
+# هذا المعالج سيستجيب لطلبات Render على المسار الرئيسي "/"
+# ====================================================================
+async def health_check_handler(request: web.Request):
+    """
+    معالج بسيط يعيد استجابة 200 OK لإعلام منصة النشر
+    بأن الخدمة تعمل بشكل صحيح.
+    """
+    logging.info("Health check endpoint was hit.")
+    return web.json_response(
+        {"status": "ok", "message": "SSE server is healthy."},
+        status=200
+    )
+
 
 # --- نقطة الدخول لتشغيل الخادم ---
 if __name__ == "__main__":
     app = web.Application()
+    app.router.add_get("/", health_check_handler)
     app.router.add_get("/notifications/stream", sse_handler)
     app.router.add_post("/_internal/publish", internal_publish_handler)
 
