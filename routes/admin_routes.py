@@ -3946,6 +3946,10 @@ async def export_subscriptions_endpoint():
     except Exception as e:
         logging.error(f"Unexpected error in /subscriptions/export: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
+<<<<<<< HEAD
+=======
+
+>>>>>>> b3f4051c2d19d648c0f5924c758869a61a297689
 
 @admin_routes.route("/dashboard/stats", methods=["GET"])
 @permission_required("dashboard.view_stats")
