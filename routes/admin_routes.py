@@ -3729,6 +3729,223 @@ async def export_users_endpoint():
         logging.error(f"Unexpected error in /users/export: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
+AVAILABLE_SUBSCRIPTION_EXPORT_FIELDS = {
+    "subscription_id": {"db_col": "fs.id", "header": "معرف الاشتراك"},
+    "telegram_id": {"db_col": "fs.telegram_id", "header": "معرف تليجرام"},
+    "full_name": {"db_col": "fs.full_name", "header": "الاسم الكامل"},
+    "username": {"db_col": "CONCAT('@', fs.username)", "header": "اسم المستخدم"},
+    "subscription_type_name": {"db_col": "fs.subscription_type_name", "header": "نوع الاشتراك"},
+    "subscription_plan_name": {"db_col": "fs.subscription_plan_name", "header": "خطة الاشتراك"},
+    "status": {"db_col": "fs.status_label", "header": "الحالة"},
+    "start_date": {"db_col": "fs.start_date", "header": "تاريخ البدء"},
+    "expiry_date": {"db_col": "fs.expiry_date", "header": "تاريخ الانتهاء"},
+    "days_remaining": {"db_col": "fs.days_remaining", "header": "الأيام المتبقية"},
+    "source": {"db_col": "fs.source", "header": "المصدر"},
+    "payment_token": {"db_col": "fs.payment_token", "header": "معرف الدفع"},
+    "created_at": {"db_col": "fs.created_at", "header": "تاريخ الإنشاء"},
+    "is_active_bool": {"db_col": "fs.is_active", "header": "هل نشط؟ (boolean)"},
+}
+
+
+@admin_routes.route("/subscriptions/export", methods=["POST"])
+@permission_required("bot_users.export")
+async def export_subscriptions_endpoint():
+    """
+    نقطة نهاية لتصدير بيانات الاشتراكات إلى ملف Excel مع تطبيق فلاتر متقدمة.
+    """
+    try:
+        data = await request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        # --- 1. استخلاص الحقول والفلاتر من الطلب ---
+        requested_field_keys = data.get('fields', [])
+        
+        # ⭐ تصحيح الخطأ الأول: تحويل القيم إلى str قبل استخدام .strip()
+        search_term = str(data.get('search', "")).strip()
+        status_filter = str(data.get("status", "")).strip().lower()
+        type_filter_id_str = str(data.get("subscription_type_id", "")).strip()
+        plan_filter_id_str = str(data.get("subscription_plan_id", "")).strip()
+        source_filter = str(data.get("source", "")).strip()
+        start_date_filter = str(data.get("start_date", "")).strip()
+        end_date_filter = str(data.get("end_date", "")).strip()
+
+        # --- 2. بناء جملة SELECT الديناميكية ---
+        fields_to_query_map = {}
+        if not requested_field_keys:
+            for key, details in AVAILABLE_SUBSCRIPTION_EXPORT_FIELDS.items():
+                fields_to_query_map[key] = details["db_col"]
+        else:
+            for key in requested_field_keys:
+                if key in AVAILABLE_SUBSCRIPTION_EXPORT_FIELDS:
+                    fields_to_query_map[key] = AVAILABLE_SUBSCRIPTION_EXPORT_FIELDS[key]["db_col"]
+                else:
+                    logging.warning(f"Requested field '{key}' not available for export and will be ignored.")
+
+        if not fields_to_query_map:
+            return jsonify({"error": "No valid fields selected for export"}), 400
+
+        select_clauses = [f'{db_expr} AS "{alias_key}"' for alias_key, db_expr in fields_to_query_map.items()]
+        dynamic_select_sql = ", ".join(select_clauses)
+
+        # --- 3. بناء جملة WHERE الديناميكية ومعاملاتها ---
+        where_clauses = []
+        query_params = []
+        param_idx = 1
+
+        if status_filter and status_filter != "all":
+            where_clauses.append(f"status_label = ${param_idx}")
+            query_params.append(status_filter)
+            param_idx += 1
+
+        if type_filter_id_str and type_filter_id_str.isdigit():
+            where_clauses.append(f"subscription_type_id = ${param_idx}")
+            query_params.append(int(type_filter_id_str))
+            param_idx += 1
+
+        if plan_filter_id_str and plan_filter_id_str.isdigit():
+            where_clauses.append(f"subscription_plan_id = ${param_idx}")
+            query_params.append(int(plan_filter_id_str))
+            param_idx += 1
+
+        if source_filter and source_filter != "all":
+            where_clauses.append(f"source ILIKE ${param_idx}")
+            query_params.append(source_filter)
+            param_idx += 1
+
+        if start_date_filter:
+            try:
+                start_date_obj = datetime.strptime(start_date_filter, '%Y-%m-%d').date()
+                where_clauses.append(f"created_at >= ${param_idx}")
+                query_params.append(start_date_obj)
+                param_idx += 1
+            except ValueError:
+                return jsonify({"error": "Invalid start_date format. Use YYYY-MM-DD."}), 400
+
+        if end_date_filter:
+            try:
+                end_date_obj = datetime.strptime(end_date_filter, '%Y-%m-%d').date()
+                where_clauses.append(f"created_at < (${param_idx}::DATE + INTERVAL '1 day')")
+                query_params.append(end_date_obj)
+                param_idx += 1
+            except ValueError:
+                return jsonify({"error": "Invalid end_date format. Use YYYY-MM-DD."}), 400
+
+        if search_term:
+            search_pattern = f"%{search_term}%"
+            search_conditions = [
+                "full_name ILIKE $1",
+                "username ILIKE $1",
+                "telegram_id::TEXT ILIKE $1",
+                "payment_token ILIKE $1",
+                "subscription_type_name ILIKE $1",
+            ]
+            # تعديل بسيط هنا لضمان استخدام البارامتر الصحيح
+            param_placeholder = f'${param_idx}'
+            where_clauses.append(f"({' OR '.join(c.replace('$1', param_placeholder) for c in search_conditions)})")
+            query_params.append(search_pattern)
+            param_idx += 1
+
+        where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+
+        # --- 4. بناء الاستعلام النهائي الكامل ---
+        final_query = f"""
+            WITH base_subscriptions AS (
+                SELECT
+                    s.*,
+                    u.full_name, u.username,
+                    st.name AS subscription_type_name,
+                    sp.name AS subscription_plan_name,
+                    CASE 
+                        WHEN s.is_active AND s.expiry_date > NOW() 
+                        THEN EXTRACT(DAY FROM s.expiry_date - NOW())::INTEGER
+                        ELSE 0
+                    END AS days_remaining,
+                    CASE
+                        WHEN s.expiry_date <= NOW() THEN 'expired'
+                        WHEN NOT s.is_active THEN 'inactive'
+                        WHEN s.expiry_date <= NOW() + INTERVAL '7 days' THEN 'expiring_soon'
+                        ELSE 'active'
+                    END AS status_label
+                FROM subscriptions s
+                LEFT JOIN users u ON s.telegram_id = u.telegram_id
+                LEFT JOIN subscription_types st ON s.subscription_type_id = st.id
+                LEFT JOIN subscription_plans sp ON s.subscription_plan_id = sp.id
+            ),
+            filtered_subscriptions AS (
+                SELECT * FROM base_subscriptions
+                WHERE {where_sql}
+            )
+            SELECT {dynamic_select_sql}
+            FROM filtered_subscriptions fs
+            ORDER BY fs.id DESC
+        """
+        logging.debug(f"Export query: {final_query} with params: {query_params}")
+
+        # --- 5. جلب البيانات من قاعدة البيانات ---
+        async with current_app.db_pool.acquire() as conn:
+            rows = await conn.fetch(final_query, *query_params)
+            data_list = [dict(row) for row in rows]
+
+        if not data_list:
+            return jsonify({"message": "No data found matching your criteria for export."}), 404
+
+        # --- 6. تحويل البيانات وتوليد ملف Excel ---
+        df = pd.DataFrame(data_list)
+        
+        # ⭐ تصحيح الخطأ الثاني: إزالة معلومات المنطقة الزمنية من أعمدة التاريخ والوقت
+        for col in df.select_dtypes(include=['datetime64[ns, UTC]', 'datetimetz']).columns:
+            logging.debug(f"Converting column '{col}' to timezone-naive.")
+            df[col] = df[col].dt.tz_localize(None)
+
+        excel_column_headers = {
+            alias_key: AVAILABLE_SUBSCRIPTION_EXPORT_FIELDS[alias_key]["header"]
+            for alias_key in df.columns
+            if alias_key in AVAILABLE_SUBSCRIPTION_EXPORT_FIELDS
+        }
+        df.rename(columns=excel_column_headers, inplace=True)
+
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+            df.to_excel(writer, sheet_name='Subscriptions Data', index=False)
+            workbook = writer.book
+            worksheet = writer.sheets['Subscriptions Data']
+
+            header_format = workbook.add_format({
+                'bold': True, 'text_wrap': True, 'valign': 'top',
+                'fg_color': '#D7E4BC', 'border': 1, 'align': 'center'
+            })
+
+            for col_num, value in enumerate(df.columns.values):
+                worksheet.write(0, col_num, value, header_format)
+
+            for i, col_name in enumerate(df.columns):
+                column_data = df[col_name]
+                if not column_data.empty:
+                    max_len = max(
+                        column_data.astype(str).map(len).max(),
+                        len(str(col_name))
+                    )
+                    adjusted_width = (max_len + 2) * 1.2
+                    worksheet.set_column(i, i, min(adjusted_width, 60))
+
+        excel_buffer.seek(0)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"subscriptions_export_{timestamp}.xlsx"
+
+        return await send_file(
+            excel_buffer,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            attachment_filename=filename,
+        )
+
+    except asyncpg.PostgresError as pe:
+        logging.error(f"Database error in /subscriptions/export: {str(pe)}", exc_info=True)
+        return jsonify({"error": "Database operation failed", "details": str(pe)}), 500
+    except Exception as e:
+        logging.error(f"Unexpected error in /subscriptions/export: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 @admin_routes.route("/dashboard/stats", methods=["GET"])
 @permission_required("dashboard.view_stats")

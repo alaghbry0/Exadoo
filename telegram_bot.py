@@ -29,7 +29,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # 🔹 استيراد القيم من .env
-CHANNEL_URL = os.getenv("CHANNEL_URL")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEB_APP_URL = os.getenv("WEB_APP_URL")
 SUBSCRIBE_URL = os.getenv("SUBSCRIBE_URL")  # ✅ تحميل رابط `/api/subscribe`

@@ -32,11 +32,10 @@ async def fetch_transaction_details(tx_hash: str) -> Optional[dict[str, any]]:
         return None
 
     url = f"https://tonapi.io/v2/blockchain/transactions/{tx_hash}"
-    headers = {"Authorization": f"Bearer {TONAPI_KEY}"}
 
     for attempt in range(3):  # إعادة المحاولة 3 مرات
         try:
-            async with current_app.aiohttp_session.get(url, headers=headers) as response:
+            async with current_app.aiohttp_session.get(url) as response:
                 if response.status == 200:
                     details = await response.json()
                     logging.info(f"✅ [TonAPI] Fetched details for tx_hash: {tx_hash}")

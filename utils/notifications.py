@@ -1,7 +1,10 @@
+# utils/notifications.py (النسخة النهائية المحدثة مع SSE)
+
 import json
 import logging
 from datetime import datetime, timezone
-from routes.ws_routes import broadcast_new_notification
+from quart import current_app
+from database.db_queries import get_unread_notifications_count
 
 
 async def create_notification(
@@ -14,15 +17,15 @@ async def create_notification(
         telegram_ids: list = None
 ):
     """
-    تنشئ إشعارًا جديدًا في جدول notifications ثم تربطه بالمستخدمين في user_notifications.
+    تنشئ إشعارًا جديدًا وتبثه فورًا للمستخدمين المعنيين عبر Server-Sent Events (SSE).
 
     :param connection: اتصال قاعدة البيانات.
-    :param notification_type: نوع الإشعار (مثال: "subscription_renewal" أو "payment_success").
-    :param title: عنوان مختصر للإشعار.
-    :param message: نص الرسالة الأساسية للإشعار.
-    :param extra_data: بيانات إضافية.
-    :param is_public: إذا كان الإشعار عامًا لجميع المستخدمين.
-    :param telegram_ids: قائمة بمعرفات تليجرام للمستخدمين المستهدفين (للإشعارات الخاصة).
+    :param notification_type: نوع الإشعار.
+    :param title: عنوان الإشعار.
+    :param message: نص الرسالة.
+    :param extra_data: بيانات إضافية (JSON).
+    :param is_public: إذا كان الإشعار عامًا.
+    :param telegram_ids: قائمة بمعرفات تليجرام المستهدفة.
     :return: معرف الإشعار المُنشأ.
     """
     extra_data = extra_data or {}
@@ -41,54 +44,47 @@ async def create_notification(
     )
     notification_id = record["id"]
 
-    # إنشاء كائن الإشعار للإرسال عبر WebSocket
+    # إنشاء كائن الإشعار للبث
     notification_obj = {
         "id": notification_id,
         "type": notification_type,
         "title": title,
         "message": message,
         "extra_data": extra_data,
-        
         "created_at": datetime.now(timezone.utc).isoformat(),
         "read_status": False
     }
 
+    target_user_ids = []
     if not is_public:
         if not telegram_ids:
             raise ValueError("telegram_ids is required for private notifications")
-        if not isinstance(telegram_ids, list):
-            telegram_ids = [telegram_ids]
-        insert_query = """
-            INSERT INTO user_notifications (telegram_id, notification_id)
-            VALUES ($1, $2)
-        """
-        for tg_id in telegram_ids:
+        target_user_ids = [telegram_ids] if not isinstance(telegram_ids, list) else telegram_ids
+        
+        insert_query = "INSERT INTO user_notifications (telegram_id, notification_id) VALUES ($1, $2)"
+        for tg_id in target_user_ids:
             await connection.execute(insert_query, tg_id, notification_id)
-            
-            # إرسال الإشعار الجديد عبر WebSocket للمستخدم المعني
-            try:
-                await broadcast_new_notification(tg_id, notification_obj)
-            except Exception as e:
-                logging.error(f"Error broadcasting notification to {tg_id}: {e}")
     else:
-        # للإشعارات العامة، نقوم بإدراجها لجميع المستخدمين
-        insert_query = """
-            INSERT INTO user_notifications (telegram_id, notification_id)
-            SELECT telegram_id, $1 FROM users
-        """
+        # للإشعارات العامة، أدرجها لجميع المستخدمين
+        insert_query = "INSERT INTO user_notifications (telegram_id, notification_id) SELECT telegram_id, $1 FROM users"
         await connection.execute(insert_query, notification_id)
         
-        # جلب قائمة المستخدمين لإرسال الإشعار لهم
-        users_query = "SELECT telegram_id FROM users"
-        users = await connection.fetch(users_query)
-        
-        # إرسال الإشعار لكل مستخدم
-        for user in users:
-            tg_id = user['telegram_id']
-            try:
-                await broadcast_new_notification(tg_id, notification_obj)
-            except Exception as e:
-                logging.error(f"Error broadcasting public notification to {tg_id}: {e}")
+        # واحصل على قائمة بجميع المستخدمين لإرسال الإشعار لهم
+        users = await connection.fetch("SELECT telegram_id FROM users")
+        target_user_ids = [user['telegram_id'] for user in users]
+
+    # ✨ التغيير هنا: البث باستخدام SSE
+    broadcaster = current_app.sse_client
+    for tg_id in target_user_ids:
+        try:
+            # 1. بث الإشعار الجديد نفسه
+            await broadcaster.publish(tg_id, 'new_notification', notification_obj)
+            
+            # 2. جلب العدد المحدث وبثه
+            unread_count = await get_unread_notifications_count(connection, tg_id)
+            await broadcaster.publish(tg_id, 'unread_update', {"count": unread_count})
+
+        except Exception as e:
+            logging.error(f"Error publishing SSE event to {tg_id}: {e}")
 
     return notification_id
-
