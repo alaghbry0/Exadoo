@@ -58,7 +58,9 @@ def handle_date_timezone(dt: datetime, tz: pytz.BaseTzInfo) -> datetime:
 
 
 def calculate_subscription_details(sub: Dict[str, Any], local_tz: pytz.BaseTzInfo) -> Dict[str, Any]:
-    """حساب تفاصيل الاشتراك مع تحسين عرض الوقت المتبقي"""
+    """
+    [مُعدل] حساب تفاصيل الاشتراك مع إضافة روابط الدعوة للقنوات الرئيسية والفرعية.
+    """
     expiry_date = handle_date_timezone(sub['expiry_date'], local_tz)
     start_date = sub['start_date'] or expiry_date - timedelta(days=30)
     start_date = handle_date_timezone(start_date, local_tz)
@@ -93,7 +95,11 @@ def calculate_subscription_details(sub: Dict[str, Any], local_tz: pytz.BaseTzInf
         "status": status,
         "start_date": start_date.isoformat(),
         "expiry_date": expiry_date.isoformat(),
-        "invite_link": sub.get('invite_link')  # <-- إضافة هذا الحقل
+        # <-- ✨ التعديل الأساسي هنا ✨ -->
+        # تم تغيير اسم الحقل إلى 'main_invite_link' ليعكس أنه رابط القناة الرئيسية
+        "invite_link": sub.get('main_invite_link'),
+        # إضافة حقل جديد يحتوي على قائمة بالقنوات الفرعية، مع التأكد من إرجاع قائمة فارغة بدلاً من null
+        "sub_channel_links": sub.get('sub_channel_links') or []
     }
 
 @user_bp.route("/api/user/subscriptions", methods=["GET"])

@@ -680,30 +680,50 @@ async def update_task_status(connection, task_id: int, status: str):
         return False
 
 
+
 async def get_user_subscriptions(connection, telegram_id: int):
     """
-    🔹 جلب اشتراكات المستخدم الفعلية مع رابط الدعوة العام للقناة الرئيسية.
+    🔹 [مُعدل] جلب اشتراكات المستخدم الفعلية مع رابط الدعوة للقناة الرئيسية وقائمة بروابط القنوات الفرعية.
     """
     try:
         # 🌟 [الاستعلام المعدل] 🌟
-        # نقوم بـ JOIN مع subscription_type_channels حيث is_main=TRUE
-        # ونربط بين subscription_type_id في جدول الاشتراكات والجدول الجديد
+        # نستخدم CTE (Common Table Expression) لتجميع روابط القنوات أولاً،
+        # ثم نربطها بالاشتراكات للحصول على رابط القناة الرئيسية ومصفوفة JSON للقنوات الفرعية.
         subscriptions = await connection.fetch("""
-            SELECT 
-                s.subscription_type_id, 
+            WITH ChannelData AS (
+                SELECT
+                    stc.subscription_type_id,
+                    -- البحث عن رابط الدعوة للقناة الرئيسية
+                    MAX(stc.invite_link) FILTER (WHERE stc.is_main = TRUE) as main_invite_link,
+                    -- تجميع معلومات القنوات الفرعية في مصفوفة JSON
+                    json_agg(
+                        json_build_object(
+                            'name', stc.channel_name,
+                            'link', stc.invite_link
+                        )
+                    ) FILTER (WHERE stc.is_main = FALSE AND stc.invite_link IS NOT NULL) as sub_channel_links
+                FROM
+                    subscription_type_channels stc
+                GROUP BY
+                    stc.subscription_type_id
+            )
+            SELECT
+                s.subscription_type_id,
                 s.start_date,
-                s.expiry_date, 
+                s.expiry_date,
                 s.is_active,
                 st.name AS subscription_name,
-                -- جلب رابط الدعوة من القناة الرئيسية المرتبطة بنوع الاشتراك
-                stc.invite_link
-            FROM 
+                -- جلب رابط الدعوة الرئيسي من CTE
+                cd.main_invite_link,
+                -- جلب روابط القنوات الفرعية من CTE
+                cd.sub_channel_links
+            FROM
                 subscriptions s
-            JOIN 
+            JOIN
                 subscription_types st ON s.subscription_type_id = st.id
-            LEFT JOIN 
-                subscription_type_channels stc ON st.id = stc.subscription_type_id AND stc.is_main = TRUE
-            WHERE 
+            LEFT JOIN
+                ChannelData cd ON st.id = cd.subscription_type_id
+            WHERE
                 s.telegram_id = $1
         """, telegram_id)
 

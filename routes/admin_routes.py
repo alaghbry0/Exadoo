@@ -3760,7 +3760,7 @@ async def export_subscriptions_endpoint():
 
         # --- 1. استخلاص الحقول والفلاتر من الطلب ---
         requested_field_keys = data.get('fields', [])
-        
+
         # ⭐ تصحيح الخطأ الأول: تحويل القيم إلى str قبل استخدام .strip()
         search_term = str(data.get('search', "")).strip()
         status_filter = str(data.get("status", "")).strip().lower()
@@ -3892,7 +3892,7 @@ async def export_subscriptions_endpoint():
 
         # --- 6. تحويل البيانات وتوليد ملف Excel ---
         df = pd.DataFrame(data_list)
-        
+
         # ⭐ تصحيح الخطأ الثاني: إزالة معلومات المنطقة الزمنية من أعمدة التاريخ والوقت
         for col in df.select_dtypes(include=['datetime64[ns, UTC]', 'datetimetz']).columns:
             logging.debug(f"Converting column '{col}' to timezone-naive.")
@@ -3946,10 +3946,7 @@ async def export_subscriptions_endpoint():
     except Exception as e:
         logging.error(f"Unexpected error in /subscriptions/export: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
-<<<<<<< HEAD
-=======
 
->>>>>>> b3f4051c2d19d648c0f5924c758869a61a297689
 
 @admin_routes.route("/dashboard/stats", methods=["GET"])
 @permission_required("dashboard.view_stats")
