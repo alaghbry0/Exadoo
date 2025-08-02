@@ -3,6 +3,7 @@ import logging
 from quart import Blueprint, request, jsonify, current_app
 from config import DATABASE_CONFIG
 import asyncpg
+import json
 from asyncpg.exceptions import DataError
 from datetime import datetime
 from decimal import Decimal
@@ -270,30 +271,118 @@ async def get_public_wallet():
         return jsonify({"error": "Internal server error"}), 500
 
 
-@public_routes.route("/terms-conditions", methods=["GET"])
-async def get_public_terms_conditions():
+@public_routes.route("/subscriptions/all", methods=["GET"])
+async def get_all_public_subscriptions():
+    """
+    تجلب هذه النقطة جميع مجموعات وأنواع وخطط الاشتراكات النشطة في بنية متداخلة.
+    يمكن تمرير 'telegram_id' كمعامل اختياري للحصول على الخصومات الخاصة بالمستخدم.
+    """
+    telegram_id = request.args.get("telegram_id", type=int)
+
     try:
         async with current_app.db_pool.acquire() as connection:
-            query = """
-                SELECT terms_array, updated_at
-                FROM terms_conditions
-                ORDER BY updated_at DESC
-                LIMIT 1;
-            """
-            result = await connection.fetchrow(query)
+            # تم تصحيح الاستعلام لاستخدام TO_CHAR بدلاً من FORMAT
+            comprehensive_query = """
+            WITH plans_with_discounts AS (
+                -- الخطوة 1: حساب الأسعار النهائية لجميع الخطط مع مراعاة الخصومات
+                SELECT
+                    p.id, p.subscription_type_id, p.name, p.duration_days, p.price, p.is_active,
 
-            if result:
-                return jsonify({
-                    "terms_array": result["terms_array"],
-                    "updated_at": result["updated_at"].isoformat() if result["updated_at"] else None
-                }), 200
-            else:
-                return jsonify({"terms_array": []}), 200
+                    CASE 
+                        WHEN ud.locked_price IS NOT NULL THEN p.price
+                        WHEN d.id IS NOT NULL THEN p.price
+                        ELSE NULL
+                    END AS original_price,
+
+                    COALESCE(
+                        ud.locked_price,
+                        CASE
+                            WHEN d.discount_type = 'percentage' THEN p.price * (1 - (d.discount_value / 100))
+                            WHEN d.discount_type = 'fixed_amount' THEN p.price - d.discount_value
+                        END,
+                        p.price
+                    ) AS final_price
+
+                FROM subscription_plans p
+
+                LEFT JOIN users u ON u.telegram_id = $1
+                LEFT JOIN user_discounts ud ON ud.user_id = u.id AND ud.subscription_plan_id = p.id AND ud.is_active = TRUE
+
+                LEFT JOIN LATERAL (
+                    SELECT * FROM discounts
+                    WHERE 
+                        ud.id IS NULL
+                        AND (discounts.applicable_to_subscription_plan_id = p.id OR discounts.applicable_to_subscription_type_id = p.subscription_type_id)
+                        AND discounts.is_active = TRUE AND discounts.target_audience = 'all_new'
+                        AND (discounts.start_date IS NULL OR discounts.start_date <= NOW())
+                        AND (discounts.end_date IS NULL OR discounts.end_date >= NOW())
+                    ORDER BY 
+                        CASE WHEN discounts.applicable_to_subscription_plan_id IS NOT NULL THEN 0 ELSE 1 END,
+                        discounts.created_at DESC
+                    LIMIT 1
+                ) d ON TRUE
+
+                WHERE p.is_active = TRUE
+            )
+            -- الخطوة 2: تجميع الخطط داخل الأنواع، والأنواع داخل المجموعات
+            SELECT
+                g.id, g.name, g.description, g.image_url, g.color, g.icon, g.sort_order,
+                COALESCE(json_agg(
+                    json_build_object(
+                        'id', st.id,
+                        'name', st.name,
+                        'channel_id', st.channel_id,
+                        'description', st.description,
+                        'image_url', st.image_url,
+                        'features', COALESCE(st.features, '[]'::jsonb),
+                        'usp', st.usp,
+                        'is_recommended', st.is_recommended,
+                        'terms_and_conditions', COALESCE(st.terms_and_conditions, '[]'::jsonb),
+                        'sort_order', st.sort_order,
+                        'subscription_plans', st.plans
+                    ) ORDER BY st.sort_order ASC, st.created_at DESC
+                ) FILTER (WHERE st.id IS NOT NULL), '[]'::json) AS subscription_types
+
+            FROM subscription_groups g
+
+            LEFT JOIN (
+                SELECT
+                    st_inner.id, st_inner.group_id, st_inner.name, st_inner.channel_id, st_inner.description,
+                    st_inner.image_url, st_inner.features, st_inner.usp, st_inner.is_recommended,
+                    st_inner.terms_and_conditions, st_inner.sort_order, st_inner.created_at,
+                    COALESCE(json_agg(
+                        json_build_object(
+                            'id', p.id,
+                            'name', p.name,
+                            'duration_days', p.duration_days,
+                            -- <<< التغيير هنا: استخدام TO_CHAR للتنسيق الصحيح في PostgreSQL
+                            'price', TO_CHAR(p.final_price, 'FM999999999.00'),
+                            'original_price', CASE WHEN p.original_price IS NOT NULL THEN TO_CHAR(p.original_price, 'FM999999999.00') ELSE NULL END
+                        ) ORDER BY p.final_price ASC
+                    ) FILTER (WHERE p.id IS NOT NULL), '[]'::json) AS plans
+                FROM subscription_types st_inner
+                LEFT JOIN plans_with_discounts p ON p.subscription_type_id = st_inner.id
+                WHERE st_inner.is_active = TRUE
+                GROUP BY st_inner.id
+            ) st ON st.group_id = g.id
+
+            WHERE g.is_active = TRUE
+            GROUP BY g.id
+            ORDER BY g.sort_order ASC, g.name ASC;
+            """
+
+            results = await connection.fetch(comprehensive_query, telegram_id)
+
+        final_structure = [
+            {**row, "subscription_types": json.loads(row["subscription_types"])}
+            for row in results
+        ]
+
+        return jsonify(final_structure), 200, {
+            "Cache-Control": "public, max-age=300",
+            "Content-Type": "application/json; charset=utf-8"
+        }
 
     except Exception as e:
-        logging.error("Error fetching public terms and conditions: %s", e, exc_info=True)
+        logging.error("Error fetching all public subscriptions: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
-
-
-
