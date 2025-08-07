@@ -9,7 +9,7 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 import aiohttp
 from utils.payment_utils import OP_JETTON_TRANSFER, JETTON_DECIMALS, normalize_address, convert_amount, OP_JETTON_TRANSFER_NOTIFICATION
 from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_payment_token, \
-    record_incoming_transaction,  update_payment_status_to_manual_check
+    record_incoming_transaction,  update_payment_status_to_manual_check, claim_limited_discount_slot
 from pytoniq import LiteBalancer, begin_cell, Address
 from pytoniq.liteclient.client import LiteServerError
 from typing import Optional  # لإضافة تلميحات النوع
@@ -46,8 +46,13 @@ getcontext().prec = 30
 
 
 # --- دوال مساعدة ---
-async def get_price_for_user(conn, telegram_id: int, plan_id: int) -> Decimal:
+async def get_price_for_user(conn, telegram_id: int, plan_id: int) -> dict:
+    """
+    ⭐ تعديل: ترجع الدالة الآن قاموساً يحتوي على السعر وتفاصيل الخصم.
+    Example: {'price': Decimal('10.00'), 'discount_id': 5, 'lock_in_price': True}
+    """
     # 1. تحقق من وجود سعر مُثبّت للمستخدم (أعلى أولوية دائماً)
+    #    هذا السعر خاص بالمستخدم ولا يتأثر بأي عروض عامة جديدة.
     locked_price_query = """
         SELECT ud.locked_price 
         FROM user_discounts ud
@@ -56,55 +61,70 @@ async def get_price_for_user(conn, telegram_id: int, plan_id: int) -> Decimal:
     """
     locked_record = await conn.fetchrow(locked_price_query, telegram_id, plan_id)
     if locked_record and locked_record['locked_price'] is not None:
-        logging.info(f"User {telegram_id} has a locked price for plan {plan_id}: {locked_record['locked_price']}")
-        return Decimal(locked_record['locked_price'])
+        logging.info(f"User {telegram_id} has a locked price for plan {plan_id}.")
+        # ⭐ تعديل: إرجاع قاموس بمعلومات السعر المثبت
+        return {
+            'price': Decimal(locked_record['locked_price']),
+            'discount_id': None,  # لا يوجد خصم عام جديد يتم تطبيقه
+            'lock_in_price': True # السعر مثبت لهذا المستخدم
+        }
 
-    # 2. إذا لا يوجد سعر مثبت، تحقق من وجود عرض عام حالي
+    # 2. إذا لا يوجد سعر مثبت، ابحث عن السعر الأساسي والعروض العامة
     plan_info_query = "SELECT subscription_type_id, price FROM subscription_plans WHERE id = $1"
     plan_info = await conn.fetchrow(plan_info_query, plan_id)
     if not plan_info:
-        # لا ينبغي أن يحدث هذا إذا كانت البيانات متسقة
-        return Decimal('0.0')
+        # هذا لا ينبغي أن يحدث إذا كانت البيانات متسقة
+        # يمكنك إما إرجاع خطأ أو سعر افتراضي
+        return {
+            'price': Decimal('0.0'),
+            'discount_id': None,
+            'lock_in_price': False
+        }
 
     base_price = Decimal(plan_info['price'])
     subscription_type_id = plan_info['subscription_type_id']
 
-    # --- ⭐ الاستعلام الجديد مع منطق الأولوية ⭐ ---
+    # --- ⭐ تعديل الاستعلام لجلب الحقول الجديدة والتحقق من عدد المستخدمين ⭐ ---
     public_offer_query = """
-        SELECT discount_type, discount_value, id as discount_id, lock_in_price
+        SELECT id as discount_id, discount_type, discount_value, lock_in_price
         FROM discounts
         WHERE 
-            -- الشرط الرئيسي: يجب أن ينطبق الخصم إما على الخطة المحددة أو على نوع الاشتراك
             (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
             AND is_active = true
             AND target_audience = 'all_new'
             AND (start_date IS NULL OR start_date <= NOW())
             AND (end_date IS NULL OR end_date >= NOW())
+            -- ⭐ شرط جديد: تأكد من أن الخصم لم يصل للحد الأقصى للمستخدمين ⭐
+            AND (max_users IS NULL OR usage_count < max_users)
         ORDER BY 
-            -- الأولوية للخصم المحدد على مستوى الخطة (0)، ثم على مستوى النوع (1)
             CASE WHEN applicable_to_subscription_plan_id IS NOT NULL THEN 0 ELSE 1 END,
-            -- إذا تساوت الأولوية، نأخذ الأحدث
             created_at DESC 
         LIMIT 1;
     """
     offer_record = await conn.fetchrow(public_offer_query, plan_id, subscription_type_id)
 
     if offer_record:
-        discounted_price = calculate_discounted_price(base_price, offer_record['discount_type'],
-                                                      offer_record['discount_value'])
-        logging.info(
-            f"Applying public offer {offer_record['discount_id']} to user {telegram_id} for plan {plan_id}. New price: {discounted_price}")
-        return discounted_price
+        discounted_price = calculate_discounted_price(base_price, offer_record['discount_type'], offer_record['discount_value'])
+        logging.info(f"Applying public offer {offer_record['discount_id']} for plan {plan_id}. New price: {discounted_price}")
+        # ⭐ تعديل: إرجاع قاموس بمعلومات الخصم
+        return {
+            'price': discounted_price,
+            'discount_id': offer_record['discount_id'],
+            'lock_in_price': offer_record['lock_in_price']
+        }
 
-    # 3. إذا لا يوجد أي خصومات، أرجع السعر الأساسي
-    logging.info(
-        f"No specific or public discounts for user {telegram_id} on plan {plan_id}. Using base price: {base_price}")
-    return base_price
+    # 3. إذا لم يوجد أي خصومات (لا مثبتة ولا عامة)، أرجع السعر الأساسي
+    logging.info(f"No discounts for plan {plan_id}. Using base price: {base_price}")
+    # ⭐ تعديل: إرجاع السعر الأساسي بنفس شكل القاموس
+    return {
+        'price': base_price,
+        'discount_id': None,
+        'lock_in_price': False # لا يوجد عرض لتثبيت السعر
+    }
 
 # ==============================================================================
 # 🌟 الدالة الرئيسية الجديدة لمعالجة المدفوعات 🌟
 # ==============================================================================
-
 async def process_single_transaction(transaction_data: dict[str, any]):
     """
     تعالج معاملة واحدة، تتحقق من صحة الدفعة، ثم تسلمها لنظام تجديد الاشتراك.
@@ -154,12 +174,18 @@ async def process_single_transaction(transaction_data: dict[str, any]):
             telegram_id = int(pending_payment['telegram_id'])
             subscription_plan_id = pending_payment['subscription_plan_id']
 
-            # الخطوة 3: التحقق من المبلغ المدفوع
-            expected_price = await get_price_for_user(conn, telegram_id, subscription_plan_id)
+            # الخطوة 3: التحقق من المبلغ المدفوع (باستخدام الدالة المعدلة)
+            # ⭐ تعديل: استقبال قاموس بدلاً من سعر فقط
+            price_details = await get_price_for_user(conn, telegram_id, subscription_plan_id)
+            expected_price = price_details['price']
+            discount_id_to_apply = price_details['discount_id']
+            lock_in_price_flag = price_details['lock_in_price']
+
             difference = expected_price - jetton_amount
 
+            # ⭐ تعديل: تحديث اللوغ ليشمل معرّف الخصم
             logging.info(
-                f"🔍 [Core Processor] Amount comparison: Expected={expected_price}, Received={jetton_amount}, Difference={difference}")
+                f"🔍 [Core Processor] Amount comparison: Expected={expected_price}, Received={jetton_amount}, Difference={difference}, DiscountID={discount_id_to_apply}")
 
             acceptable_tolerance = Decimal('0.30')
             silent_tolerance = Decimal('0.15')
@@ -207,23 +233,27 @@ async def process_single_transaction(transaction_data: dict[str, any]):
                                                                 "Bot object not found during processing")
                     return
 
+                # ⭐ تعديل: إضافة معرّف الخصم والـ flag إلى بيانات الدفعة
                 payment_full_data = {
                     **pending_payment,
                     "tx_hash": tx_hash,
-                    "amount_received": jetton_amount
+                    "amount_received": jetton_amount,
+                    "discount_id": discount_id_to_apply,
+                    "lock_in_price": lock_in_price_flag
                 }
 
+                # ⭐ تعديل: تمرير دالة حجز المقعد إلى معالج الاشتراك
                 await process_subscription_renewal(
                     connection=conn,
                     bot=bot,
-                    payment_data=payment_full_data
+                    payment_data=payment_full_data,
+
                 )
 
             else:
                 logging.warning(
                     f"⚠️ [Payment Invalid] Payment for {tx_hash} is invalid (insufficient amount). Status has been set to 'failed'.")
 
-        # --- بداية الكود المدمج ---
         except Exception as e:
             logging.error(
                 f"❌ [Core Processor] Critical error while processing payment for token '{payment_token}': {e}",
@@ -233,7 +263,6 @@ async def process_single_transaction(transaction_data: dict[str, any]):
                 if payment_token:
                     await update_payment_status_to_manual_check(conn, payment_token, str(e))
 
-                # ===> إرسال إشعار للمطور
                 bot = current_app.bot
                 if bot:
                     await send_system_notification(
@@ -399,7 +428,7 @@ async def startup_payment_tasks():
 @payment_confirmation_bp.route("/api/confirm_payment", methods=["POST"])
 async def confirm_payment():
     logging.info("✅ تم استدعاء نقطة API /api/confirm_payment!")
-    data = None # تعريف المتغير خارج الـ try ليكون متاحًا في الـ except النهائي
+    data = None  # تعريف المتغير خارج الـ try ليكون متاحًا في الـ except النهائي
     try:
         data = await request.get_json()
         logging.info(f"📥 بيانات الطلب المستلمة في /api/confirm_payment: {json.dumps(data, indent=2)}")
@@ -450,8 +479,19 @@ async def confirm_payment():
 
         async with current_app.db_pool.acquire() as conn:
             try:
-                amount_decimal = await get_price_for_user(conn, telegram_id, subscription_plan_id)
+                # --- ⭐ بداية التغيير المطلوب ---
+
+                # 1. استقبل القاموس الكامل في متغير اسمه price_details
+                price_details = await get_price_for_user(conn, telegram_id, subscription_plan_id)
+
+                # 2. استخرج قيمة 'price' من القاموس
+                amount_decimal = price_details['price']
+
+                # 3. الآن يمكنك تحويل الرقم العشري (Decimal) إلى float بأمان
                 amount = float(amount_decimal)
+
+                # --- نهاية التغيير المطلوب ---
+
                 logging.info(f"✅ السعر المحدد للمستخدم {telegram_id} هو: {amount}")
             except Exception as e:
                 logging.error(f"❌ خطأ أثناء جلب السعر من قاعدة البيانات: {str(e)}", exc_info=True)

@@ -1700,17 +1700,18 @@ async def create_discount():
         if not all(field in data for field in required_fields):
             return jsonify({"error": "Missing required fields"}), 400
 
-        # --- ⭐ التصحيح هنا ⭐ ---
         # تحويل التواريخ من نص إلى كائنات تاريخ إذا كانت موجودة
         start_date = datetime.fromisoformat(data["start_date"]) if data.get("start_date") else None
         end_date = datetime.fromisoformat(data["end_date"]) if data.get("end_date") else None
 
         query = """
             INSERT INTO discounts (
-                name, description, discount_type, discount_value, 
+                name, description, discount_type, discount_value,
                 applicable_to_subscription_type_id, applicable_to_subscription_plan_id,
-                start_date, end_date, is_active, lock_in_price, lose_on_lapse, target_audience
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                start_date, end_date, is_active, lock_in_price, lose_on_lapse, target_audience,
+                -- ⭐ الحقول الجديدة هنا ⭐
+                max_users, display_fake_count, fake_count_value
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             RETURNING *;
         """
         async with current_app.db_pool.acquire() as connection:
@@ -1727,15 +1728,84 @@ async def create_discount():
                 data.get("is_active", True),
                 data.get("lock_in_price", False),
                 data.get("lose_on_lapse", False),
-                data["target_audience"]
+                data["target_audience"],
+                # ⭐ تمرير قيم الحقول الجديدة ⭐
+                data.get("max_users"),
+                data.get("display_fake_count", False),
+                data.get("fake_count_value")
             )
 
+        # تحويل سجل قاعدة البيانات إلى قاموس يمكن تحويله لـ JSON
         return jsonify(dict(new_discount)), 201
 
     except Exception as e:
         logging.error(f"Error creating discount: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+
+# 2. تعديل خصم (نسخة معدلة)
+@admin_routes.route("/discounts/<int:discount_id>", methods=["PUT"])
+@permission_required("discounts.update")
+async def update_discount(discount_id: int):
+    try:
+        data = await request.get_json()
+
+        update_fields = []
+        params = []
+        param_counter = 1
+
+        fields_to_check = [
+            "name", "description", "discount_type", "discount_value",
+            "applicable_to_subscription_type_id", "applicable_to_subscription_plan_id",
+            "start_date", "end_date", "is_active", "lock_in_price", "lose_on_lapse",
+            "target_audience", "max_users", "display_fake_count", "fake_count_value"
+        ]
+
+        for field in fields_to_check:
+            if field in data:
+                update_fields.append(f"{field} = ${param_counter}")
+                value = data[field]
+
+                if field in ["start_date", "end_date"] and value is not None:
+                    value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                elif field == "discount_value" and value is not None:
+                    value = Decimal(value)
+
+                params.append(value)
+                param_counter += 1
+
+        if not update_fields:
+            return jsonify({"error": "No fields to update"}), 400
+
+        params.append(discount_id)
+
+        # --- ⭐ التصحيح المطبق هنا ⭐ ---
+        # المعامل الخاص بـ `id` في شرط `WHERE` هو العداد الحالي (`param_counter`)
+        query = f"""
+            UPDATE discounts SET
+                {', '.join(update_fields)}
+            WHERE id = ${param_counter}
+            RETURNING *;
+        """
+
+        async with current_app.db_pool.acquire() as connection:
+            updated_discount = await connection.fetchrow(query, *params)
+
+        if updated_discount:
+            result = {
+                k: (str(v) if isinstance(v, Decimal) else (v.isoformat() if isinstance(v, datetime) else v))
+                for k, v in dict(updated_discount).items()
+            }
+            return jsonify(result), 200
+        else:
+            return jsonify({"error": "Discount not found"}), 404
+
+    except (ValueError, TypeError) as e:
+        logging.warning(f"Invalid data format for discount {discount_id}: {e}")
+        return jsonify({"error": f"Invalid data format: {e}"}), 400
+    except Exception as e:
+        logging.error(f"Error updating discount {discount_id}: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 # 2. جلب كل الخصومات (النسخة المصححة)
 @admin_routes.route("/discounts", methods=["GET"])
@@ -1780,56 +1850,6 @@ async def get_discounts():
 
     except Exception as e:
         logging.error(f"Error fetching discounts with stats: {e}", exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
-
-
-# 3. تعديل خصم
-@admin_routes.route("/discounts/<int:discount_id>", methods=["PUT"])
-@permission_required("discounts.update")
-async def update_discount(discount_id: int):
-    try:
-        data = await request.get_json()
-
-        # --- ⭐ التصحيح هنا ⭐ ---
-        start_date = datetime.fromisoformat(data["start_date"]) if data.get("start_date") else None
-        end_date = datetime.fromisoformat(data["end_date"]) if data.get("end_date") else None
-
-        query = """
-            UPDATE discounts SET
-                name = COALESCE($1, name),
-                description = COALESCE($2, description),
-                discount_type = COALESCE($3, discount_type),
-                discount_value = COALESCE($4, discount_value),
-                applicable_to_subscription_type_id = COALESCE($5, applicable_to_subscription_type_id),
-                applicable_to_subscription_plan_id = COALESCE($6, applicable_to_subscription_plan_id),
-                start_date = COALESCE($7, start_date),
-                end_date = COALESCE($8, end_date),
-                is_active = COALESCE($9, is_active),
-                lock_in_price = COALESCE($10, lock_in_price),
-                lose_on_lapse = COALESCE($11, lose_on_lapse),
-                target_audience = COALESCE($12, target_audience)
-            WHERE id = $13
-            RETURNING *;
-        """
-        async with current_app.db_pool.acquire() as connection:
-            updated_discount = await connection.fetchrow(
-                query,
-                data.get("name"), data.get("description"), data.get("discount_type"),
-                Decimal(data["discount_value"]) if "discount_value" in data else None,
-                data.get("applicable_to_subscription_type_id"),
-                data.get("applicable_to_subscription_plan_id"),
-                start_date, end_date, data.get("is_active"),
-                data.get("lock_in_price"), data.get("lose_on_lapse"), data.get("target_audience"),
-                discount_id
-            )
-
-        if updated_discount:
-            return jsonify(dict(updated_discount)), 200
-        else:
-            return jsonify({"error": "Discount not found"}), 404
-
-    except Exception as e:
-        logging.error(f"Error updating discount {discount_id}: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 

@@ -2,7 +2,7 @@ from quart import Blueprint, request, jsonify, current_app
 import logging
 import pytz
 from datetime import datetime, timedelta, timezone
-from database.db_queries import get_user_subscriptions, upsert_user
+from database.db_queries import get_user_subscriptions, upsert_user, link_user_gmail
 from typing import Dict, Any
 
 user_bp = Blueprint("users", __name__)
@@ -133,4 +133,49 @@ async def get_user_subscriptions_endpoint():
             "ar_message": "حدث خطأ تقني، الرجاء المحاولة لاحقاً"
         }), 500
 
+# 💡=============== نقطة API لاستقبال بيانات الربط من تطبيق الموبايل ===============💡
+@user_bp.route("/api/v1/users/link-account", methods=["POST"])
+async def link_mobile_account():
+    """
+    تستقبل هذه النقطة طلب POST من خادم تطبيق الموبايل لربط حساب المستخدم
+    عن طريق إضافة بريده الإلكتروني.
+    """
+    # الخطوة 1: التحقق من مفتاح الـ API السري (الأمان أولاً)
+    auth_header = request.headers.get("Authorization")
+    expected_key = f"Bearer {os.getenv('MOBILE_API_KEY')}"
 
+    if not auth_header or auth_header != expected_key:
+        logging.warning("Unauthorized attempt to access link-account API.")
+        return jsonify({"error": "Forbidden"}), 403
+
+    try:
+        # الخطوة 2: قراءة البيانات من الطلب
+        data = await request.get_json()
+        telegram_id = data.get("telegram_id")
+        user_gmail = data.get("user_gmail")
+
+        # الخطوة 3: التحقق من وجود البيانات الأساسية
+        if not telegram_id or not user_gmail:
+            return jsonify({"error": "telegram_id and user_gmail are required"}), 400
+
+        # الخطوة 4: تنفيذ الربط في قاعدة البيانات
+        async with current_app.db_pool.acquire() as connection:
+            success = await link_user_gmail(connection, int(telegram_id), user_gmail)
+
+        # الخطوة 5: إرجاع الرد المناسب
+        if success:
+            logging.info(f"Account linking successful for telegram_id={telegram_id}")
+            return jsonify({"status": "success", "message": "Account linked successfully"}), 200
+        else:
+            # قد يكون السبب أن المستخدم غير موجود أو خطأ في قاعدة البيانات
+            return jsonify({
+                "error": "Failed to link account",
+                "ar_message": "فشل ربط الحساب، قد يكون المستخدم غير موجود"
+            }), 404
+
+    except Exception as e:
+        logging.error(f"Error in link_mobile_account endpoint: {str(e)}", exc_info=True)
+        return jsonify({
+            "error": "Internal Server Error",
+            "ar_message": "حدث خطأ داخلي في الخادم"
+        }), 500

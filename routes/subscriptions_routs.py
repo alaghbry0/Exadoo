@@ -1,3 +1,4 @@
+
 import json
 import logging
 from quart import Blueprint, request, jsonify, current_app
@@ -119,89 +120,108 @@ async def get_public_subscription_types():
 @public_routes.route("/subscription-plans", methods=["GET"])
 async def get_public_subscription_plans():
     try:
-        # قراءة المعاملات كما هي، لكن لن نُرجع خطأ الآن
         subscription_type_id = request.args.get("subscription_type_id", type=int)
         telegram_id = request.args.get("telegram_id", type=int)
 
-        # <<< التغيير الرئيسي هنا: إزالة التحقق الإلزامي >>>
-        # if not subscription_type_id:
-        #     return jsonify({"error": "subscription_type_id is required"}), 400
-
         async with current_app.db_pool.acquire() as connection:
-            
-            # <<< بناء الاستعلام بشكل ديناميكي >>>
             params = []
-            where_clauses = ["is_active = true"] # الفلتر الأساسي
+            where_clauses = ["is_active = true"]
 
-            # إذا تم توفير subscription_type_id، أضفه إلى شروط البحث
             if subscription_type_id:
                 params.append(subscription_type_id)
                 where_clauses.append(f"subscription_type_id = ${len(params)}")
-            
-            # تجميع شروط WHERE
+
             where_sql = " AND ".join(where_clauses)
-            
             base_query = f"""
                 SELECT *
                 FROM subscription_plans
                 WHERE {where_sql}
                 ORDER BY subscription_type_id, price ASC;
             """
-            
-            # تنفيذ الاستعلام مع المعاملات الديناميكية
             base_plans_records = await connection.fetch(base_query, *params)
-            # <<< نهاية التغيير الرئيسي >>>
 
-            # قائمة لتخزين القواميس النهائية بعد المعالجة
             processed_plans = []
-
             for plan_record in base_plans_records:
-                # <<< لا تغييرات هنا، بقية الكود سيعمل كما هو >>>
                 current_price = Decimal(plan_record['price'])
                 original_price = None
+                discount_details = {}
 
+                # 1. تحقق من السعر المثبت للمستخدم (أعلى أولوية) - يبقى كما هو
                 if telegram_id:
-                    # ... (بقية منطق الخصومات يبقى كما هو)
                     locked_price_query = """
                         SELECT locked_price FROM user_discounts ud
                         JOIN users u ON u.id = ud.user_id
                         WHERE u.telegram_id = $1 AND ud.subscription_plan_id = $2 AND ud.is_active = true
                     """
                     locked_record = await connection.fetchrow(locked_price_query, telegram_id, plan_record['id'])
+                    if locked_record and locked_record['locked_price'] is not None:
+                        locked_price = Decimal(locked_record['locked_price'])
+                        if locked_price < current_price:
+                            original_price = current_price
+                            current_price = locked_price
 
-                    if locked_record:
-                        original_price = current_price
-                        current_price = Decimal(locked_record['locked_price'])
-                    else:
-                        public_offer_query = """
-                            SELECT discount_type, discount_value FROM discounts
-                            WHERE 
-                                (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
-                                AND is_active = true AND target_audience = 'all_new'
-                                AND (start_date IS NULL OR start_date <= NOW())
-                                AND (end_date IS NULL OR end_date >= NOW())
-                            ORDER BY 
-                                CASE WHEN applicable_to_subscription_plan_id IS NOT NULL THEN 0 ELSE 1 END,
-                                created_at DESC 
-                            LIMIT 1;
-                        """
-                        offer_record = await connection.fetchrow(public_offer_query, plan_record['id'],
-                                                                 plan_record['subscription_type_id'])
+                # 2. إذا لم يكن هناك سعر مثبت، ابحث عن عرض عام
+                if not original_price:
+                    # ⭐ تعديل الاستعلام لجلب اسم الخصم أيضاً ⭐
+                    public_offer_query = """
+                        SELECT 
+                            id, name, discount_type, discount_value,
+                            max_users, usage_count, 
+                            display_fake_count, fake_count_value
+                        FROM discounts
+                        WHERE 
+                            (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
+                            AND is_active = true 
+                            AND target_audience = 'all_new'
+                            AND (start_date IS NULL OR start_date <= NOW())
+                            AND (end_date IS NULL OR end_date >= NOW())
+                            AND (max_users IS NULL OR usage_count < max_users)
+                        ORDER BY 
+                            CASE WHEN applicable_to_subscription_plan_id IS NOT NULL THEN 0 ELSE 1 END,
+                            created_at DESC 
+                        LIMIT 1;
+                    """
+                    offer_record = await connection.fetchrow(public_offer_query, plan_record['id'],
+                                                             plan_record['subscription_type_id'])
 
-                        if offer_record:
-                            discount_value = Decimal(offer_record['discount_value'])
-                            discounted_price = calculate_discounted_price(
-                                current_price,
-                                offer_record['discount_type'],
-                                discount_value
-                            )
-                            if discounted_price < current_price:
-                                original_price = current_price
-                                current_price = discounted_price
+                    if offer_record:
+                        # منطق حساب السعر المخفض يبقى كما هو
+                        discount_value = Decimal(offer_record['discount_value'])
+                        discounted_price = calculate_discounted_price(current_price, offer_record['discount_type'],
+                                                                      discount_value)
+
+                        if discounted_price < current_price:
+                            original_price = current_price
+                            current_price = discounted_price
+
+                            # ⭐⭐⭐ المنطقة المحورية: منطق حساب المقاعد المتبقية للعرض ⭐⭐⭐
+                            display_slots = None
+                            if offer_record['max_users'] is not None:
+                                real_remaining = offer_record['max_users'] - offer_record['usage_count']
+
+                                # تحقق مما إذا كان يجب استخدام العدد الوهمي
+                                if offer_record['display_fake_count'] and offer_record['fake_count_value'] is not None:
+                                    # القاعدة: اعرض الرقم الأقل بين العدد الحقيقي المتبقي والعدد الوهمي
+                                    # هذا يمنع عرض عدد وهمي أعلى من العدد الفعلي المتاح
+                                    display_slots = min(real_remaining, offer_record['fake_count_value'])
+                                else:
+                                    # إذا لم يكن هناك عدد وهمي، اعرض العدد الحقيقي
+                                    display_slots = real_remaining
+
+                                # تأكد من أن العدد المعروض ليس أقل من صفر
+                                display_slots = max(0, display_slots)
+
+                            discount_details = {
+                                "discount_id": offer_record['id'],
+                                "discount_name": offer_record['name'],  # <-- إضافة اسم الخصم
+                                "has_limited_slots": offer_record['max_users'] is not None,
+                                "remaining_slots": display_slots  # <-- الرقم النهائي المحسوب
+                            }
 
                 final_plan_data = dict(plan_record)
                 final_plan_data['price'] = f"{current_price:.2f}"
                 final_plan_data['original_price'] = f"{original_price:.2f}" if original_price is not None else None
+                final_plan_data['discount_details'] = discount_details
 
                 processed_plans.append(final_plan_data)
 

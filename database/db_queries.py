@@ -281,7 +281,7 @@ async def update_subscription(
     new_expiry_date: datetime,
     start_date: datetime,
     is_active: bool = True,
-    *,  # هام: يفرض أن تكون الوسائط التالية keyword-only
+    *,
     subscription_plan_id: int | None = None,
     payment_id: str | None = None,       # <-- يقبل payment_id
     source: str | None = None,           # <-- يقبل source
@@ -895,6 +895,7 @@ async def update_payment_with_txhash(
         return None
 
 
+
 async def fetch_pending_payment_by_payment_token(conn, payment_token: str) -> Optional[dict]:
     """
     جلب سجل دفع من قاعدة البيانات بناءً على payment_token.
@@ -967,7 +968,7 @@ async def update_payment_status_to_manual_check(conn, payment_token: str, error_
         await conn.execute(
             """
             UPDATE payments
-            SET status = 'manual_check', error_message = $1, processed_at = NOW()
+            SET status = 'failed', error_message = $1, processed_at = NOW()
             WHERE payment_token = $2
             """,
             f"Subscription activation failed: {error_message}",
@@ -975,7 +976,7 @@ async def update_payment_status_to_manual_check(conn, payment_token: str, error_
         )
         logging.warning(f"⚠️ تم تحديد الدفعة {payment_token} على أنها تحتاج لمراجعة يدوية.")
     except Exception as e:
-        logging.error(f"❌ فشل تحديث حالة الدفع إلى 'manual_check' لـ {payment_token}: {e}")
+        logging.error(f"❌ فشل تحديث حالة الدفع إلى 'failed' لـ {payment_token}: {e}")
 
 
 async def get_unread_notifications_count(connection, telegram_id: int) -> int:
@@ -993,3 +994,87 @@ async def get_unread_notifications_count(connection, telegram_id: int) -> int:
     except Exception as e:
         logging.error(f"Error fetching unread notifications for {telegram_id}: {e}")
         return 0
+
+
+async def link_user_gmail(connection, telegram_id: int, gmail: str) -> bool:
+    """
+    يقوم بربط أو تحديث البريد الإلكتروني (gmail) لمستخدم موجود بالفعل.
+
+    Args:
+        connection: اتصال قاعدة البيانات.
+        telegram_id: معرف المستخدم في تليجرام.
+        gmail: البريد الإلكتروني للمستخدم من تطبيق الموبايل.
+
+    Returns:
+        True إذا تم التحديث بنجاح, False في حالة حدوث خطأ.
+    """
+    try:
+        # نحن نستخدم UPDATE فقط لأن المستخدم يجب أن يكون موجودًا بالفعل
+        # من خلال تطبيقي المصغر قبل أن يتمكن من المزامنة.
+        query = """
+            UPDATE users SET gmail = $2 WHERE telegram_id = $1;
+        """
+        # execute ستعيد عدد الصفوف المتأثرة, يمكننا التحقق منها
+        result = await connection.execute(query, telegram_id, gmail)
+
+        # "UPDATE 1" يعني أنه تم تحديث صف واحد بنجاح
+        if "UPDATE 1" in result:
+            logging.info(f"✅ Gmail linked successfully for user {telegram_id}.")
+            return True
+        else:
+            # هذا يعني أن الـ telegram_id لم يتم العثور عليه
+            logging.warning(f"⚠️ Attempted to link gmail for non-existent user {telegram_id}.")
+            return False
+
+    except Exception as e:
+        logging.error(f"❌ Error linking gmail for user {telegram_id}: {e}", exc_info=True)
+        return False
+
+
+async def claim_limited_discount_slot(conn, discount_id: int) -> bool:
+    """
+    تقوم بحجز مقعد واحد لخصم محدود العدد بشكل آمن (atomic).
+    تعيد True عند النجاح، و False عند الفشل (إذا كانت المقاعد قد امتلأت).
+    """
+    if not discount_id:
+        return True  # لا يوجد خصم لتطبيقه، اعتبر العملية ناجحة
+
+    try:
+        # ابدأ معاملة داخلية أو استخدم المعاملة الحالية
+        # قفل الصف لمنع أي عملية أخرى من قراءته أو تعديله حتى انتهاء المعاملة
+        discount = await conn.fetchrow(
+            "SELECT max_users, usage_count FROM discounts WHERE id = $1 FOR UPDATE",
+            discount_id
+        )
+
+        # إذا كان الخصم غير محدود العدد، لا تفعل شيئًا
+        if not discount or discount['max_users'] is None:
+            return True
+
+        # تحقق مرة أخرى إذا كان هناك مقاعد متبقية
+        if discount['usage_count'] >= discount['max_users']:
+            logging.warning(f"Attempted to claim a slot for fully used discount ID: {discount_id}. Aborting.")
+            # يمكنك هنا أيضاً وضع علامة على الخصم كـ is_active = false
+            await conn.execute("UPDATE discounts SET is_active = false WHERE id = $1 AND is_active = true", discount_id)
+            return False
+
+        # قم بزيادة عداد الاستخدام
+        new_usage_count = discount['usage_count'] + 1
+        await conn.execute(
+            "UPDATE discounts SET usage_count = $1 WHERE id = $2",
+            new_usage_count, discount_id
+        )
+
+        logging.info(f"Successfully claimed slot for discount {discount_id}. New count: {new_usage_count}")
+
+        # إذا كان هذا هو آخر مقعد، قم بتعطيل الخصم
+        if new_usage_count >= discount['max_users']:
+            logging.info(f"Discount {discount_id} has reached its limit. Deactivating.")
+            await conn.execute("UPDATE discounts SET is_active = false WHERE id = $1", discount_id)
+
+        return True
+
+    except Exception as e:
+        logging.error(f"Error claiming discount slot for ID {discount_id}: {e}", exc_info=True)
+        # أعد إطلاق الخطأ لضمان تراجع المعاملة الخارجية (rollback)
+        raise e
