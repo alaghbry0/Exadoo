@@ -48,79 +48,78 @@ getcontext().prec = 30
 # --- دوال مساعدة ---
 async def get_price_for_user(conn, telegram_id: int, plan_id: int) -> dict:
     """
-    ⭐ تعديل: ترجع الدالة الآن قاموساً يحتوي على السعر وتفاصيل الخصم.
-    Example: {'price': Decimal('10.00'), 'discount_id': 5, 'lock_in_price': True}
+    ⭐ النسخة النهائية والمحسّنة: تجلب كل البيانات اللازمة بأقل عدد من الاستعلامات.
     """
-    # 1. تحقق من وجود سعر مُثبّت للمستخدم (أعلى أولوية دائماً)
-    #    هذا السعر خاص بالمستخدم ولا يتأثر بأي عروض عامة جديدة.
-    locked_price_query = """
-        SELECT ud.locked_price 
-        FROM user_discounts ud
-        JOIN users u ON u.id = ud.user_id
-        WHERE u.telegram_id = $1 AND ud.subscription_plan_id = $2 AND ud.is_active = true
-    """
-    locked_record = await conn.fetchrow(locked_price_query, telegram_id, plan_id)
-    if locked_record and locked_record['locked_price'] is not None:
-        logging.info(f"User {telegram_id} has a locked price for plan {plan_id}.")
-        # ⭐ تعديل: إرجاع قاموس بمعلومات السعر المثبت
-        return {
-            'price': Decimal(locked_record['locked_price']),
-            'discount_id': None,  # لا يوجد خصم عام جديد يتم تطبيقه
-            'lock_in_price': True # السعر مثبت لهذا المستخدم
-        }
+    # --- ⭐ الخطوة 1: جلب كل البيانات الأساسية في استعلامات مجمعة (حتى لو كانت لخطة واحدة) ⭐ ---
 
-    # 2. إذا لا يوجد سعر مثبت، ابحث عن السعر الأساسي والعروض العامة
+    # (استعلام 1): جلب معلومات الخطة والسعر الأساسي
     plan_info_query = "SELECT subscription_type_id, price FROM subscription_plans WHERE id = $1"
     plan_info = await conn.fetchrow(plan_info_query, plan_id)
     if not plan_info:
-        # هذا لا ينبغي أن يحدث إذا كانت البيانات متسقة
-        # يمكنك إما إرجاع خطأ أو سعر افتراضي
-        return {
-            'price': Decimal('0.0'),
-            'discount_id': None,
-            'lock_in_price': False
-        }
+        return {'price': Decimal('0.0'), 'discount_id': None, 'discount_name': None, 'lock_in_price': False}
 
     base_price = Decimal(plan_info['price'])
     subscription_type_id = plan_info['subscription_type_id']
 
-    # --- ⭐ تعديل الاستعلام لجلب الحقول الجديدة والتحقق من عدد المستخدمين ⭐ ---
-    public_offer_query = """
-        SELECT id as discount_id, discount_type, discount_value, lock_in_price
-        FROM discounts
-        WHERE 
-            (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
-            AND is_active = true
-            AND target_audience = 'all_new'
-            AND (start_date IS NULL OR start_date <= NOW())
-            AND (end_date IS NULL OR end_date >= NOW())
-            -- ⭐ شرط جديد: تأكد من أن الخصم لم يصل للحد الأقصى للمستخدمين ⭐
-            AND (max_users IS NULL OR usage_count < max_users)
-        ORDER BY 
-            CASE WHEN applicable_to_subscription_plan_id IS NOT NULL THEN 0 ELSE 1 END,
-            created_at DESC 
-        LIMIT 1;
+    # (استعلام 2): جلب السعر المثبت (إن وجد)
+    locked_price_query = """
+        SELECT ud.locked_price, d.name as discount_name FROM user_discounts ud
+        JOIN users u ON u.id = ud.user_id
+        LEFT JOIN discounts d ON d.id = ud.discount_id
+        WHERE u.telegram_id = $1 AND ud.subscription_plan_id = $2 AND ud.is_active = true
     """
-    offer_record = await conn.fetchrow(public_offer_query, plan_id, subscription_type_id)
+    locked_record = await conn.fetchrow(locked_price_query, telegram_id, plan_id)
 
-    if offer_record:
-        discounted_price = calculate_discounted_price(base_price, offer_record['discount_type'], offer_record['discount_value'])
-        logging.info(f"Applying public offer {offer_record['discount_id']} for plan {plan_id}. New price: {discounted_price}")
-        # ⭐ تعديل: إرجاع قاموس بمعلومات الخصم
-        return {
+    # (استعلام 3): جلب كل الخصومات العامة المتاحة لهذه الخطة
+    all_public_offers_query = """
+        SELECT id as discount_id, name, discount_type, discount_value, lock_in_price
+        FROM discounts
+        WHERE (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
+          AND is_active = true AND target_audience = 'all_new'
+          AND (start_date IS NULL OR start_date <= NOW())
+          AND (end_date IS NULL OR end_date >= NOW())
+          AND (max_users IS NULL OR usage_count < max_users)
+    """
+    all_offers = await conn.fetch(all_public_offers_query, plan_id, subscription_type_id)
+
+    # --- ⭐ الخطوة 2: المعالجة في الذاكرة لاختيار أفضل سعر ⭐ ---
+
+    price_options = []
+
+    # إضافة السعر الأساسي كخيار افتراضي
+    price_options.append(
+        {'price': base_price, 'discount_id': None, 'discount_name': 'Base Price', 'lock_in_price': False})
+
+    # إضافة السعر المثبت كخيار
+    if locked_record and locked_record['locked_price'] is not None:
+        price_options.append({
+            'price': Decimal(locked_record['locked_price']),
+            'discount_id': None,
+            'discount_name': locked_record.get('discount_name') or 'Locked-in Deal',
+            'lock_in_price': True
+        })
+
+    # إضافة أسعار الخصومات العامة كخيارات
+    for offer in all_offers:
+        discounted_price = calculate_discounted_price(base_price, offer['discount_type'], offer['discount_value'])
+        price_options.append({
             'price': discounted_price,
-            'discount_id': offer_record['discount_id'],
-            'lock_in_price': offer_record['lock_in_price']
-        }
+            'discount_id': offer['discount_id'],
+            'discount_name': offer['name'],
+            'lock_in_price': offer['lock_in_price']
+        })
 
-    # 3. إذا لم يوجد أي خصومات (لا مثبتة ولا عامة)، أرجع السعر الأساسي
-    logging.info(f"No discounts for plan {plan_id}. Using base price: {base_price}")
-    # ⭐ تعديل: إرجاع السعر الأساسي بنفس شكل القاموس
-    return {
-        'price': base_price,
-        'discount_id': None,
-        'lock_in_price': False # لا يوجد عرض لتثبيت السعر
-    }
+    # اختيار أفضل سعر (الأقل) من بين جميع الخيارات
+    best_option = min(price_options, key=lambda x: x['price'])
+
+    logging.info(
+        f"Best price for user {telegram_id} on plan {plan_id} is {best_option['price']} "
+        f"(Source: {best_option['discount_name'] or 'N/A'}, Discount ID: {best_option['discount_id']})"
+    )
+
+    return best_option
+
+
 
 # ==============================================================================
 # 🌟 الدالة الرئيسية الجديدة لمعالجة المدفوعات 🌟

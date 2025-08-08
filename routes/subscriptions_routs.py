@@ -117,6 +117,145 @@ async def get_public_subscription_types():
         return jsonify({"error": "Internal server error"}), 500
 
 
+# routes/payment_confirmation.py - تحسين دالة get_price_for_user
+
+async def get_price_for_user(conn, telegram_id: int, plan_id: int) -> dict:
+    """
+    ⭐ تعديل شامل: تجلب جميع الخصومات المتاحة وتختار الأفضل للعميل
+    Example: {'price': Decimal('10.00'), 'discount_id': 5, 'lock_in_price': True, 'discount_name': 'عرض الجمعة البيضاء'}
+    """
+    # 1. تحقق من وجود سعر مُثبّت للمستخدم (أعلى أولوية دائماً)
+    locked_price_query = """
+        SELECT ud.locked_price, d.name as discount_name
+        FROM user_discounts ud
+        JOIN users u ON u.id = ud.user_id
+        LEFT JOIN discounts d ON d.id = ud.discount_id
+        WHERE u.telegram_id = $1 AND ud.subscription_plan_id = $2 AND ud.is_active = true
+    """
+    locked_record = await conn.fetchrow(locked_price_query, telegram_id, plan_id)
+    if locked_record and locked_record['locked_price'] is not None:
+        logging.info(f"User {telegram_id} has a locked price for plan {plan_id}.")
+        return {
+            'price': Decimal(locked_record['locked_price']),
+            'discount_id': None,
+            'discount_name': locked_record['discount_name'],
+            'lock_in_price': True
+        }
+
+    # 2. الحصول على معلومات الخطة والسعر الأساسي
+    plan_info_query = "SELECT subscription_type_id, price FROM subscription_plans WHERE id = $1"
+    plan_info = await conn.fetchrow(plan_info_query, plan_id)
+    if not plan_info:
+        return {
+            'price': Decimal('0.0'),
+            'discount_id': None,
+            'discount_name': None,
+            'lock_in_price': False
+        }
+
+    base_price = Decimal(plan_info['price'])
+    subscription_type_id = plan_info['subscription_type_id']
+
+    # 3. ⭐ جلب جميع الخصومات المتاحة بدلاً من واحد فقط ⭐
+    all_public_offers_query = """
+        SELECT 
+            id as discount_id, 
+            name,
+            discount_type, 
+            discount_value, 
+            lock_in_price,
+            applicable_to_subscription_plan_id,
+            applicable_to_subscription_type_id,
+            created_at
+        FROM discounts
+        WHERE 
+            (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
+            AND is_active = true
+            AND target_audience = 'all_new'
+            AND (start_date IS NULL OR start_date <= NOW())
+            AND (end_date IS NULL OR end_date >= NOW())
+            AND (max_users IS NULL OR usage_count < max_users)
+        ORDER BY 
+            -- ترتيب للمساعدة في اختيار الأفضل عند التساوي
+            CASE WHEN applicable_to_subscription_plan_id IS NOT NULL THEN 0 ELSE 1 END,
+            created_at DESC;
+    """
+
+    all_offers = await conn.fetch(all_public_offers_query, plan_id, subscription_type_id)
+
+    if not all_offers:
+        # لا توجد خصومات، أرجع السعر الأساسي
+        logging.info(f"No discounts for plan {plan_id}. Using base price: {base_price}")
+        return {
+            'price': base_price,
+            'discount_id': None,
+            'discount_name': None,
+            'lock_in_price': False
+        }
+
+    # 4. ⭐ حساب جميع الأسعار واختيار الأفضل ⭐
+    best_offer = None
+    best_price = base_price  # البداية بالسعر الأساسي
+
+    # إضافة السعر الأساسي كخيار (في حالة عدم وجود خصم أفضل)
+    price_options = [{
+        'price': base_price,
+        'discount_id': None,
+        'discount_name': None,
+        'lock_in_price': False,
+        'is_base_price': True
+    }]
+
+    # حساب سعر كل خصم
+    for offer in all_offers:
+        discounted_price = calculate_discounted_price(
+            base_price,
+            offer['discount_type'],
+            offer['discount_value']
+        )
+
+        price_options.append({
+            'price': discounted_price,
+            'discount_id': offer['discount_id'],
+            'discount_name': offer['name'],
+            'lock_in_price': offer['lock_in_price'],
+            'applicable_to_plan': offer['applicable_to_subscription_plan_id'] is not None,
+            'created_at': offer['created_at'],
+            'is_base_price': False
+        })
+
+        logging.info(f"Discount {offer['discount_id']} ({offer['name']}): {base_price} -> {discounted_price}")
+
+    # 5. ⭐ اختيار أفضل سعر للعميل ⭐
+    # ترتيب حسب السعر (الأقل أولاً), ثم حسب الأولوية
+    price_options.sort(key=lambda x: (
+        x['price'],  # السعر الأقل أولاً
+        not x.get('applicable_to_plan', False),  # خصومات الخطة المحددة لها أولوية
+        x.get('created_at', datetime.min) if not x['is_base_price'] else datetime.min  # الأحدث عند التساوي
+    ))
+
+    best_option = price_options[0]
+
+    logging.info(f"""
+    Best price calculation for plan {plan_id}:
+    - Base price: {base_price}
+    - Best option: {best_option['price']} 
+    - Discount: {best_option['discount_name'] or 'None'}
+    - Total options evaluated: {len(price_options)}
+    """)
+
+    return {
+        'price': best_option['price'],
+        'discount_id': best_option['discount_id'],
+        'discount_name': best_option['discount_name'],
+        'lock_in_price': best_option['lock_in_price']
+    }
+
+
+# ======================================
+# تحسين الكود في subscriptions_routes.py
+# ======================================
+
 @public_routes.route("/subscription-plans", methods=["GET"])
 async def get_public_subscription_plans():
     try:
@@ -124,105 +263,101 @@ async def get_public_subscription_plans():
         telegram_id = request.args.get("telegram_id", type=int)
 
         async with current_app.db_pool.acquire() as connection:
+            # --- ⭐ الخطوة 1: جلب كل الخطط المطلوبة (استعلام واحد) ⭐ ---
             params = []
             where_clauses = ["is_active = true"]
-
             if subscription_type_id:
                 params.append(subscription_type_id)
                 where_clauses.append(f"subscription_type_id = ${len(params)}")
-
             where_sql = " AND ".join(where_clauses)
-            base_query = f"""
-                SELECT *
-                FROM subscription_plans
-                WHERE {where_sql}
-                ORDER BY subscription_type_id, price ASC;
-            """
+
+            base_query = f"SELECT * FROM subscription_plans WHERE {where_sql} ORDER BY price ASC;"
             base_plans_records = await connection.fetch(base_query, *params)
 
+            if not base_plans_records:
+                return jsonify([]), 200
+
+            plan_ids = [p['id'] for p in base_plans_records]
+            type_ids = list(set(p['subscription_type_id'] for p in base_plans_records))
+
+            # --- ⭐ الخطوة 2: جلب كل الخصومات المحتملة دفعة واحدة (استعلام واحد) ⭐ ---
+            all_public_offers_query = """
+                SELECT id, name, discount_type, discount_value, max_users, usage_count,
+                       display_fake_count, fake_count_value, applicable_to_subscription_plan_id,
+                       applicable_to_subscription_type_id
+                FROM discounts
+                WHERE 
+                    (applicable_to_subscription_plan_id = ANY($1::int[]) OR applicable_to_subscription_type_id = ANY($2::int[]))
+                    AND is_active = true AND target_audience = 'all_new'
+                    AND (start_date IS NULL OR start_date <= NOW())
+                    AND (end_date IS NULL OR end_date >= NOW())
+                    AND (max_users IS NULL OR usage_count < max_users)
+            """
+            all_discounts = await connection.fetch(all_public_offers_query, plan_ids, type_ids)
+
+            # --- ⭐ الخطوة 3: جلب كل الأسعار المثبتة للمستخدم دفعة واحدة (استعلام واحد) ⭐ ---
+            locked_prices = {}
+            if telegram_id:
+                locked_price_query = """
+                    SELECT subscription_plan_id, locked_price FROM user_discounts ud
+                    JOIN users u ON u.id = ud.user_id
+                    WHERE u.telegram_id = $1 AND ud.is_active = true AND ud.subscription_plan_id = ANY($2::int[])
+                """
+                locked_price_records = await connection.fetch(locked_price_query, telegram_id, plan_ids)
+                locked_prices = {r['subscription_plan_id']: Decimal(r['locked_price']) for r in locked_price_records}
+
+            # --- ⭐ الخطوة 4: المعالجة في الذاكرة (بدون استعلامات داخل الحلقة) ⭐ ---
             processed_plans = []
-            for plan_record in base_plans_records:
-                current_price = Decimal(plan_record['price'])
-                original_price = None
-                discount_details = {}
+            for plan in base_plans_records:
+                base_price = Decimal(plan['price'])
 
-                # 1. تحقق من السعر المثبت للمستخدم (أعلى أولوية) - يبقى كما هو
-                if telegram_id:
-                    locked_price_query = """
-                        SELECT locked_price FROM user_discounts ud
-                        JOIN users u ON u.id = ud.user_id
-                        WHERE u.telegram_id = $1 AND ud.subscription_plan_id = $2 AND ud.is_active = true
-                    """
-                    locked_record = await connection.fetchrow(locked_price_query, telegram_id, plan_record['id'])
-                    if locked_record and locked_record['locked_price'] is not None:
-                        locked_price = Decimal(locked_record['locked_price'])
-                        if locked_price < current_price:
-                            original_price = current_price
-                            current_price = locked_price
+                possible_prices = [{'price': base_price, 'original_price': None, 'discount_details': {}}]
 
-                # 2. إذا لم يكن هناك سعر مثبت، ابحث عن عرض عام
-                if not original_price:
-                    # ⭐ تعديل الاستعلام لجلب اسم الخصم أيضاً ⭐
-                    public_offer_query = """
-                        SELECT 
-                            id, name, discount_type, discount_value,
-                            max_users, usage_count, 
-                            display_fake_count, fake_count_value
-                        FROM discounts
-                        WHERE 
-                            (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
-                            AND is_active = true 
-                            AND target_audience = 'all_new'
-                            AND (start_date IS NULL OR start_date <= NOW())
-                            AND (end_date IS NULL OR end_date >= NOW())
-                            AND (max_users IS NULL OR usage_count < max_users)
-                        ORDER BY 
-                            CASE WHEN applicable_to_subscription_plan_id IS NOT NULL THEN 0 ELSE 1 END,
-                            created_at DESC 
-                        LIMIT 1;
-                    """
-                    offer_record = await connection.fetchrow(public_offer_query, plan_record['id'],
-                                                             plan_record['subscription_type_id'])
+                # إضافة السعر المثبت كخيار
+                if plan['id'] in locked_prices and locked_prices[plan['id']] < base_price:
+                    possible_prices.append({
+                        'price': locked_prices[plan['id']],
+                        'original_price': base_price,
+                        'discount_details': {}
+                    })
 
-                    if offer_record:
-                        # منطق حساب السعر المخفض يبقى كما هو
-                        discount_value = Decimal(offer_record['discount_value'])
-                        discounted_price = calculate_discounted_price(current_price, offer_record['discount_type'],
-                                                                      discount_value)
+                # فلترة الخصومات المطبقة على هذه الخطة
+                applicable_discounts = [
+                    d for d in all_discounts
+                    if d['applicable_to_subscription_plan_id'] == plan['id'] or \
+                       d['applicable_to_subscription_type_id'] == plan['subscription_type_id']
+                ]
 
-                        if discounted_price < current_price:
-                            original_price = current_price
-                            current_price = discounted_price
+                for offer in applicable_discounts:
+                    discounted_price = calculate_discounted_price(base_price, offer['discount_type'],
+                                                                  offer['discount_value'])
+                    if discounted_price < base_price:
+                        display_slots = None
+                        if offer['max_users'] is not None:
+                            real_remaining = offer['max_users'] - offer['usage_count']
+                            display_slots = min(real_remaining, offer['fake_count_value']) if offer[
+                                                                                                  'display_fake_count'] and \
+                                                                                              offer[
+                                                                                                  'fake_count_value'] else real_remaining
+                            display_slots = max(0, display_slots)
 
-                            # ⭐⭐⭐ المنطقة المحورية: منطق حساب المقاعد المتبقية للعرض ⭐⭐⭐
-                            display_slots = None
-                            if offer_record['max_users'] is not None:
-                                real_remaining = offer_record['max_users'] - offer_record['usage_count']
+                        discount_details = {
+                            "discount_id": offer['id'], "discount_name": offer['name'],
+                            "has_limited_slots": offer['max_users'] is not None, "remaining_slots": display_slots
+                        }
+                        possible_prices.append({
+                            'price': discounted_price, 'original_price': base_price,
+                            'discount_details': discount_details
+                        })
 
-                                # تحقق مما إذا كان يجب استخدام العدد الوهمي
-                                if offer_record['display_fake_count'] and offer_record['fake_count_value'] is not None:
-                                    # القاعدة: اعرض الرقم الأقل بين العدد الحقيقي المتبقي والعدد الوهمي
-                                    # هذا يمنع عرض عدد وهمي أعلى من العدد الفعلي المتاح
-                                    display_slots = min(real_remaining, offer_record['fake_count_value'])
-                                else:
-                                    # إذا لم يكن هناك عدد وهمي، اعرض العدد الحقيقي
-                                    display_slots = real_remaining
+                # اختيار أفضل سعر (الأقل) من كل الخيارات
+                best_price_option = min(possible_prices, key=lambda x: x['price'])
 
-                                # تأكد من أن العدد المعروض ليس أقل من صفر
-                                display_slots = max(0, display_slots)
-
-                            discount_details = {
-                                "discount_id": offer_record['id'],
-                                "discount_name": offer_record['name'],  # <-- إضافة اسم الخصم
-                                "has_limited_slots": offer_record['max_users'] is not None,
-                                "remaining_slots": display_slots  # <-- الرقم النهائي المحسوب
-                            }
-
-                final_plan_data = dict(plan_record)
-                final_plan_data['price'] = f"{current_price:.2f}"
-                final_plan_data['original_price'] = f"{original_price:.2f}" if original_price is not None else None
-                final_plan_data['discount_details'] = discount_details
-
+                final_plan_data = dict(plan)
+                final_plan_data['price'] = f"{best_price_option['price']:.2f}"
+                final_plan_data['original_price'] = f"{best_price_option['original_price']:.2f}" if best_price_option[
+                    'original_price'] else None
+                final_plan_data['discount_details'] = best_price_option['discount_details']
                 processed_plans.append(final_plan_data)
 
         return jsonify(processed_plans), 200
