@@ -9,7 +9,8 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 import aiohttp
 from utils.payment_utils import OP_JETTON_TRANSFER, JETTON_DECIMALS, normalize_address, convert_amount, OP_JETTON_TRANSFER_NOTIFICATION
 from database.db_queries import record_payment, update_payment_with_txhash, fetch_pending_payment_by_payment_token, \
-    record_incoming_transaction,  update_payment_status_to_manual_check, claim_limited_discount_slot
+    record_incoming_transaction,  update_payment_status_to_manual_check
+from database.tiered_discount_queries import get_price_for_user_with_tiered, claim_discount_slot_universal, claim_limited_discount_slot
 from pytoniq import LiteBalancer, begin_cell, Address
 from pytoniq.liteclient.client import LiteServerError
 from typing import Optional  # لإضافة تلميحات النوع
@@ -43,81 +44,6 @@ getcontext().prec = 30
     #level=logging.WARNING,
 #format='%(asctime)s - %(levelname)s - %(message)s'
 #)
-
-
-# --- دوال مساعدة ---
-async def get_price_for_user(conn, telegram_id: int, plan_id: int) -> dict:
-    """
-    ⭐ النسخة النهائية والمحسّنة: تجلب كل البيانات اللازمة بأقل عدد من الاستعلامات.
-    """
-    # --- ⭐ الخطوة 1: جلب كل البيانات الأساسية في استعلامات مجمعة (حتى لو كانت لخطة واحدة) ⭐ ---
-
-    # (استعلام 1): جلب معلومات الخطة والسعر الأساسي
-    plan_info_query = "SELECT subscription_type_id, price FROM subscription_plans WHERE id = $1"
-    plan_info = await conn.fetchrow(plan_info_query, plan_id)
-    if not plan_info:
-        return {'price': Decimal('0.0'), 'discount_id': None, 'discount_name': None, 'lock_in_price': False}
-
-    base_price = Decimal(plan_info['price'])
-    subscription_type_id = plan_info['subscription_type_id']
-
-    # (استعلام 2): جلب السعر المثبت (إن وجد)
-    locked_price_query = """
-        SELECT ud.locked_price, d.name as discount_name FROM user_discounts ud
-        JOIN users u ON u.id = ud.user_id
-        LEFT JOIN discounts d ON d.id = ud.discount_id
-        WHERE u.telegram_id = $1 AND ud.subscription_plan_id = $2 AND ud.is_active = true
-    """
-    locked_record = await conn.fetchrow(locked_price_query, telegram_id, plan_id)
-
-    # (استعلام 3): جلب كل الخصومات العامة المتاحة لهذه الخطة
-    all_public_offers_query = """
-        SELECT id as discount_id, name, discount_type, discount_value, lock_in_price
-        FROM discounts
-        WHERE (applicable_to_subscription_plan_id = $1 OR applicable_to_subscription_type_id = $2)
-          AND is_active = true AND target_audience = 'all_new'
-          AND (start_date IS NULL OR start_date <= NOW())
-          AND (end_date IS NULL OR end_date >= NOW())
-          AND (max_users IS NULL OR usage_count < max_users)
-    """
-    all_offers = await conn.fetch(all_public_offers_query, plan_id, subscription_type_id)
-
-    # --- ⭐ الخطوة 2: المعالجة في الذاكرة لاختيار أفضل سعر ⭐ ---
-
-    price_options = []
-
-    # إضافة السعر الأساسي كخيار افتراضي
-    price_options.append(
-        {'price': base_price, 'discount_id': None, 'discount_name': 'Base Price', 'lock_in_price': False})
-
-    # إضافة السعر المثبت كخيار
-    if locked_record and locked_record['locked_price'] is not None:
-        price_options.append({
-            'price': Decimal(locked_record['locked_price']),
-            'discount_id': None,
-            'discount_name': locked_record.get('discount_name') or 'Locked-in Deal',
-            'lock_in_price': True
-        })
-
-    # إضافة أسعار الخصومات العامة كخيارات
-    for offer in all_offers:
-        discounted_price = calculate_discounted_price(base_price, offer['discount_type'], offer['discount_value'])
-        price_options.append({
-            'price': discounted_price,
-            'discount_id': offer['discount_id'],
-            'discount_name': offer['name'],
-            'lock_in_price': offer['lock_in_price']
-        })
-
-    # اختيار أفضل سعر (الأقل) من بين جميع الخيارات
-    best_option = min(price_options, key=lambda x: x['price'])
-
-    logging.info(
-        f"Best price for user {telegram_id} on plan {plan_id} is {best_option['price']} "
-        f"(Source: {best_option['discount_name'] or 'N/A'}, Discount ID: {best_option['discount_id']})"
-    )
-
-    return best_option
 
 
 
@@ -173,18 +99,23 @@ async def process_single_transaction(transaction_data: dict[str, any]):
             telegram_id = int(pending_payment['telegram_id'])
             subscription_plan_id = pending_payment['subscription_plan_id']
 
-            # الخطوة 3: التحقق من المبلغ المدفوع (باستخدام الدالة المعدلة)
-            # ⭐ تعديل: استقبال قاموس بدلاً من سعر فقط
-            price_details = await get_price_for_user(conn, telegram_id, subscription_plan_id)
+            # --- ⭐ بداية الكود المعدل ---
+
+            # الخطوة 3: التحقق من المبلغ باستخدام الدالة الجديدة
+            price_details = await get_price_for_user_with_tiered(conn, telegram_id, subscription_plan_id)
             expected_price = price_details['price']
             discount_id_to_apply = price_details['discount_id']
-            lock_in_price_flag = price_details['lock_in_price']
+            lock_in_price_flag = price_details.get('lock_in_price', False)
+            # استخراج معلومات الطبقة ليتم تمريرها لاحقاً
+            tier_info_to_apply = price_details.get('tier_info')
 
             difference = expected_price - jetton_amount
-
-            # ⭐ تعديل: تحديث اللوغ ليشمل معرّف الخصم
             logging.info(
-                f"🔍 [Core Processor] Amount comparison: Expected={expected_price}, Received={jetton_amount}, Difference={difference}, DiscountID={discount_id_to_apply}")
+                f"🔍 [Core Processor] Amount comparison: Expected={expected_price}, Received={jetton_amount}, "
+                f"Difference={difference}, DiscountID={discount_id_to_apply}, TierID={tier_info_to_apply.get('tier_id') if tier_info_to_apply else 'N/A'}"
+            )
+
+            # --- نهاية الكود المعدل ---
 
             acceptable_tolerance = Decimal('0.30')
             silent_tolerance = Decimal('0.15')
@@ -232,22 +163,25 @@ async def process_single_transaction(transaction_data: dict[str, any]):
                                                                 "Bot object not found during processing")
                     return
 
-                # ⭐ تعديل: إضافة معرّف الخصم والـ flag إلى بيانات الدفعة
+                # --- ⭐ بداية الكود المعدل ---
+
                 payment_full_data = {
                     **pending_payment,
                     "tx_hash": tx_hash,
                     "amount_received": jetton_amount,
                     "discount_id": discount_id_to_apply,
-                    "lock_in_price": lock_in_price_flag
+                    "lock_in_price": lock_in_price_flag,
+                    "tier_info": tier_info_to_apply  # <-- إضافة معلومات الطبقة
                 }
 
-                # ⭐ تعديل: تمرير دالة حجز المقعد إلى معالج الاشتراك
+                # استدعاء دالة التجديد مع البيانات الكاملة
                 await process_subscription_renewal(
                     connection=conn,
                     bot=bot,
-                    payment_data=payment_full_data,
-
+                    payment_data=payment_full_data
                 )
+
+                # --- نهاية الكود المعدل ---
 
             else:
                 logging.warning(
@@ -478,15 +412,9 @@ async def confirm_payment():
 
         async with current_app.db_pool.acquire() as conn:
             try:
-                # --- ⭐ بداية التغيير المطلوب ---
-
-                # 1. استقبل القاموس الكامل في متغير اسمه price_details
-                price_details = await get_price_for_user(conn, telegram_id, subscription_plan_id)
-
-                # 2. استخرج قيمة 'price' من القاموس
+                # --- ⭐ التصحيح هنا: استدعاء الدالة الموحدة الجديدة ---
+                price_details = await get_price_for_user_with_tiered(conn, telegram_id, subscription_plan_id)
                 amount_decimal = price_details['price']
-
-                # 3. الآن يمكنك تحويل الرقم العشري (Decimal) إلى float بأمان
                 amount = float(amount_decimal)
 
                 # --- نهاية التغيير المطلوب ---

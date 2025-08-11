@@ -15,6 +15,8 @@ from database.db_queries import (
     add_scheduled_task,
     update_payment_with_txhash  # <-- إضافة مهمة لتحديث حالة الدفع
 )
+from database.tiered_discount_queries import claim_discount_slot_universal, save_user_discount
+
 from typing import Optional
 from decimal import Decimal
 from utils.db_utils import generate_channel_invite_link, send_message_to_user
@@ -22,6 +24,8 @@ from asyncpg import Connection
 from aiogram import Bot
 from utils.notifications import create_notification
 from utils.system_notifications import send_system_notification
+
+
 
 # --- إعدادات وثوابت ---
 LOCAL_TZ = pytz.timezone("Asia/Riyadh")
@@ -216,16 +220,6 @@ async def _activate_or_renew_subscription_core(
 
             main_invite_link = main_channel_data['invite_link']
 
-            # --- 2. منطق تثبيت السعر (إذا كانت البيانات متاحة) ---
-            if subscription_plan_id and amount_received is not None:
-                await _handle_price_lock_in(
-                    connection=connection,
-                    telegram_id=telegram_id,
-                    plan_id=subscription_plan_id,
-                    subscription_type_id=subscription_type_id,
-                    amount_received=amount_received
-                )
-
             # --- 3. حساب تواريخ البدء والانتهاء ---
             current_time_utc = datetime.now(timezone.utc)
             start_date, expiry_date = await calculate_subscription_dates(
@@ -257,40 +251,25 @@ async def _activate_or_renew_subscription_core(
             if not main_subscription_id:
                 raise RuntimeError("فشل في إنشاء أو تحديث سجل الاشتراك الرئيسي.")
 
-            # --- 5. جدولة مهام القنوات الفرعية ---
+            # --- 5. جدولة مهام القنوات ---
             secondary_links_to_send = []
             for channel in all_channels:
+                task_type = "remove_user"
+                # جدولة مهمة الإزالة للقناة الرئيسية والفرعية
+                await add_scheduled_task(
+                    connection=connection, task_type=task_type, telegram_id=telegram_id,
+                    execute_at=expiry_date, channel_id=channel['channel_id'], clean_up=True
+                )
+                logging.info(f"CORE: Scheduled '{task_type}' task for user {telegram_id} from channel {channel['channel_id']} at {expiry_date}.")
+
                 if not channel['is_main']:
                     if channel.get('invite_link'):
                         secondary_links_to_send.append(
                             f"▫️ قناة <a href='{channel['invite_link']}'>{channel['channel_name']}</a>")
-                        await add_scheduled_task(
-                            connection=connection, task_type="remove_user", telegram_id=telegram_id,
-                            execute_at=expiry_date, channel_id=channel['channel_id'], clean_up=True
-                        )
                     else:
                         logging.warning(
                             f"CORE: Skipping secondary channel {channel['channel_id']} for user {telegram_id} due to missing invite link.")
 
-            # =================================================================
-            # 🔽🔽🔽 بداية التعديل الذي يحل المشكلة 🔽🔽🔽
-            # =================================================================
-
-            # --- 5.1. جدولة مهام الإزالة للقناة الرئيسية ---
-            # أولاً: جدولة مهمة لإزالة المستخدم من القناة الرئيسية عند انتهاء الاشتراك
-            await add_scheduled_task(
-                connection=connection,
-                task_type="remove_user",
-                telegram_id=telegram_id,
-                execute_at=expiry_date,
-                channel_id=main_channel_id,
-                clean_up=True
-            )
-            logging.info(f"CORE: Scheduled 'remove_user' task for user {telegram_id} from main channel {main_channel_id} at {expiry_date}.")
-
-            # =================================================================
-            # 🔼🔼🔼 نهاية التعديل 🔼🔼🔼
-            # =================================================================
 
             # --- 6. تسجيل في سجل الاشتراكات ---
             previous_history = await connection.fetchval("SELECT 1 FROM subscription_history WHERE payment_id = $1", tx_hash)
@@ -301,9 +280,9 @@ async def _activate_or_renew_subscription_core(
 
             history_data = json.dumps({"full_name": full_name, "username": username, "source": source})
             history_record = await connection.fetchrow(
-                """INSERT INTO subscription_history 
-                   (subscription_id, invite_link, action_type, subscription_type_name, subscription_plan_name, 
-                    renewal_date, expiry_date, telegram_id, extra_data, payment_id, payment_token) 
+                """INSERT INTO subscription_history
+                   (subscription_id, invite_link, action_type, subscription_type_name, subscription_plan_name,
+                    renewal_date, expiry_date, telegram_id, extra_data, payment_id, payment_token)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id""",
                 main_subscription_id, main_invite_link, action_type, subscription_type_name,
                 plan_name, start_date, expiry_date, telegram_id, history_data,
@@ -350,128 +329,124 @@ async def _activate_or_renew_subscription_core(
 
 
 
+# ⭐ تعديل: الدالة أصبحت تستخدم discount_details لتمرير معلومات الخصم
 async def _execute_renewal_logic(
         connection: Connection,
         bot: Bot,
         payment_data: dict
 ) -> tuple[bool, str]:
     """
-    مُغلِّف للتجديد الآلي. يستخرج البيانات ويستدعي الدالة الجوهرية.
+    يحجز مقعد الخصم، يثبت السعر (إذا لزم الأمر)، ثم يستدعي الدالة الجوهرية.
     """
-    # 1. استخراج البيانات من الدفعة
     telegram_id = payment_data.get("telegram_id")
     subscription_plan_id = payment_data.get("subscription_plan_id")
-    tx_hash = payment_data.get("tx_hash")
-    payment_token = payment_data.get("payment_token")
     amount_received = payment_data.get("amount_received", Decimal('0.0'))
+    discount_id_to_claim = payment_data.get("discount_id")
+    tier_info_to_save = payment_data.get("tier_info")
 
-    # 2. جلب تفاصيل الخطة (للحصول على المدة والاسم)
-    subscription_plan = await connection.fetchrow(
-        "SELECT subscription_type_id, name, duration_days FROM subscription_plans WHERE id = $1",
-        subscription_plan_id
-    )
-    if not subscription_plan:
-        return False, f"خطة اشتراك غير صالحة: {subscription_plan_id}"
+    try:
+        # هذه الدالة تعمل داخل معاملة (transaction) من الدالة التي تستدعيها
+        # الخطوة 1: حجز مقعد في الخصم (إذا كان هناك خصم مطبق)
+        if discount_id_to_claim:
+            claim_successful, claimed_tier_info = await claim_discount_slot_universal(connection, discount_id_to_claim)
+            if not claim_successful:
+                return False, "نفدت الكمية المتاحة لهذا العرض أو لم يعد صالحًا."
+            if claimed_tier_info: tier_info_to_save = claimed_tier_info
 
-    subscription_type_id = subscription_plan["subscription_type_id"]
-    duration_days = subscription_plan["duration_days"]
-    plan_name = subscription_plan["name"]
+        # الخطوة 2: جلب تفاصيل الخطة
+        subscription_plan = await connection.fetchrow("SELECT * FROM subscription_plans WHERE id = $1",
+                                                      subscription_plan_id)
+        if not subscription_plan: raise ValueError(f"خطة اشتراك غير صالحة: {subscription_plan_id}")
 
-    # 3. استدعاء الدالة الجوهرية بكل البيانات
-    success, message, _ = await _activate_or_renew_subscription_core(
-        connection=connection,
-        bot=bot,
-        telegram_id=telegram_id,
-        subscription_type_id=subscription_type_id,
-        duration_days=duration_days,
-        source="Automatically",
-        subscription_plan_id=subscription_plan_id,
-        plan_name=plan_name,
-        payment_token=payment_token,
-        tx_hash=tx_hash,
-        amount_received=amount_received
-    )
+        # ⭐ تعديل: استخراج البيانات اللازمة لتثبيت السعر من الخصم الرئيسي
+        discount_details = None
+        if discount_id_to_claim:
+            discount_details = await connection.fetchrow(
+                "SELECT lock_in_price, price_lock_duration_months FROM discounts WHERE id = $1",
+                discount_id_to_claim
+            )
 
-    # لا حاجة للتعامل مع الإشعارات هنا، الدالة الجوهرية قامت بذلك
-    return success, message
+        # الخطوة 3: معالجة تثبيت السعر
+        await _record_discount_usage(  # <-- تم تغيير الاسم هنا
+            connection=connection,
+            telegram_id=telegram_id,
+            plan_id=subscription_plan_id,
+            amount_received=amount_received,
+            discount_id=discount_id_to_claim,
+            tier_info=tier_info_to_save,
+            discount_details=discount_details
+        )
 
-async def _handle_price_lock_in(
+        # الخطوة 4: استدعاء الدالة الجوهرية لتفعيل أو تجديد الاشتراك
+        success, message, _ = await _activate_or_renew_subscription_core(
+            connection=connection, bot=bot, telegram_id=telegram_id,
+            subscription_type_id=subscription_plan["subscription_type_id"],
+            duration_days=subscription_plan["duration_days"], source="Automatically",
+            subscription_plan_id=subscription_plan_id, plan_name=subscription_plan["name"],
+            payment_token=payment_data.get("payment_token"), tx_hash=payment_data.get("tx_hash"),
+            amount_received=amount_received
+        )
+        if not success: raise Exception(f"Core subscription renewal failed: {message}")
+
+        return success, message
+    except Exception as e:
+        logging.error(f"Critical error during renewal transaction for user {telegram_id}: {e}", exc_info=True)
+        return False, "حدث خطأ فني أثناء محاولة تجديد اشتراكك. تم إلغاء العملية بالكامل."
+
+
+# ⭐ تعديل: الدالة المحدثة بالكامل للتعامل مع منطق تثبيت السعر
+async def _record_discount_usage(
         connection: Connection,
         telegram_id: int,
         plan_id: int,
-        subscription_type_id: int,
-        amount_received: Decimal
+        amount_received: Decimal,
+        discount_id: Optional[int],
+        tier_info: Optional[dict],
+        discount_details: Optional[dict]
 ):
     """
-    Handles the logic for locking in a discounted price for a user
-    if they subscribed during a promotion with the 'lock_in_price' flag.
+    توثق استخدام الخصم في جدول user_discounts.
+    - إذا كان الخصم يتطلب تثبيت السعر، تنشئ سجلاً نشطاً.
+    - إذا لم يكن يتطلب، تنشئ سجلاً تاريخياً غير نشط.
     """
+    # إذا لم يكن هناك خصم، لا تفعل شيئاً
+    if not discount_id or not discount_details:
+        return
+
     try:
-        logging.info(f"Checking for price lock-in for user={telegram_id}, plan={plan_id}")
-
-        # الخطوة 1: ابحث عن `user_id`
         user_id_record = await connection.fetchrow("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
-        if not user_id_record:
-            logging.warning(
-                f"Price lock-in check failed: User with telegram_id {telegram_id} not found in users table.")
-            return
-
+        if not user_id_record: return
         user_id = user_id_record['id']
 
-        # الخطوة 2: تحقق مما إذا كان لدى المستخدم سعر مثبت بالفعل لهذه الخطة لتجنب العمل غير الضروري
-        existing_lock = await connection.fetchval(
-            "SELECT 1 FROM user_discounts WHERE user_id = $1 AND subscription_plan_id = $2 AND is_active = true",
-            user_id, plan_id
-        )
-        if existing_lock:
-            logging.info(f"User {telegram_id} already has a locked price for plan {plan_id}. Skipping.")
-            return
+        should_lock_price = discount_details.get('lock_in_price', False)
 
-        # الخطوة 3: ابحث عن العرض الذي كان فعالاً عند الاشتراك ويتطلب تثبيت السعر
-        # هذا الاستعلام أكثر دقة لأنه يبحث عن العرض العام الذي كان متاحاً
-        offer_query = """
-            SELECT id as discount_id
-            FROM discounts
-            WHERE 
-                (applicable_to_subscription_type_id = $1 OR applicable_to_subscription_type_id IS NULL)
-                AND is_active = true
-                AND lock_in_price = true  -- أهم شرط: هل العرض يتطلب تثبيت السعر؟
-                AND target_audience = 'all_new'
-                AND (start_date IS NULL OR start_date <= NOW())
-                AND (end_date IS NULL OR end_date >= NOW())
-            ORDER BY 
-                -- نعطي الأولوية للعرض المخصص لنوع الاشتراك
-                CASE WHEN applicable_to_subscription_type_id IS NOT NULL THEN 0 ELSE 1 END,
-                created_at DESC
-            LIMIT 1;
-        """
-        offer = await connection.fetchrow(offer_query, subscription_type_id)
-
-        # الخطوة 4: إذا وجدنا عرضاً مطابقاً، قم بتثبيت السعر
-        if offer:
-            discount_id = offer['discount_id']
-            locked_price = amount_received  # السعر المثبت هو المبلغ الذي دفعه المستخدم بالفعل
-
-            logging.info(
-                f"Found active 'lock_in_price' offer (ID: {discount_id}) for user {telegram_id}. Locking price at {locked_price}.")
-
-            # استخدم ON CONFLICT لضمان عدم حدوث خطأ إذا تمت إضافة الخصم في نفس اللحظة من عملية أخرى (أمان إضافي)
-            await connection.execute(
-                """
-                INSERT INTO user_discounts (user_id, discount_id, subscription_plan_id, locked_price, is_active)
-                VALUES ($1, $2, $3, $4, true)
-                ON CONFLICT (user_id, subscription_plan_id, is_active) DO NOTHING;
-                """,
-                user_id,
-                discount_id,
-                plan_id,
-                locked_price
+        if should_lock_price:
+            # ⭐ الحالة 1: تثبيت السعر مفعل (السلوك القديم)
+            logging.info(f"Price lock is enabled for discount {discount_id}. Saving active record for user {user_id}.")
+            await save_user_discount(
+                conn=connection,
+                user_id=user_id,
+                plan_id=plan_id,
+                discount_id=discount_id,
+                locked_price=amount_received,
+                tier_info=tier_info,
+                lock_duration_months=discount_details.get('price_lock_duration_months'),
+                is_active=True  # <-- نمرر True
             )
-            logging.info(
-                f"✅ Price locked for user_id={user_id} (telegram_id={telegram_id}) on plan_id={plan_id} at {locked_price}")
         else:
-            logging.info(f"No active 'lock_in_price' offer found for user {telegram_id} on plan {plan_id}.")
+            # ⭐ الحالة 2: تثبيت السعر معطل (السلوك الجديد)
+            logging.info(f"Price lock is disabled. Saving historical record for discount {discount_id} usage by user {user_id}.")
+            await save_user_discount(
+                conn=connection,
+                user_id=user_id,
+                plan_id=plan_id,
+                discount_id=discount_id,
+                locked_price=amount_received,  # نسجل السعر الذي دفعه
+                tier_info=tier_info,
+                lock_duration_months=None,  # لا توجد مدة
+                is_active=False  # <-- نمرر False
+            )
 
     except Exception as e:
-        # نسجل الخطأ ولكن لا نوقف عملية التجديد الرئيسية بسببه
-        logging.error(f"❌ Error during price lock-in check for user {telegram_id}: {e}", exc_info=True)
+        # من المهم عدم إيقاف عملية التجديد بالكامل بسبب خطأ في التوثيق
+        logging.error(f"❌ Non-critical error during discount usage recording for user {telegram_id}: {e}", exc_info=True)

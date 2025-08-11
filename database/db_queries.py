@@ -1,3 +1,5 @@
+# database/db_queries.py
+
 import asyncpg
 from datetime import datetime, timedelta, timezone  # <-- تأكد من وجود timezone هنا
 from config import DATABASE_CONFIG
@@ -1030,51 +1032,3 @@ async def link_user_gmail(connection, telegram_id: int, gmail: str) -> bool:
         logging.error(f"❌ Error linking gmail for user {telegram_id}: {e}", exc_info=True)
         return False
 
-
-async def claim_limited_discount_slot(conn, discount_id: int) -> bool:
-    """
-    تقوم بحجز مقعد واحد لخصم محدود العدد بشكل آمن (atomic).
-    تعيد True عند النجاح، و False عند الفشل (إذا كانت المقاعد قد امتلأت).
-    """
-    if not discount_id:
-        return True  # لا يوجد خصم لتطبيقه، اعتبر العملية ناجحة
-
-    try:
-        # ابدأ معاملة داخلية أو استخدم المعاملة الحالية
-        # قفل الصف لمنع أي عملية أخرى من قراءته أو تعديله حتى انتهاء المعاملة
-        discount = await conn.fetchrow(
-            "SELECT max_users, usage_count FROM discounts WHERE id = $1 FOR UPDATE",
-            discount_id
-        )
-
-        # إذا كان الخصم غير محدود العدد، لا تفعل شيئًا
-        if not discount or discount['max_users'] is None:
-            return True
-
-        # تحقق مرة أخرى إذا كان هناك مقاعد متبقية
-        if discount['usage_count'] >= discount['max_users']:
-            logging.warning(f"Attempted to claim a slot for fully used discount ID: {discount_id}. Aborting.")
-            # يمكنك هنا أيضاً وضع علامة على الخصم كـ is_active = false
-            await conn.execute("UPDATE discounts SET is_active = false WHERE id = $1 AND is_active = true", discount_id)
-            return False
-
-        # قم بزيادة عداد الاستخدام
-        new_usage_count = discount['usage_count'] + 1
-        await conn.execute(
-            "UPDATE discounts SET usage_count = $1 WHERE id = $2",
-            new_usage_count, discount_id
-        )
-
-        logging.info(f"Successfully claimed slot for discount {discount_id}. New count: {new_usage_count}")
-
-        # إذا كان هذا هو آخر مقعد، قم بتعطيل الخصم
-        if new_usage_count >= discount['max_users']:
-            logging.info(f"Discount {discount_id} has reached its limit. Deactivating.")
-            await conn.execute("UPDATE discounts SET is_active = false WHERE id = $1", discount_id)
-
-        return True
-
-    except Exception as e:
-        logging.error(f"Error claiming discount slot for ID {discount_id}: {e}", exc_info=True)
-        # أعد إطلاق الخطأ لضمان تراجع المعاملة الخارجية (rollback)
-        raise e

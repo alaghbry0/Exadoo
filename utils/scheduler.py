@@ -10,7 +10,6 @@ from database.db_queries import (
     get_pending_tasks,
     update_task_status,
     get_subscription,
-    deactivate_subscription,
     add_scheduled_task,
     find_lapsable_user_discounts_for_type,
     deactivate_multiple_user_discounts,

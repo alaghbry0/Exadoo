@@ -1,3 +1,5 @@
+# routes/admin_routes.py
+
 import os
 from dotenv import load_dotenv
 import json
@@ -31,6 +33,7 @@ from database.db_queries import (
     get_failed_payment_for_retry
 )
 from database.db_queries import update_subscription as update_subscription_db
+from database.tiered_discount_queries import create_tiered_discount, update_discount_tiers
 from utils.messaging_batch import FailedSendDetail
 from utils.discount_utils import calculate_discounted_price
 
@@ -1684,172 +1687,194 @@ async def get_subscription_plan(plan_id: int):
         return jsonify({"error": "Internal server error"}), 500
 
 
-#######################################
-# نقاط API لإدارة الخصومات (Discounts)
-#######################################
-
-# 1. إنشاء خصم جديد
+# ==============================================================================
+# 1. إنشاء خصم جديد (النسخة النهائية والمبسطة)
+# ==============================================================================
 @admin_routes.route("/discounts", methods=["POST"])
 @permission_required("discounts.create")
 async def create_discount():
     try:
         data = await request.get_json()
+        is_tiered = data.get("is_tiered", False)
 
-        # التحقق من البيانات الإلزامية
-        required_fields = ["name", "discount_type", "discount_value", "target_audience"]
-        if not all(field in data for field in required_fields):
-            return jsonify({"error": "Missing required fields"}), 400
-
-        # تحويل التواريخ من نص إلى كائنات تاريخ إذا كانت موجودة
-        start_date = datetime.fromisoformat(data["start_date"]) if data.get("start_date") else None
-        end_date = datetime.fromisoformat(data["end_date"]) if data.get("end_date") else None
-
-        query = """
-            INSERT INTO discounts (
-                name, description, discount_type, discount_value,
-                applicable_to_subscription_type_id, applicable_to_subscription_plan_id,
-                start_date, end_date, is_active, lock_in_price, lose_on_lapse, target_audience,
-                -- ⭐ الحقول الجديدة هنا ⭐
-                max_users, display_fake_count, fake_count_value
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            RETURNING *;
-        """
         async with current_app.db_pool.acquire() as connection:
-            new_discount = await connection.fetchrow(
-                query,
-                data["name"],
-                data.get("description"),
-                data["discount_type"],
-                Decimal(data["discount_value"]),
-                data.get("applicable_to_subscription_type_id"),
-                data.get("applicable_to_subscription_plan_id"),
-                start_date,
-                end_date,
-                data.get("is_active", True),
-                data.get("lock_in_price", False),
-                data.get("lose_on_lapse", False),
-                data["target_audience"],
-                # ⭐ تمرير قيم الحقول الجديدة ⭐
-                data.get("max_users"),
-                data.get("display_fake_count", False),
-                data.get("fake_count_value")
-            )
+            async with connection.transaction():
+                if is_tiered:
+                    # --- منطق الخصم المتدرج ---
+                    required_fields = ["name", "target_audience", "tiers", "lock_in_price"]
+                    if not all(field in data for field in required_fields):
+                        return jsonify({
+                                           "error": "Missing fields for tiered discount (name, target_audience, tiers, lock_in_price)"}), 400
 
-        # تحويل سجل قاعدة البيانات إلى قاموس يمكن تحويله لـ JSON
-        return jsonify(dict(new_discount)), 201
+                    tiers = data.get("tiers")
+                    if not isinstance(tiers, list) or not tiers:
+                        return jsonify({"error": "Tiered discount requires a non-empty 'tiers' array"}), 400
 
+                    # ⭐ تمرير كل بيانات الخصم الرئيسي إلى الدالة المساعدة
+                    result = await create_tiered_discount(connection, data, tiers)
+                    # تحويل القيم غير القابلة للتسلسل
+                    if result.get('tiers'):
+                        for tier in result['tiers']:
+                            if 'created_at' in tier: tier['created_at'] = tier['created_at'].isoformat()
+                    return jsonify(result), 201
+
+                else:
+                    # --- منطق الخصم العادي ---
+                    required_fields = ["name", "discount_type", "discount_value", "target_audience"]
+                    if not all(field in data for field in required_fields):
+                        return jsonify({"error": "Missing required fields for standard discount"}), 400
+
+                    query = """
+                        INSERT INTO discounts (
+                            name, description, discount_type, discount_value,
+                            applicable_to_subscription_type_id, applicable_to_subscription_plan_id,
+                            start_date, end_date, is_active, lock_in_price, lose_on_lapse, target_audience,
+                            max_users, display_fake_count, fake_count_value, is_tiered
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, false)
+                        RETURNING *;
+                    """
+                    start_date = datetime.fromisoformat(data["start_date"]) if data.get("start_date") else None
+                    end_date = datetime.fromisoformat(data["end_date"]) if data.get("end_date") else None
+
+                    new_discount = await connection.fetchrow(
+                        query,
+                        data["name"], data.get("description"), data["discount_type"], Decimal(data["discount_value"]),
+                        data.get("applicable_to_subscription_type_id"), data.get("applicable_to_subscription_plan_id"),
+                        start_date, end_date,
+                        data.get("is_active", True), data.get("lock_in_price", False),
+                        data.get("lose_on_lapse", False), data["target_audience"], data.get("max_users"),
+                        data.get("display_fake_count", False), data.get("fake_count_value")
+                    )
+                    return jsonify(dict(new_discount)), 201
+
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Invalid data format: {e}"}), 400
     except Exception as e:
         logging.error(f"Error creating discount: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
-# 2. تعديل خصم (نسخة معدلة)
+# ==============================================================================
+# 2. تعديل خصم (النسخة النهائية والموحدة)
+# ==============================================================================
 @admin_routes.route("/discounts/<int:discount_id>", methods=["PUT"])
 @permission_required("discounts.update")
 async def update_discount(discount_id: int):
     try:
         data = await request.get_json()
-
-        update_fields = []
-        params = []
-        param_counter = 1
-
-        fields_to_check = [
-            "name", "description", "discount_type", "discount_value",
-            "applicable_to_subscription_type_id", "applicable_to_subscription_plan_id",
-            "start_date", "end_date", "is_active", "lock_in_price", "lose_on_lapse",
-            "target_audience", "max_users", "display_fake_count", "fake_count_value"
-        ]
-
-        for field in fields_to_check:
-            if field in data:
-                update_fields.append(f"{field} = ${param_counter}")
-                value = data[field]
-
-                if field in ["start_date", "end_date"] and value is not None:
-                    value = datetime.fromisoformat(value.replace('Z', '+00:00'))
-                elif field == "discount_value" and value is not None:
-                    value = Decimal(value)
-
-                params.append(value)
-                param_counter += 1
-
-        if not update_fields:
-            return jsonify({"error": "No fields to update"}), 400
-
-        params.append(discount_id)
-
-        # --- ⭐ التصحيح المطبق هنا ⭐ ---
-        # المعامل الخاص بـ `id` في شرط `WHERE` هو العداد الحالي (`param_counter`)
-        query = f"""
-            UPDATE discounts SET
-                {', '.join(update_fields)}
-            WHERE id = ${param_counter}
-            RETURNING *;
-        """
+        tiers = data.get("tiers")
 
         async with current_app.db_pool.acquire() as connection:
-            updated_discount = await connection.fetchrow(query, *params)
+            async with connection.transaction():
+                # --- تحديث الحقول الرئيسية في جدول discounts (لا تغيير هنا) ---
+                update_fields = []
+                params = []
+                param_counter = 1
+                fields_to_check = [
+                    "name", "description", "discount_type", "discount_value",
+                    "applicable_to_subscription_type_id", "applicable_to_subscription_plan_id",
+                    "start_date", "end_date", "is_active", "lock_in_price", "lose_on_lapse",
+                    "target_audience", "max_users", "display_fake_count", "fake_count_value",
+                    "is_tiered", "price_lock_duration_months"
+                ]
 
-        if updated_discount:
-            result = {
-                k: (str(v) if isinstance(v, Decimal) else (v.isoformat() if isinstance(v, datetime) else v))
-                for k, v in dict(updated_discount).items()
-            }
-            return jsonify(result), 200
-        else:
-            return jsonify({"error": "Discount not found"}), 404
+                for field in fields_to_check:
+                    if field in data:
+                        update_fields.append(f"{field} = ${param_counter}")
+                        value = data[field]
+                        if field in ["start_date", "end_date"] and value is not None:
+                            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                        elif field == "discount_value" and value is not None:
+                            value = Decimal(value)
+                        params.append(value)
+                        param_counter += 1
+
+                if update_fields:
+                    params.append(discount_id)
+                    update_query = f"UPDATE discounts SET {', '.join(update_fields)} WHERE id = ${param_counter}"
+                    await connection.execute(update_query, *params)
+
+                # =================================================================
+                # 🔽🔽🔽 بداية التصحيح: استبدال المنطق القديم بالجديد 🔽🔽🔽
+                # =================================================================
+
+                # --- تحديث المستويات (Tiers) بذكاء إذا تم إرسالها ---
+                if tiers is not None:
+                    if not isinstance(tiers, list):
+                        raise ValueError("'tiers' must be a list.")
+
+                    logging.info(f"Smart updating tiers for discount {discount_id}...")
+                    await update_discount_tiers(connection, discount_id, tiers)
+                    logging.info(f"Tiers for discount {discount_id} updated successfully.")
+
+                # =================================================================
+                # 🔼🔼🔼 نهاية التصحيح 🔼🔼🔼
+                # =================================================================
+
+        return jsonify({"message": f"Discount {discount_id} updated successfully"}), 200
 
     except (ValueError, TypeError) as e:
-        logging.warning(f"Invalid data format for discount {discount_id}: {e}")
         return jsonify({"error": f"Invalid data format: {e}"}), 400
     except Exception as e:
         logging.error(f"Error updating discount {discount_id}: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
-# 2. جلب كل الخصومات (النسخة المصححة)
+# ==============================================================================
+# 3. جلب كل الخصومات (النسخة النهائية والمحدثة)
+# ==============================================================================
 @admin_routes.route("/discounts", methods=["GET"])
 @permission_required("discounts.read")
 async def get_discounts():
     try:
-        # استعلام يدمج الخصومات مع إحصائياتها بمنطق محدث ومتوافق مع التعديلات الأخيرة
+        # ⭐ استعلام محدث ليشمل كل الحقول الجديدة من جدول المستويات
         query = """
-            SELECT
-                d.*,
-                -- عدد الحاصلين على الخصم حاليًا (لا تغيير هنا، هذا صحيح)
-                (SELECT COUNT(DISTINCT ud.user_id)
-                 FROM user_discounts ud
-                 WHERE ud.discount_id = d.id AND ud.is_active = true) as active_holders_count,
-
-                -- عدد المستخدمين المحتملين (المستهدفين)
-                (CASE
-                    WHEN d.target_audience = 'existing_subscribers' THEN
-                        (SELECT COUNT(DISTINCT s.user_id)
-                         FROM subscriptions s
-                         -- --- ⭐ التعديل الرئيسي هنا ---
-                         -- تمت إزالة شرط "s.is_active = true" ليشمل جميع المشتركين (النشطين والمنتهيين)
-                         -- وهذا ليعكس منطق دالة تطبيق الخصم الجديدة.
-                         WHERE (
-                               (d.applicable_to_subscription_plan_id IS NOT NULL AND s.subscription_plan_id = d.applicable_to_subscription_plan_id)
-                               OR
-                               (d.applicable_to_subscription_plan_id IS NULL AND d.applicable_to_subscription_type_id IS NOT NULL AND s.subscription_type_id = d.applicable_to_subscription_type_id)
-                           )
-                        )
-                    ELSE 0
-                END) as potential_recipients_count
-            FROM
-                discounts d
-            ORDER BY
-                d.created_at DESC;
+        SELECT
+            d.*,
+            (SELECT COUNT(DISTINCT ud.user_id) FROM user_discounts ud WHERE ud.discount_id = d.id AND ud.is_active = true) as active_holders_count,
+            json_agg(
+                json_build_object(
+                    'id', dt.id,
+                    'tier_order', dt.tier_order,
+                    'discount_value', dt.discount_value,
+                    'max_slots', dt.max_slots,
+                    'used_slots', dt.used_slots,
+                    'display_fake_count', dt.display_fake_count, -- ⭐ تمت الإضافة
+                    'fake_count_value', dt.fake_count_value,     -- ⭐ تمت الإضافة
+                    'is_active', dt.is_active,
+                    'created_at', dt.created_at
+                ) ORDER BY dt.tier_order ASC
+            ) FILTER (WHERE dt.id IS NOT NULL) AS tiers
+        FROM
+            discounts d
+        LEFT JOIN
+            discount_tiers dt ON d.id = dt.discount_id
+        GROUP BY
+            d.id
+        ORDER BY
+            d.created_at DESC;
         """
         async with current_app.db_pool.acquire() as connection:
             results = await connection.fetch(query)
 
-        discounts = [dict(r) for r in results]
+        discounts = []
+        for record in results:
+            discount_dict = dict(record)
+            if discount_dict.get('tiers') is None:
+                discount_dict['tiers'] = []
+
+            # تحويل القيم غير القابلة للتسلسل (مثل التواريخ و Decimal) إلى نص
+            for key, value in discount_dict.items():
+                if isinstance(value, datetime):
+                    discount_dict[key] = value.isoformat()
+                elif isinstance(value, Decimal):
+                    discount_dict[key] = str(value)
+
+            discounts.append(discount_dict)
+
         return jsonify(discounts), 200
 
     except Exception as e:
-        logging.error(f"Error fetching discounts with stats: {e}", exc_info=True)
+        logging.error(f"Error fetching discounts with stats and tiers: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
