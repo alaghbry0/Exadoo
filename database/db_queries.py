@@ -993,6 +993,18 @@ async def get_all_channel_ids_for_type(connection, subscription_type_id: int) ->
         logging.error(f"❌ Error fetching all channel IDs for subscription_type_id {subscription_type_id}: {e}")
         return []
 
+async def get_reminder_settings(connection):
+    """
+    🔹 جلب إعدادات التذكيرات من قاعدة البيانات.
+    يفترض وجود صف واحد فقط في الجدول.
+    """
+    try:
+        # نفترض أن هناك صف واحد فقط من الإعدادات، لذا نستخدم LIMIT 1
+        settings = await connection.fetchrow("SELECT * FROM reminder_settings ORDER BY id LIMIT 1")
+        return settings
+    except Exception as e:
+        logging.error(f"❌ Error fetching reminder settings: {e}")
+        return None
 
 async def get_unread_notifications_count(connection, telegram_id: int) -> int:
     """

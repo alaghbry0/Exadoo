@@ -13,7 +13,8 @@ from database.db_queries import (
     add_subscription,
     update_subscription,
     add_scheduled_task,
-    update_payment_with_txhash  # <-- إضافة مهمة لتحديث حالة الدفع
+    update_payment_with_txhash,  # <-- إضافة مهمة لتحديث حالة الدفع
+    get_reminder_settings
 )
 from database.tiered_discount_queries import claim_discount_slot_universal, save_user_discount
 
@@ -394,14 +395,11 @@ async def _reschedule_all_tasks_for_subscription(
 ):
     """
     🔹 تقوم هذه الدالة بإعادة جدولة كل المهام (إزالة وتذكيرات) لاشتراك معين.
-    1. تحذف جميع المهام القديمة ذات الصلة لضمان عدم وجود تكرار.
-    2. تقوم بجدولة المهام الجديدة بناءً على تاريخ انتهاء الصلاحية الجديد.
+    (نسخة محدثة للتعامل مع التذكيرات بالساعات)
     """
     logging.info(f"Rescheduling all tasks for user {telegram_id} in main channel {main_channel_id}.")
 
-    # --- الخطوة 1: المسح الشامل (Clean Sweep) ---
-    # نحذف كل أنواع المهام التي نديرها لهذا المستخدم وهذه القناة الرئيسية دفعة واحدة.
-    # هذا يضمن عدم بقاء أي مهام قديمة (remove_user, first_reminder, second_reminder).
+    # --- الخطوة 1: المسح الشامل (Clean Sweep) - (لا تغيير هنا) ---
     task_types_to_clean = ('remove_user', 'first_reminder', 'second_reminder')
     await connection.execute("""
         DELETE FROM scheduled_tasks
@@ -413,35 +411,40 @@ async def _reschedule_all_tasks_for_subscription(
 
     # --- الخطوة 2: جدولة المهام الجديدة ---
 
-    # 2.1: جدولة مهمة الإزالة
+    # 2.1: جدولة مهمة الإزالة (لا تغيير هنا)
     await add_scheduled_task(
         connection,
         task_type="remove_user",
         telegram_id=telegram_id,
         execute_at=expiry_date,
         channel_id=main_channel_id,
-        clean_up=False  # المسح تم بالفعل، لا داعي للتكرار
+        clean_up=False
     )
 
-    # 2.2: جدولة التذكيرات
-    reminder_settings = await get_reminder_settings(connection)  # نفترض أنك أضفت هذه الدالة في db_queries.py
+    # 2.2: جدولة التذكيرات (هنا التعديل)
+    reminder_settings = await get_reminder_settings(connection)
     if reminder_settings:
         now_utc = datetime.now(timezone.utc)
 
+        # ⭐⭐⭐ التعديل هنا: استخدام hours بدلاً من days ⭐⭐⭐
         # التذكير الأول
-        first_reminder_date = expiry_date - timedelta(days=reminder_settings['first_reminder'])
+        first_reminder_hours = reminder_settings['first_reminder']
+        first_reminder_date = expiry_date - timedelta(hours=first_reminder_hours)
         if first_reminder_date > now_utc:
             await add_scheduled_task(
                 connection, "first_reminder", telegram_id, first_reminder_date, main_channel_id, clean_up=False
             )
 
+        # ⭐⭐⭐ التعديل هنا: استخدام hours بدلاً من days ⭐⭐⭐
         # التذكير الثاني
-        second_reminder_date = expiry_date - timedelta(days=reminder_settings['second_reminder'])
+        second_reminder_hours = reminder_settings['second_reminder']
+        second_reminder_date = expiry_date - timedelta(hours=second_reminder_hours)
         if second_reminder_date > now_utc:
             await add_scheduled_task(
                 connection, "second_reminder", telegram_id, second_reminder_date, main_channel_id, clean_up=False
             )
-        logging.info(f"Scheduled new reminder tasks for user {telegram_id}.")
+
+        logging.info(f"Scheduled new reminder tasks for user {telegram_id} (using hours).")
     else:
         logging.warning(f"Could not schedule reminders for user {telegram_id}, settings not found.")
 
