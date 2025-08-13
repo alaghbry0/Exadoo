@@ -155,11 +155,29 @@ async def handle_remove_user_task(bot: Bot, connection, telegram_id: int, channe
                 if lapsable_discount_groups:
                     logging.info(
                         f"User {telegram_id} has {len(lapsable_discount_groups)} groups of lapsable discounts. Scheduling deactivation tasks.")
+
+                    # ⭐⭐⭐ الخطوة 1: جلب اسم نوع الاشتراك ⭐⭐⭐
+                    subscription_type_name = await connection.fetchval(
+                        "SELECT name FROM subscription_types WHERE id = $1",
+                        subscription_type_id
+                    )
+                    # وضع قيمة افتراضية في حال لم يتم العثور على الاسم لأي سبب
+                    subscription_type_name = subscription_type_name or "هذا الاشتراك"
+
+                    # ⭐⭐⭐ الخطوة 2: بناء الرسالة الجديدة باستخدام f-string ⭐⭐⭐
+                    warning_message = (
+                        f"🔔 تنبيه هام!\n\n"
+                        f"لقد انتهى اشتراكك في \"{subscription_type_name}\". لديك خصومات خاصة مرتبطة بهذا الاشتراك. "
+                        f"إذا لم تقم بالتجديد خلال 7 أيام، ستفقد هذه الخصومات بشكل دائم."
+                    )
+
                     try:
-                        await send_message_to_user(bot, telegram_id,
-                                                   "🔔 تنبيه هام!\n\nلقد انتهى اشتراكك. لديك خصومات خاصة مرتبطة بهذا النوع من الاشتراك. إذا لم تقم بالتجديد خلال 7 أيام، ستفقد هذه الخصومات بشكل دائم.")
+                        # ⭐⭐⭐ الخطوة 3: إرسال الرسالة المخصصة ⭐⭐⭐
+                        await send_message_to_user(bot, telegram_id, warning_message)
                     except Exception as msg_err:
                         logging.error(f"Could not send discount warning message to {telegram_id}: {msg_err}")
+
+                    # --- باقي الكود لجدولة مهمة إلغاء الخصم (لا تغيير هنا) ---
                     deactivation_time = datetime.now(timezone.utc) + timedelta(hours=168)
                     for lapsable_group in lapsable_discount_groups:
                         await add_scheduled_task(connection=connection, task_type="deactivate_discount_grace_period",
@@ -167,9 +185,8 @@ async def handle_remove_user_task(bot: Bot, connection, telegram_id: int, channe
                                                  payload={'user_id': user_id,
                                                           'discount_id': lapsable_group['original_discount_id']},
                                                  clean_up=False)
-        # --- نهاية منطق الخصومات ---
 
-        # الخطوة 4: تحديث حالة المهمة الرئيسية بعد الانتهاء من كل القنوات
+            # الخطوة 4: تحديث حالة المهمة الرئيسية بعد الانتهاء من كل القنوات
         await update_task_status(connection, task_id, "completed")
 
     except Exception as e:
