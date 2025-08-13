@@ -108,18 +108,30 @@ class BackgroundTaskService:
 
     async def start_channel_audit(self) -> str:
         """
-        يبدأ مهمة فحص شاملة لجميع القنوات المدارة باستخدام نظام المهام.
+        يبدأ مهمة فحص شاملة للقنوات المرتبطة باشتراكات نشطة فقط.
         """
-        self.logger.info("Starting a new channel audit task.")
+        self.logger.info("Starting a new channel audit task for active subscription types.")
 
         async with self.db_pool.acquire() as conn:
-            # جلب كل القنوات التي يديرها البوت
+            # --- ▼▼▼ بداية التعديل ▼▼▼ ---
+            # جلب كل القنوات التي لديها اشتراكات نشطة حالياً فقط
             managed_channels_records = await conn.fetch(
-                "SELECT DISTINCT channel_id, channel_name FROM subscription_type_channels"
+                """
+                SELECT DISTINCT stc.channel_id, stc.channel_name
+                FROM subscription_type_channels stc
+                JOIN subscriptions s ON stc.subscription_type_id = s.subscription_type_id
+                WHERE s.is_active = TRUE
+                """
             )
+            # --- ▲▲▲ نهاية التعديل ▲▲▲ ---
 
         if not managed_channels_records:
-            raise ValueError("No managed channels found to audit.")
+            # تم تعديل الرسالة لتعكس المنطق الجديد
+            self.logger.warning("No managed channels with active subscriptions found to audit.")
+            # يمكنك إما إرجاع خطأ أو إكمال المهمة بنجاح دون عمل شيء
+            # هنا سنختار عدم إطلاق خطأ، لأنها حالة متوقعة
+            raise ValueError("No managed channels with active subscriptions found to audit.")
+
 
         # قائمة القنوات التي سيتم معالجتها، عنصر واحد لكل قناة
         channels_to_audit = [dict(rec) for rec in managed_channels_records]
