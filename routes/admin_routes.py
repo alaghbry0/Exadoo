@@ -20,7 +20,7 @@ import asyncpg
 import asyncio
 import io
 import pandas as pd
-from routes.subscriptions import process_subscription_renewal, _activate_or_renew_subscription_core
+from routes.subscriptions import process_subscription_renewal, _activate_or_renew_subscription_core, _reschedule_all_tasks_for_subscription
 from utils.notifications import create_notification
 from utils.db_utils import remove_users_from_channel, generate_channel_invite_link, send_message_to_user, \
     generate_shared_invite_link_for_channel, remove_user_from_channel
@@ -3048,53 +3048,54 @@ async def get_incoming_transactions():
 async def update_subscription(subscription_id):
     try:
         data = await request.get_json()
-        expiry_date = data.get("expiry_date")
-        subscription_plan_id = data.get("subscription_plan_id")
-        source = data.get("source")  # مثال: "manual" أو "auto"
+        new_expiry_date_str = data.get("expiry_date")  # سنركز على تعديل تاريخ الانتهاء
 
-        if expiry_date is None and subscription_plan_id is None and source is None:
-            return jsonify({"error": "No fields provided for update"}), 400
-
-        update_fields = []
-        params = []
-        idx = 1
-        local_tz = pytz.timezone("Asia/Riyadh")
-
-        if expiry_date:
-            # تحويل expiry_date إلى datetime timezone-aware باستخدام local_tz
-            dt_expiry = datetime.fromisoformat(expiry_date.replace("Z", "")).replace(tzinfo=pytz.UTC).astimezone(
-                local_tz)
-            update_fields.append(f"expiry_date = ${idx}")
-            params.append(dt_expiry)
-            idx += 1
-
-            # إعادة حساب is_active بناءً على expiry_date
-            is_active = dt_expiry > datetime.now(local_tz)
-            update_fields.append(f"is_active = ${idx}")
-            params.append(is_active)
-            idx += 1
-
-        if subscription_plan_id:
-            update_fields.append(f"subscription_plan_id = ${idx}")
-            params.append(subscription_plan_id)
-            idx += 1
-
-        if source:
-            update_fields.append(f"source = ${idx}")
-            params.append(source)
-            idx += 1
-
-        update_fields.append("updated_at = now()")
-        query = f"UPDATE subscriptions SET {', '.join(update_fields)} WHERE id = ${idx} RETURNING *;"
-        params.append(subscription_id)
+        if not new_expiry_date_str:
+            return jsonify({"error": "Only 'expiry_date' updates are supported via this logic for now."}), 400
 
         async with current_app.db_pool.acquire() as connection:
-            row = await connection.fetchrow(query, *params)
-        if not row:
-            return jsonify({"error": "Subscription not found"}), 404
-        return jsonify(dict(row))
+            async with connection.transaction():
+                # الخطوة 1: جلب البيانات الحالية للاشتراك (نحتاج telegram_id و channel_id)
+                current_sub = await connection.fetchrow(
+                    "SELECT telegram_id, channel_id FROM subscriptions WHERE id = $1",
+                    subscription_id
+                )
+                if not current_sub:
+                    return jsonify({"error": "Subscription not found"}), 404
+
+                telegram_id = current_sub['telegram_id']
+                main_channel_id = current_sub['channel_id']
+
+                # الخطوة 2: تحويل التاريخ الجديد وتحديث قاعدة البيانات
+                # (الكود الحالي الخاص بك لتحويل التاريخ جيد)
+                local_tz = pytz.timezone("Asia/Riyadh")
+                dt_expiry_aware = datetime.fromisoformat(new_expiry_date_str.replace("Z", "+00:00"))
+                is_active = dt_expiry_aware > datetime.now(timezone.utc)
+
+                await connection.execute(
+                    """UPDATE subscriptions 
+                       SET expiry_date = $1, is_active = $2, updated_at = now() 
+                       WHERE id = $3""",
+                    dt_expiry_aware, is_active, subscription_id
+                )
+
+                # ⭐⭐⭐ الخطوة 3: استدعاء دالة إعادة الجدولة (الحل للمشكلة) ⭐⭐⭐
+                await _reschedule_all_tasks_for_subscription(
+                    connection=connection,
+                    telegram_id=telegram_id,
+                    main_channel_id=main_channel_id,
+                    expiry_date=dt_expiry_aware
+                )
+
+                # جلب السجل المحدث لإعادته
+                updated_row = await connection.fetchrow("SELECT * FROM subscriptions WHERE id = $1", subscription_id)
+
+        # تحويل السجل إلى قاموس قبل إرساله كـ JSON
+        response_data = dict(updated_row) if updated_row else {}
+        return jsonify(response_data)
+
     except Exception as e:
-        logging.error("Error updating subscription: %s", e, exc_info=True)
+        logging.error("Error updating subscription via admin: %s", e, exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 
@@ -3270,7 +3271,14 @@ async def cancel_subscription_admin():
                     }), 500
 
                 # 4. حذف المهام المجدولة
-                await delete_scheduled_tasks_for_subscription(conn, telegram_id, channels)
+                task_types_to_clean = ('remove_user', 'first_reminder', 'second_reminder')
+                await conn.execute("""
+                                    DELETE FROM scheduled_tasks
+                                    WHERE telegram_id = $1
+                                      AND channel_id = $2
+                                      AND task_type = ANY($3::text[])
+                                """, telegram_id, main_channel_id, list(task_types_to_clean))
+                logging.info(f"ADMIN CANCEL: Cleaned up all scheduled tasks for user {telegram_id}.")
 
                 # 5. تسجيل الـ history
                 await conn.execute(

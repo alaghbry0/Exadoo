@@ -166,6 +166,7 @@ async def process_subscription_renewal(
 
     return success, message
 
+
 async def _activate_or_renew_subscription_core(
         connection: Connection,
         bot: Bot,
@@ -180,26 +181,24 @@ async def _activate_or_renew_subscription_core(
         user_full_name: Optional[str] = None,
         user_username: Optional[str] = None,
         amount_received: Optional[Decimal] = None
-
 ) -> tuple[bool, str, dict]:
     """
-    الدالة الجوهرية والمركزية لتفعيل أو تجديد أي اشتراك.
-    Returns: (success, message, result_data)
+    الدالة الجوهرية والمركزية لتفعيل أو تجديد أي اشتراك (نسخة محسّنة).
     """
-    # استخدام transaction لضمان أن كل العمليات تنجح معًا أو تفشل معًا
     async with connection.transaction():
         try:
-            # --- 1. جلب البيانات الأساسية ---
+            # --- الخطوة 1: جلب بيانات المستخدم وإضافته إذا لم يكن موجوداً ---
             user_record = await get_user(connection, telegram_id)
             if not user_record:
                 await add_user(connection, telegram_id, username=user_username, full_name=user_full_name)
-                logging.info(f"User {telegram_id} not found, added to database.")
-                user_record = await get_user(connection, telegram_id)
+                user_record = await get_user(connection, telegram_id)  # إعادة الجلب للحصول على السجل الكامل
 
+            # تحديد الاسم للترحيب والتسجيل
             full_name = user_full_name or user_record.get('full_name')
             username = user_username or user_record.get('username')
             greeting_name = full_name or username or str(telegram_id)
 
+            # --- الخطوة 2: جلب بيانات نوع الاشتراك وقنواته ---
             type_info = await connection.fetchrow(
                 "SELECT name, channel_id AS main_channel_id FROM subscription_types WHERE id = $1",
                 subscription_type_id
@@ -211,23 +210,18 @@ async def _activate_or_renew_subscription_core(
             main_channel_id = int(type_info["main_channel_id"])
 
             all_channels = await connection.fetch(
-                "SELECT channel_id, channel_name, is_main, invite_link FROM subscription_type_channels WHERE subscription_type_id = $1 ORDER BY is_main DESC",
+                "SELECT channel_name, is_main, invite_link FROM subscription_type_channels WHERE subscription_type_id = $1",
                 subscription_type_id
             )
-            main_channel_data = next((ch for ch in all_channels if ch['is_main']), None)
-            if not main_channel_data or not main_channel_data.get('invite_link'):
-                raise ValueError(f"رابط الدعوة للقناة الرئيسية لنوع الاشتراك {subscription_type_id} غير موجود.")
 
-            main_invite_link = main_channel_data['invite_link']
-
-            # --- 3. حساب تواريخ البدء والانتهاء ---
+            # --- الخطوة 3: حساب تواريخ البدء والانتهاء ---
             current_time_utc = datetime.now(timezone.utc)
             start_date, expiry_date = await calculate_subscription_dates(
                 connection, telegram_id, main_channel_id, duration_days,
                 120 if IS_DEVELOPMENT else 0, current_time_utc
             )
 
-            # --- 4. إضافة أو تحديث الاشتراك الرئيسي ---
+            # --- الخطوة 4: إضافة أو تحديث الاشتراك الرئيسي ---
             existing_sub = await connection.fetchrow(
                 "SELECT id FROM subscriptions WHERE telegram_id = $1 AND channel_id = $2", telegram_id, main_channel_id)
 
@@ -251,46 +245,40 @@ async def _activate_or_renew_subscription_core(
             if not main_subscription_id:
                 raise RuntimeError("فشل في إنشاء أو تحديث سجل الاشتراك الرئيسي.")
 
-            # --- 5. جدولة مهام القنوات ---
-            secondary_links_to_send = []
-            for channel in all_channels:
-                task_type = "remove_user"
-                # جدولة مهمة الإزالة للقناة الرئيسية والفرعية
-                await add_scheduled_task(
-                    connection=connection, task_type=task_type, telegram_id=telegram_id,
-                    execute_at=expiry_date, channel_id=channel['channel_id'], clean_up=True
-                )
-                logging.info(f"CORE: Scheduled '{task_type}' task for user {telegram_id} from channel {channel['channel_id']} at {expiry_date}.")
+            # --- ⭐⭐⭐ الخطوة 5: إعادة جدولة جميع المهام (التحسين الرئيسي) ⭐⭐⭐ ---
+            await _reschedule_all_tasks_for_subscription(
+                connection=connection,
+                telegram_id=telegram_id,
+                main_channel_id=main_channel_id,
+                expiry_date=expiry_date
+            )
+            logging.info(f"CORE: Rescheduled all tasks for user {telegram_id} with new expiry {expiry_date}.")
 
-                if not channel['is_main']:
-                    if channel.get('invite_link'):
-                        secondary_links_to_send.append(
-                            f"▫️ قناة <a href='{channel['invite_link']}'>{channel['channel_name']}</a>")
-                    else:
-                        logging.warning(
-                            f"CORE: Skipping secondary channel {channel['channel_id']} for user {telegram_id} due to missing invite link.")
-
-
-            # --- 6. تسجيل في سجل الاشتراكات ---
-            previous_history = await connection.fetchval("SELECT 1 FROM subscription_history WHERE payment_id = $1", tx_hash)
+            # --- الخطوة 6: تسجيل الإجراء في سجل الاشتراكات ---
             if source.startswith('admin'):
                 action_type = 'ADMIN_RENEWAL' if existing_sub else 'ADMIN_NEW'
             else:
-                action_type = 'RENEWAL' if previous_history or existing_sub else 'NEW'
+                # التحقق من السجل السابق لتحديد ما إذا كان تجديداً حقيقياً
+                previous_history = await connection.fetchval(
+                    "SELECT 1 FROM subscription_history WHERE telegram_id = $1 AND subscription_type_id = $2",
+                    telegram_id, subscription_type_id)
+                action_type = 'RENEWAL' if existing_sub or previous_history else 'NEW'
 
             history_data = json.dumps({"full_name": full_name, "username": username, "source": source})
+            main_invite_link = next((ch['invite_link'] for ch in all_channels if ch['is_main']), None)
+
             history_record = await connection.fetchrow(
                 """INSERT INTO subscription_history
                    (subscription_id, invite_link, action_type, subscription_type_name, subscription_plan_name,
-                    renewal_date, expiry_date, telegram_id, extra_data, payment_id, payment_token)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id""",
+                    renewal_date, expiry_date, telegram_id, extra_data, payment_id, payment_token, subscription_type_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id""",
                 main_subscription_id, main_invite_link, action_type, subscription_type_name,
                 plan_name, start_date, expiry_date, telegram_id, history_data,
-                tx_hash, payment_token
+                tx_hash, payment_token, subscription_type_id
             )
             history_id = history_record['id'] if history_record else None
 
-            # --- 7. إرسال الإشعارات ---
+            # --- الخطوة 7: إرسال الإشعارات والروابط للمستخدم ---
             action_verb = 'تجديد' if 'RENEWAL' in action_type else 'تفعيل'
             notification_title = f"{action_verb} اشتراك: {subscription_type_name}"
             notification_message = (
@@ -306,6 +294,10 @@ async def _activate_or_renew_subscription_core(
                 extra_data=notification_extra, is_public=False, telegram_ids=[telegram_id]
             )
 
+            # إرسال روابط القنوات الفرعية إن وجدت
+            secondary_links_to_send = [f"▫️ قناة <a href='{ch['invite_link']}'>{ch['channel_name']}</a>"
+                                       for ch in all_channels if not ch['is_main'] and ch.get('invite_link')]
+
             if secondary_links_to_send:
                 secondary_msg = (
                         f"📬 بالإضافة إلى اشتراكك الرئيسي، يمكنك الانضمام للقنوات الفرعية التالية:\n\n" +
@@ -314,8 +306,9 @@ async def _activate_or_renew_subscription_core(
                 )
                 await send_message_to_user(bot, telegram_id, secondary_msg)
 
-            logging.info(f"✅ CORE: Subscription {action_type} for user {telegram_id} processed successfully within transaction.")
+            logging.info(f"✅ CORE: Subscription {action_type} for user {telegram_id} processed successfully.")
 
+            # --- الخطوة 8: إرجاع البيانات للرد على المستخدم ---
             result_data = {
                 "new_expiry_date": expiry_date.astimezone(LOCAL_TZ), "greeting_name": greeting_name,
                 "subscription_type_name": subscription_type_name, "action_verb": action_verb
@@ -323,10 +316,9 @@ async def _activate_or_renew_subscription_core(
             return True, "Subscription processed successfully", result_data
 
         except Exception as e:
-            logging.error(f"❌ CORE: Error in _activate_or_renew_subscription_core for user {telegram_id}: {e}", exc_info=True)
-            # إرجاع رسالة خطأ واضحة، والـ transaction سيقوم بـ rollback تلقائياً
+            logging.error(f"❌ CORE: Error in _activate_or_renew_subscription_core for user {telegram_id}: {e}",
+                          exc_info=True)
             return False, f"حدث خطأ داخلي أثناء معالجة الاشتراك: {e}", {}
-
 
 
 # ⭐ تعديل: الدالة أصبحت تستخدم discount_details لتمرير معلومات الخصم
@@ -392,6 +384,66 @@ async def _execute_renewal_logic(
     except Exception as e:
         logging.error(f"Critical error during renewal transaction for user {telegram_id}: {e}", exc_info=True)
         return False, "حدث خطأ فني أثناء محاولة تجديد اشتراكك. تم إلغاء العملية بالكامل."
+
+
+async def _reschedule_all_tasks_for_subscription(
+        connection: Connection,
+        telegram_id: int,
+        main_channel_id: int,
+        expiry_date: datetime
+):
+    """
+    🔹 تقوم هذه الدالة بإعادة جدولة كل المهام (إزالة وتذكيرات) لاشتراك معين.
+    1. تحذف جميع المهام القديمة ذات الصلة لضمان عدم وجود تكرار.
+    2. تقوم بجدولة المهام الجديدة بناءً على تاريخ انتهاء الصلاحية الجديد.
+    """
+    logging.info(f"Rescheduling all tasks for user {telegram_id} in main channel {main_channel_id}.")
+
+    # --- الخطوة 1: المسح الشامل (Clean Sweep) ---
+    # نحذف كل أنواع المهام التي نديرها لهذا المستخدم وهذه القناة الرئيسية دفعة واحدة.
+    # هذا يضمن عدم بقاء أي مهام قديمة (remove_user, first_reminder, second_reminder).
+    task_types_to_clean = ('remove_user', 'first_reminder', 'second_reminder')
+    await connection.execute("""
+        DELETE FROM scheduled_tasks
+        WHERE telegram_id = $1
+          AND channel_id = $2
+          AND task_type = ANY($3::text[])
+    """, telegram_id, main_channel_id, list(task_types_to_clean))
+    logging.info(f"Cleaned up old tasks for user {telegram_id}.")
+
+    # --- الخطوة 2: جدولة المهام الجديدة ---
+
+    # 2.1: جدولة مهمة الإزالة
+    await add_scheduled_task(
+        connection,
+        task_type="remove_user",
+        telegram_id=telegram_id,
+        execute_at=expiry_date,
+        channel_id=main_channel_id,
+        clean_up=False  # المسح تم بالفعل، لا داعي للتكرار
+    )
+
+    # 2.2: جدولة التذكيرات
+    reminder_settings = await get_reminder_settings(connection)  # نفترض أنك أضفت هذه الدالة في db_queries.py
+    if reminder_settings:
+        now_utc = datetime.now(timezone.utc)
+
+        # التذكير الأول
+        first_reminder_date = expiry_date - timedelta(days=reminder_settings['first_reminder'])
+        if first_reminder_date > now_utc:
+            await add_scheduled_task(
+                connection, "first_reminder", telegram_id, first_reminder_date, main_channel_id, clean_up=False
+            )
+
+        # التذكير الثاني
+        second_reminder_date = expiry_date - timedelta(days=reminder_settings['second_reminder'])
+        if second_reminder_date > now_utc:
+            await add_scheduled_task(
+                connection, "second_reminder", telegram_id, second_reminder_date, main_channel_id, clean_up=False
+            )
+        logging.info(f"Scheduled new reminder tasks for user {telegram_id}.")
+    else:
+        logging.warning(f"Could not schedule reminders for user {telegram_id}, settings not found.")
 
 
 # ⭐ تعديل: الدالة المحدثة بالكامل للتعامل مع منطق تثبيت السعر

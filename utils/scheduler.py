@@ -13,7 +13,8 @@ from database.db_queries import (
     add_scheduled_task,
     find_lapsable_user_discounts_for_type,
     deactivate_multiple_user_discounts,
-    find_active_user_discounts_by_original_discount
+    find_active_user_discounts_by_original_discount,
+    get_all_channel_ids_for_type
 )
 import json
 
@@ -93,65 +94,87 @@ async def execute_scheduled_tasks(bot: Bot, connection):
 
 # --- ⭐ تعديل دالة إزالة المستخدم ---
 async def handle_remove_user_task(bot: Bot, connection, telegram_id: int, channel_id: int, task_id: int):
+    """
+    🔹 تعالج مهمة إزالة المستخدم.
+    عندما تُنفذ، ستقوم بإزالة المستخدم من القناة الرئيسية وجميع القنوات الفرعية المرتبطة بالاشتراك.
+    """
+    # channel_id الذي يصل هنا هو معرف القناة الرئيسية دائمًا حسب المنطق الجديد
     try:
+        # الخطوة 1: التحقق من الاشتراك الرئيسي للتأكد من أنه لم يتم تجديده
         current_sub = await get_subscription(connection, telegram_id, channel_id)
-        if not current_sub or current_sub['is_active']:
-            status_reason = "active subscription" if current_sub else "no subscription record"
-            logging.info(f"✅ Skipping removal task {task_id} for user {telegram_id}. Reason: {status_reason}.")
+        if not current_sub:
+            logging.info(
+                f"✅ Skipping removal task {task_id}. Main subscription record not found for user {telegram_id} in channel {channel_id}.")
+            await update_task_status(connection, task_id, "completed")
+            return
+
+        if current_sub['is_active']:
+            logging.info(
+                f"✅ Skipping removal task {task_id} for user {telegram_id}. Main subscription is still active.")
             await update_task_status(connection, task_id, "completed")
             return
 
         logging.info(f"🛠️ Proceeding with removal for user {telegram_id}. Subscription is confirmed inactive.")
 
-        # --- ⭐⭐⭐ المنطق الجديد والموحد للتعامل مع الخصومات ⭐⭐⭐ ---
+        subscription_type_id = current_sub.get('subscription_type_id')
+        if not subscription_type_id:
+            logging.error(
+                f"❌ Cannot perform full removal for task {task_id}. Missing 'subscription_type_id' on subscription record.")
+            await update_task_status(connection, task_id, "failed")
+            return
+
+        # الخطوة 2: جلب كل القنوات (الرئيسية والفرعية) المرتبطة بهذا الاشتراك
+        all_channels_to_remove_from = await get_all_channel_ids_for_type(connection, subscription_type_id)
+
+        if not all_channels_to_remove_from:
+            logging.warning(
+                f"Could not find any associated channels for sub_type_id {subscription_type_id}. Falling back to removing from main channel {channel_id} only.")
+            all_channels_to_remove_from = [channel_id]  # كإجراء احتياطي
+
+        logging.info(
+            f"Unified Removal: User {telegram_id} will be removed from {len(all_channels_to_remove_from)} channel(s).")
+
+        # الخطوة 3: المرور على كل القنوات ومحاولة إزالة المستخدم
+        for ch_id in all_channels_to_remove_from:
+            try:
+                removal_success = await remove_user_from_channel(bot, connection, telegram_id, ch_id)
+                if removal_success:
+                    logging.info(f"✅ Successfully removed user {telegram_id} from channel {ch_id}.")
+                # دالة remove_user_from_channel يجب أن تعالج أخطاءها بنفسها (مثلما تفعل على الأغلب)
+            except Exception as e:
+                # هذا الاستثناء يمسك الأخطاء غير المتوقعة فقط
+                logging.error(f"❌ Unhandled error while trying to remove user {telegram_id} from channel {ch_id}: {e}",
+                              exc_info=True)
+
+        # --- بداية منطق الخصومات (لا تغيير هنا) ---
         if current_sub.get('is_main_channel_subscription'):
-            sub_type_id = current_sub.get('subscription_type_id')
             user_id = await connection.fetchval("SELECT id FROM users WHERE telegram_id = $1", telegram_id)
-
-            if sub_type_id and user_id:
-                # 1. ابحث عن كل الخصومات القابلة للإلغاء (مجمعة حسب الخصم الأصلي)
-                lapsable_discount_groups = await find_lapsable_user_discounts_for_type(connection, telegram_id, sub_type_id)
-
+            if subscription_type_id and user_id:
+                lapsable_discount_groups = await find_lapsable_user_discounts_for_type(connection, telegram_id,
+                                                                                       subscription_type_id)
                 if lapsable_discount_groups:
                     logging.info(
                         f"User {telegram_id} has {len(lapsable_discount_groups)} groups of lapsable discounts. Scheduling deactivation tasks.")
-
-                    # 2. أرسل رسالة تحذيرية واحدة فقط للمستخدم
                     try:
-                        await send_message_to_user(
-                            bot,
-                            telegram_id,
-                            "🔔 تنبيه هام!\n\n"
-                            "لقد انتهى اشتراكك. لديك خصومات خاصة مرتبطة بهذا النوع من الاشتراك. "
-                            "إذا لم تقم بالتجديد خلال 7 أيام، ستفقد هذه الخصومات بشكل دائم."
-                        )
+                        await send_message_to_user(bot, telegram_id,
+                                                   "🔔 تنبيه هام!\n\nلقد انتهى اشتراكك. لديك خصومات خاصة مرتبطة بهذا النوع من الاشتراك. إذا لم تقم بالتجديد خلال 7 أيام، ستفقد هذه الخصومات بشكل دائم.")
                     except Exception as msg_err:
                         logging.error(f"Could not send discount warning message to {telegram_id}: {msg_err}")
-
-                    # 3. قم بجدولة مهمة إلغاء منفصلة لكل مجموعة من الخصومات
                     deactivation_time = datetime.now(timezone.utc) + timedelta(hours=168)
                     for lapsable_group in lapsable_discount_groups:
-                        await add_scheduled_task(
-                            connection=connection,
-                            task_type="deactivate_discount_grace_period",
-                            telegram_id=telegram_id,
-                            execute_at=deactivation_time,
-                            # ⭐ استخدام الـ PAYLOAD الجديد والموحد
-                            payload={
-                                'user_id': user_id,
-                                'discount_id': lapsable_group['original_discount_id']
-                            },
-                            clean_up=False
-                        )
-        # --- نهاية المنطق الجديد ---
+                        await add_scheduled_task(connection=connection, task_type="deactivate_discount_grace_period",
+                                                 telegram_id=telegram_id, execute_at=deactivation_time,
+                                                 payload={'user_id': user_id,
+                                                          'discount_id': lapsable_group['original_discount_id']},
+                                                 clean_up=False)
+        # --- نهاية منطق الخصومات ---
 
-        removal_success = await remove_user_from_channel(bot, connection, telegram_id, channel_id)
-        if removal_success:
-            logging.info(f"✅ Successfully removed user {telegram_id} from channel {channel_id}.")
-
+        # الخطوة 4: تحديث حالة المهمة الرئيسية بعد الانتهاء من كل القنوات
         await update_task_status(connection, task_id, "completed")
+
     except Exception as e:
-        logging.error(f"❌ Error during remove user task for {telegram_id}: {e}", exc_info=True)
+        logging.error(f"❌ Critical error during unified remove user task {task_id} for user {telegram_id}: {e}",
+                      exc_info=True)
         await update_task_status(connection, task_id, "failed")
 
 

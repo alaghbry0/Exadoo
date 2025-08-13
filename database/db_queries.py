@@ -981,6 +981,19 @@ async def update_payment_status_to_manual_check(conn, payment_token: str, error_
         logging.error(f"❌ فشل تحديث حالة الدفع إلى 'failed' لـ {payment_token}: {e}")
 
 
+async def get_all_channel_ids_for_type(connection, subscription_type_id: int) -> list[int]:
+    """
+    🔹 جلب كل معرفات القنوات (الرئيسية والفرعية) المرتبطة بنوع اشتراك معين.
+    """
+    try:
+        query = "SELECT channel_id FROM subscription_type_channels WHERE subscription_type_id = $1"
+        records = await connection.fetch(query, subscription_type_id)
+        return [record['channel_id'] for record in records]
+    except Exception as e:
+        logging.error(f"❌ Error fetching all channel IDs for subscription_type_id {subscription_type_id}: {e}")
+        return []
+
+
 async def get_unread_notifications_count(connection, telegram_id: int) -> int:
     """
     إرجاع عدد الإشعارات غير المقروءة للمستخدم.
