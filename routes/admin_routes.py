@@ -3277,7 +3277,7 @@ async def cancel_subscription_admin():
                                     WHERE telegram_id = $1
                                       AND channel_id = $2
                                       AND task_type = ANY($3::text[])
-                                """, telegram_id, main_channel_id, list(task_types_to_clean))
+                                 """, telegram_id, main_channel, list(task_types_to_clean))
                 logging.info(f"ADMIN CANCEL: Cleaned up all scheduled tasks for user {telegram_id}.")
 
                 # 5. تسجيل الـ history
